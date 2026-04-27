@@ -1,0 +1,84 @@
+{
+  "implementation_model": {
+    "name": "qwen3.6-27b-q4km",
+    "base_url": "http://127.0.0.1:8161/v1",
+    "api_key": "not-needed",
+    "model": "local-gguf",
+    "context_window": 76800,
+    "max_tokens": 2048,
+    "temperature": 0.25,
+    "request_timeout_seconds": 21600
+  },
+  "feedback_model": null,
+  "mcp_tools": {
+    "terminal": true,
+    "web_scraping": true,
+    "web_interaction": true
+  },
+  "runtime": {
+    "docker_isolation": true,
+    "docker_image": "agentic-feedback-coding:local",
+    "workspace": "workspaces/mock-platformer",
+    "command_timeout_seconds": 180,
+    "print_transcript": true,
+    "max_command_timeout_seconds": 21600
+  },
+  "context_compaction": {
+    "enabled": true,
+    "threshold_ratio": 0.8,
+    "keep_recent_turns": 8,
+    "summary_max_tokens": 1024
+  },
+  "loop": {
+    "max_iterations": 3,
+    "stop_when_review_clean": true
+  },
+  "project_design": {
+    "title": "Browser platformer with external levels and scriptable actors",
+    "prompt": "Build a browser game where the user controls a 2D Mario-like platform person. Levels must be designed externally in a text file. Enemies and NPC friends must be scriptable from data, and the game must support savepoints. The feedback loop must validate that the game is easy to control through Playwright keyboard input, can produce screenshots for visual review, and has simple visual markers that a VL model could inspect from screenshots."
+  },
+  "phases": {
+    "requirements_refinement": {
+      "max_iterations": 2
+    },
+    "plan_validation": {
+      "max_iterations": 2
+    },
+    "implementation": {
+      "max_iterations": 7
+    }
+  },
+  "resolution_policy": {
+    "max_same_error_repeats": 2,
+    "allow_requirement_dilution": true,
+    "allow_skip_with_note": true,
+    "stop_on_cannot_resolve": false
+  },
+  "quality_policy": {
+    "assume_code_quality_when_unspecified": true,
+    "require_research_and_structure_step": true
+  },
+  "review_policy": {
+    "hard_pushback_iterations": 3,
+    "compromise_iterations": 4,
+    "final_review_iterations": 1
+  },
+  "web_research": {
+    "enabled": true,
+    "max_search_results": 3,
+    "max_pages": 3,
+    "timeout_seconds": 15,
+    "max_page_bytes": 1000000,
+    "excerpt_chars": 3000,
+    "user_agent": "agenticFeedbackCoding/0.1 (+local research harness)"
+  },
+  "git_policy": {
+    "enabled": true,
+    "commit_completed_steps": true,
+    "require_step_diff": true,
+    "leave_final_changes_uncommitted": false,
+    "final_reset_mode": "soft",
+    "commit_user_name": "agenticFeedbackCoding",
+    "commit_user_email": "agentic-feedback@example.local"
+  }
+}
