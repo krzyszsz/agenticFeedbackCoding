@@ -5,9 +5,11 @@
     "api_key": "not-needed",
     "model": "local-gguf",
     "context_window": 76800,
-    "max_tokens": 2048,
+    "max_tokens": 32768,
     "temperature": 0.25,
-    "request_timeout_seconds": 21600
+    "request_timeout_seconds": 21600,
+    "retry_attempts": 20,
+    "retry_sleep_seconds": 30
   },
   "feedback_model": null,
   "mcp_tools": {
@@ -18,20 +20,31 @@
   "runtime": {
     "docker_isolation": true,
     "docker_image": "agentic-feedback-coding:local",
+    "docker_user": "host",
     "workspace": "workspaces/example-task-tracker",
+    "plan_file": "PLAN.md",
+    "requirements_file": "REQUIREMENTS.md",
+    "research_file": "RESEARCH.md",
     "command_timeout_seconds": 120,
     "print_transcript": true,
-    "max_command_timeout_seconds": 21600
+    "live_turn_max_chars": 0,
+    "color_transcript": true,
+    "max_command_timeout_seconds": 21600,
+    "final_summary": "compact",
+    "feedback_response_max_tokens": 4096
   },
   "context_compaction": {
     "enabled": true,
     "threshold_ratio": 0.8,
     "keep_recent_turns": 8,
-    "summary_max_tokens": 1024
+    "summary_max_tokens": 1024,
+    "tool_output_max_chars": 4000,
+    "workspace_file_max_bytes": 20000,
+    "git_diff_max_chars": 20000,
+    "transcript_review_max_chars": 24000
   },
   "loop": {
-    "max_iterations": 3,
-    "stop_when_review_clean": true
+    "max_iterations": 3
   },
   "project_design": {
     "title": "Starter task tracker project",

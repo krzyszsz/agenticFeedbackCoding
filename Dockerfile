@@ -2,7 +2,8 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    AGENT_IN_CONTAINER=1
+    AGENT_IN_CONTAINER=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 RUN set -eux; \
     apt-get update; \
@@ -17,6 +18,10 @@ RUN python -m pip install --no-cache-dir \
     playwright==1.51.0 \
     pytest==8.3.5 \
     requests==2.32.3
+
+RUN set -eux; \
+    python -m playwright install chromium; \
+    chmod -R a+rX /ms-playwright
 
 WORKDIR /app
 COPY feedback_agent /app/feedback_agent

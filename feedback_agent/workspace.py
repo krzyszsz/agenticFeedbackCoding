@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import subprocess
 from typing import Any
+
+from .bounds import run_bounded_process
 
 
 PLAN_TEMPLATE = """# Agent Plan
@@ -30,16 +31,16 @@ PLAN_TEMPLATE = """# Agent Plan
 """
 
 
-def ensure_plan(workspace: Path) -> Path:
+def ensure_plan(workspace: Path, plan_filename: str = "PLAN.md") -> Path:
     workspace.mkdir(parents=True, exist_ok=True)
-    path = workspace / "PLAN.md"
+    path = workspace / plan_filename
     if not path.exists():
         path.write_text(PLAN_TEMPLATE, encoding="utf-8")
     return path
 
 
-def append_plan_note(workspace: Path, note: str) -> None:
-    plan = ensure_plan(workspace)
+def append_plan_note(workspace: Path, note: str, plan_filename: str = "PLAN.md") -> None:
+    plan = ensure_plan(workspace, plan_filename)
     with plan.open("a", encoding="utf-8") as f:
         f.write(f"\n- {note.strip()}\n")
 
@@ -195,6 +196,7 @@ def run_commands(
     timeout_seconds: int,
     max_timeout_seconds: int | None = None,
     allow_git_mutation: bool = False,
+    output_limit_chars: int = 4000,
 ) -> list[dict]:
     """Run bounded validation commands inside the workspace.
 
@@ -242,36 +244,15 @@ def run_commands(
                     "blocked_git_mutation": True,
                 })
                 continue
-        try:
-            proc = subprocess.run(
-                parts,
-                cwd=workspace,
-                text=True,
-                capture_output=True,
-                timeout=command_timeout,
-                check=False,
-            )
-            results.append({
-                "command": parts,
-                "timeout_seconds": command_timeout,
-                "returncode": proc.returncode,
-                "expected_returncode": expected_returncode,
-                "returncode_matches_expected": proc.returncode == expected_returncode,
-                "stdout": proc.stdout[-4000:],
-                "stderr": proc.stderr[-4000:],
-                "timed_out": False,
-            })
-        except subprocess.TimeoutExpired as exc:
-            results.append({
-                "command": parts,
-                "returncode": 124,
-                "expected_returncode": expected_returncode,
-                "returncode_matches_expected": 124 == expected_returncode,
-                "stdout": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
-                "stderr": (exc.stderr or "")[-4000:] if isinstance(exc.stderr, str) else "",
-                "timed_out": True,
-                "timeout_seconds": command_timeout,
-            })
+        result = run_bounded_process(
+            parts,
+            cwd=workspace,
+            timeout_seconds=command_timeout,
+            output_limit_chars=output_limit_chars,
+        )
+        result["expected_returncode"] = expected_returncode
+        result["returncode_matches_expected"] = result["returncode"] == expected_returncode
+        results.append(result)
     return results
 
 
@@ -292,7 +273,12 @@ def normalize_plan_steps(raw_steps: list[dict[str, Any]]) -> list[dict[str, Any]
     return [normalize_step(step, index) for index, step in enumerate(raw_steps, start=1)]
 
 
-def write_requirements_doc(workspace: Path, requirements: dict[str, Any], review: dict[str, Any] | None = None) -> None:
+def write_requirements_doc(
+    workspace: Path,
+    requirements: dict[str, Any],
+    review: dict[str, Any] | None = None,
+    requirements_filename: str = "REQUIREMENTS.md",
+) -> None:
     lines = ["# Refined Requirements", ""]
     lines.append("## Project")
     lines.append("")
@@ -333,7 +319,7 @@ def write_requirements_doc(workspace: Path, requirements: dict[str, Any], review
         lines.append("## Last Requirements Review")
         lines.append(f"- Status: {review.get('status') or ('needs_rework' if review.get('needs_rework') else 'resolved')}")
         lines.append(f"- Summary: {review.get('summary', 'no summary')}")
-    (workspace / "REQUIREMENTS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (workspace / requirements_filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_plan_doc(
@@ -341,6 +327,7 @@ def write_plan_doc(
     requirements: dict[str, Any],
     steps: list[dict[str, Any]],
     notes: list[str] | None = None,
+    plan_filename: str = "PLAN.md",
 ) -> None:
     notes = notes or []
     lines = ["# Agent Plan", ""]
@@ -409,16 +396,33 @@ def write_plan_doc(
     lines.append("")
     unresolved = [s for s in steps if s.get("status") != "resolved"]
     lines.append(f"- Resolved steps: {len(steps) - len(unresolved)} / {len(steps)}")
-    (workspace / "PLAN.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (workspace / plan_filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def collect_workspace_files(workspace: Path, max_file_bytes: int = 20000) -> list[dict[str, str]]:
-    files: list[dict[str, str]] = []
+def collect_workspace_files(workspace: Path, max_file_bytes: int = 20000) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
     skipped_dirs = {".agent_state", ".git", "__pycache__", ".pytest_cache"}
     for path in sorted(workspace.rglob("*")):
         if not path.is_file() or any(part in skipped_dirs for part in path.parts):
             continue
         rel = path.relative_to(workspace)
-        if path.stat().st_size <= max_file_bytes:
-            files.append({"path": str(rel), "content": path.read_text(encoding="utf-8", errors="replace")})
+        size = path.stat().st_size
+        if size <= max_file_bytes:
+            files.append({
+                "path": str(rel),
+                "content": path.read_text(encoding="utf-8", errors="replace"),
+                "size": size,
+                "truncated": False,
+            })
+            continue
+        with path.open("rb") as f:
+            head = f.read(max_file_bytes // 2)
+            f.seek(max(size - max_file_bytes // 2, 0))
+            tail = f.read(max_file_bytes // 2)
+        content = (
+            head.decode("utf-8", errors="replace")
+            + f"\n\n[workspace file truncated: kept first and last {max_file_bytes // 2} bytes of {size}]\n\n"
+            + tail.decode("utf-8", errors="replace")
+        )
+        files.append({"path": str(rel), "content": content, "size": size, "truncated": True})
     return files

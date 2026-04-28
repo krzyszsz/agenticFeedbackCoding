@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import sys
 
+from .bounds import clamp_text, estimate_tokens
+
 
 @dataclass
 class Turn:
@@ -20,22 +22,51 @@ class Conversation:
     agentic work when each new request is appended to a visible conversation.
     """
 
-    def __init__(self, path: Path, *, echo: bool = False):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        echo: bool = False,
+        full_path: Path | None = None,
+        echo_limit_chars: int = 0,
+        color: bool = True,
+    ):
         self.path = path
+        self.full_path = full_path
         self.echo = echo
-        self.turns: list[Turn] = []
+        self.echo_limit_chars = echo_limit_chars
+        self.color = color and sys.stdout.isatty()
+        self.turns: list[Turn] = self._load_turns(path)
+        if self.full_path and not self.full_path.exists() and self.turns:
+            self._write_turns(self.full_path, self.turns)
+
+    def _load_turns(self, path: Path) -> list[Turn]:
+        turns: list[Turn] = []
         if path.exists():
             for line in path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     item = json.loads(line)
-                    self.turns.append(Turn(role=item["role"], content=item["content"]))
+                    turns.append(Turn(role=item["role"], content=item["content"]))
+        return turns
+
+    def _append_turn_to_path(self, path: Path, turn: Turn) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(turn), ensure_ascii=False) + "\n")
+
+    def _write_turns(self, path: Path, turns: list[Turn]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(asdict(t), ensure_ascii=False) + "\n" for t in turns),
+            encoding="utf-8",
+        )
 
     def append(self, role: str, content: str) -> None:
         turn = Turn(role=role, content=content)
         self.turns.append(turn)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(turn), ensure_ascii=False) + "\n")
+        self._append_turn_to_path(self.path, turn)
+        if self.full_path and self.full_path != self.path:
+            self._append_turn_to_path(self.full_path, turn)
         if self.echo:
             self._print_turn(turn)
 
@@ -49,32 +80,39 @@ class Conversation:
         return messages
 
     def estimated_tokens(self) -> int:
-        return max(1, sum(len(t.content) for t in self.turns) // 4)
+        return max(1, sum(estimate_tokens(t.content) for t in self.turns))
 
     def replace_with_memory(self, memory: str, keep_recent_turns: int) -> None:
         recent = self.turns[-keep_recent_turns:] if keep_recent_turns > 0 else []
-        self.turns = [
-            Turn(
-                role="system",
-                content=(
-                    "Compacted durable memory from earlier turns. Preserve these decisions, "
-                    "constraints, and unresolved risks:\n\n" + memory
-                ),
+        memory_turn = Turn(
+            role="system",
+            content=(
+                "Compacted durable memory from earlier turns. Preserve these decisions, "
+                "constraints, and unresolved risks:\n\n" + memory
             ),
-            *recent,
-        ]
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            "".join(json.dumps(asdict(t), ensure_ascii=False) + "\n" for t in self.turns),
-            encoding="utf-8",
         )
+        self.turns = [memory_turn, *recent]
+        self._write_turns(self.path, self.turns)
+        if self.full_path and self.full_path != self.path:
+            self._append_turn_to_path(
+                self.full_path,
+                Turn(
+                    role="system",
+                    content=(
+                        "ACTIVE_CONTEXT_COMPACTED: conversation.jsonl was rewritten "
+                        "with compacted memory plus recent turns. Full prior turns "
+                        "remain above in this append-only transcript."
+                    ),
+                ),
+            )
         if self.echo:
             self._print_turn(self.turns[0])
 
-    def write_markdown(self, path: Path) -> None:
+    def write_markdown(self, path: Path, *, full: bool = False) -> None:
         """Export the JSONL transcript in a form people can read after the run."""
+        turns = self._load_turns(self.full_path) if full and self.full_path else self.turns
         lines: list[str] = ["# Agent Transcript", ""]
-        for index, turn in enumerate(self.turns, start=1):
+        for index, turn in enumerate(turns, start=1):
             lines.append(f"## {index}. {turn.role}")
             lines.append("")
             lines.append("```text")
@@ -84,7 +122,40 @@ class Conversation:
         path.write_text("\n".join(lines), encoding="utf-8")
 
     def _print_turn(self, turn: Turn) -> None:
-        print(f"\n===== {turn.role.upper()} =====", flush=True)
-        print(turn.content, flush=True)
-        print("===== END TURN =====\n", flush=True)
+        label = self._turn_label(turn)
+        color = self._turn_color(turn)
+        reset = "\033[0m" if color else ""
+        print(f"\n{color}===== {label} ====={reset}", flush=True)
+        if self.echo_limit_chars > 0:
+            print(
+                clamp_text(turn.content, self.echo_limit_chars, marker="live transcript turn truncated"),
+                flush=True,
+            )
+        else:
+            print(turn.content, flush=True)
+        print(f"{color}===== END TURN ====={reset}\n", flush=True)
         sys.stdout.flush()
+
+    def _turn_label(self, turn: Turn) -> str:
+        content = turn.content
+        if content.startswith("IMPLEMENTATION_AGENT_REQUEST"):
+            return "IMPLEMENTATION REQUEST"
+        if content.startswith("IMPLEMENTATION_AGENT_RESPONSE"):
+            return "IMPLEMENTATION RESPONSE"
+        if content.startswith("FEEDBACK_AGENT_REQUEST"):
+            return "FEEDBACK REQUEST"
+        if content.startswith("FEEDBACK_AGENT_RESPONSE"):
+            return "FEEDBACK RESPONSE"
+        return turn.role.upper()
+
+    def _turn_color(self, turn: Turn) -> str:
+        if not self.color:
+            return ""
+        content = turn.content
+        if content.startswith("IMPLEMENTATION_AGENT"):
+            return "\033[36m"
+        if content.startswith("FEEDBACK_AGENT"):
+            return "\033[33m"
+        if turn.role == "system":
+            return "\033[2m"
+        return ""

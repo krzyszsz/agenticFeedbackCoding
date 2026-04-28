@@ -6,17 +6,23 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$PROJECT_DIR"
 
 CONFIG_PATH="$PROJECT_DIR/config.example.json"
-ARGS=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --config)
       CONFIG_PATH="$2"
-      ARGS+=("$1" "$2")
       shift 2
       ;;
+    -*)
+      echo "Unknown argument: $1" >&2
+      exit 2
+      ;;
     *)
-      ARGS+=("$1")
+      if [ "$CONFIG_PATH" != "$PROJECT_DIR/config.example.json" ]; then
+        echo "Only one config path can be provided." >&2
+        exit 2
+      fi
+      CONFIG_PATH="$1"
       shift
       ;;
   esac
@@ -54,14 +60,42 @@ if not workspace.is_absolute():
 print(workspace.resolve())
 PY
 )"
+  docker_user="$(python3 - "$CONFIG_ABS" <<'PY'
+import json
+import pathlib
+import sys
+cfg = json.loads(pathlib.Path(sys.argv[1]).read_text())
+print(cfg.get("runtime", {}).get("docker_user", "host"))
+PY
+)"
   mkdir -p "$workspace"
   docker_cmd=(docker)
   if ! docker info >/dev/null 2>&1; then
     docker_cmd=(sudo docker)
   fi
-  "${docker_cmd[@]}" build -t "$image" "$PROJECT_DIR"
+  if [ "${REBUILD_AGENT_IMAGE:-0}" = "1" ] || ! "${docker_cmd[@]}" image inspect "$image" >/dev/null 2>&1; then
+    echo "Building agent image: $image" >&2
+    "${docker_cmd[@]}" build -t "$image" "$PROJECT_DIR"
+  else
+    echo "Using existing agent image: $image (set REBUILD_AGENT_IMAGE=1 to rebuild)" >&2
+  fi
+  user_args=()
+  case "$docker_user" in
+    host)
+      user_args=(--user "$(id -u):$(id -g)")
+      ;;
+    root)
+      user_args=(--user "0:0")
+      ;;
+    none|"")
+      user_args=()
+      ;;
+    *)
+      user_args=(--user "$docker_user")
+      ;;
+  esac
   "${docker_cmd[@]}" run --rm --network=host --security-opt label=disable \
-    --user "$(id -u):$(id -g)" \
+    "${user_args[@]}" \
     -e AGENT_IN_CONTAINER=1 \
     -e HOME=/tmp \
     -e AGENT_WORKSPACE=/workspace/project \

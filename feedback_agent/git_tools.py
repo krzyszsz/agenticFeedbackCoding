@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
 from typing import Any
+
+from .bounds import run_bounded_process
 
 
 DEFAULT_GITIGNORE = """# Harness/runtime state
@@ -20,37 +21,25 @@ HARNESS_ONLY_PATHS = {
     "PLAN.md",
     "REQUIREMENTS.md",
     "RESEARCH.md",
+    "AGENT_PLAN.md",
+    "AGENT_REQUIREMENTS.md",
 }
 
 
-def run_git(workspace: Path, args: list[str], timeout_seconds: int = 30) -> dict[str, Any]:
+def run_git(
+    workspace: Path,
+    args: list[str],
+    timeout_seconds: int = 30,
+    output_limit_chars: int = 20000,
+) -> dict[str, Any]:
     """Run a bounded git command and return JSON-friendly evidence."""
     command = ["git", *args]
-    try:
-        proc = subprocess.run(
-            command,
-            cwd=workspace,
-            text=True,
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-        return {
-            "command": command,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout[-20000:],
-            "stderr": proc.stderr[-20000:],
-            "timed_out": False,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "command": command,
-            "returncode": 124,
-            "stdout": (exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else "",
-            "stderr": (exc.stderr or "")[-20000:] if isinstance(exc.stderr, str) else "",
-            "timed_out": True,
-            "timeout_seconds": timeout_seconds,
-        }
+    return run_bounded_process(
+        command,
+        cwd=workspace,
+        timeout_seconds=timeout_seconds,
+        output_limit_chars=output_limit_chars,
+    )
 
 
 def ensure_git_repo(workspace: Path, *, user_name: str, user_email: str) -> dict[str, Any]:
@@ -103,7 +92,7 @@ def meaningful_changed_paths(status_short: str) -> list[str]:
     return changed
 
 
-def git_evidence(workspace: Path) -> dict[str, Any]:
+def git_evidence(workspace: Path, *, max_diff_chars: int = 20000) -> dict[str, Any]:
     """Capture the current diff/status for the feedback agent."""
     status = git_status_short(workspace)
     return {
@@ -111,8 +100,8 @@ def git_evidence(workspace: Path) -> dict[str, Any]:
         "head": git_head(workspace),
         "status_short": status,
         "meaningful_changed_paths": meaningful_changed_paths(status),
-        "diff_stat": run_git(workspace, ["diff", "--stat"])["stdout"].strip(),
-        "diff": run_git(workspace, ["diff", "--", "."])["stdout"][-20000:],
+        "diff_stat": run_git(workspace, ["diff", "--stat"], output_limit_chars=max_diff_chars)["stdout"].strip(),
+        "diff": run_git(workspace, ["diff", "--", "."], output_limit_chars=max_diff_chars)["stdout"],
     }
 
 

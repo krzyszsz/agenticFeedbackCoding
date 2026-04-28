@@ -17,9 +17,10 @@ fi
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8161}"
-CTX_SIZE="${CTX_SIZE:-32768}"
+CTX_SIZE="${CTX_SIZE:-76800}"
 GPU_LAYERS="${GPU_LAYERS:-999}"
 THREADS="${THREADS:-8}"
+PARALLEL="${PARALLEL:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 EXTRA_ARR=()
@@ -35,4 +36,5 @@ exec /usr/local/bin/llama-server \
   --ctx-size "$CTX_SIZE" \
   --n-gpu-layers "$GPU_LAYERS" \
   --threads "$THREADS" \
+  --parallel "$PARALLEL" \
   "${EXTRA_ARR[@]}"

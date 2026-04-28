@@ -17,6 +17,8 @@ class ModelConfig:
     max_tokens: int
     temperature: float
     request_timeout_seconds: int
+    retry_attempts: int
+    retry_sleep_seconds: int
 
 
 @dataclass(frozen=True)
@@ -30,10 +32,18 @@ class ToolConfig:
 class RuntimeConfig:
     docker_isolation: bool
     docker_image: str
+    docker_user: str
     workspace: Path
+    plan_file: str
+    requirements_file: str
+    research_file: str
     command_timeout_seconds: int
     max_command_timeout_seconds: int
     print_transcript: bool
+    live_turn_max_chars: int
+    color_transcript: bool
+    final_summary: str
+    feedback_response_max_tokens: int
 
 
 @dataclass(frozen=True)
@@ -42,12 +52,15 @@ class CompactionConfig:
     threshold_ratio: float
     keep_recent_turns: int
     summary_max_tokens: int
+    tool_output_max_chars: int = 4000
+    workspace_file_max_bytes: int = 20000
+    git_diff_max_chars: int = 20000
+    transcript_review_max_chars: int = 24000
 
 
 @dataclass(frozen=True)
 class LoopConfig:
     max_iterations: int
-    stop_when_review_clean: bool
 
 
 @dataclass(frozen=True)
@@ -135,9 +148,11 @@ def _model(data: dict[str, Any]) -> ModelConfig:
         api_key=str(data.get("api_key") or "not-needed"),
         model=str(data.get("model") or "local-gguf"),
         context_window=int(data["context_window"]),
-        max_tokens=int(data.get("max_tokens", 2048)),
+        max_tokens=int(data.get("max_tokens", 32768)),
         temperature=float(data.get("temperature", 0.25)),
         request_timeout_seconds=int(data.get("request_timeout_seconds", 21_600)),
+        retry_attempts=max(1, int(data.get("retry_attempts", 20))),
+        retry_sleep_seconds=max(0, int(data.get("retry_sleep_seconds", 30))),
     )
 
 
@@ -212,7 +227,7 @@ def _git_policy(data: dict[str, Any]) -> GitPolicy:
 def load_config(path: str | Path, repo_root: Path | None = None) -> AgentConfig:
     cfg_path = Path(path).resolve()
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
-    base = repo_root or cfg_path.parents[2]
+    base = repo_root.resolve() if repo_root else cfg_path.parent
 
     feedback = data.get("feedback_model")
     runtime_data = data["runtime"]
@@ -230,15 +245,22 @@ def load_config(path: str | Path, repo_root: Path | None = None) -> AgentConfig:
         runtime=RuntimeConfig(
             docker_isolation=bool(runtime_data.get("docker_isolation", True)),
             docker_image=str(runtime_data.get("docker_image", "agentic-feedback-coding:local")),
+            docker_user=str(runtime_data.get("docker_user", "host")),
             workspace=workspace,
+            plan_file=str(runtime_data.get("plan_file", "PLAN.md")),
+            requirements_file=str(runtime_data.get("requirements_file", "REQUIREMENTS.md")),
+            research_file=str(runtime_data.get("research_file", "RESEARCH.md")),
             command_timeout_seconds=int(runtime_data.get("command_timeout_seconds", 120)),
             max_command_timeout_seconds=int(runtime_data.get("max_command_timeout_seconds", 21_600)),
             print_transcript=bool(runtime_data.get("print_transcript", True)),
+            live_turn_max_chars=int(runtime_data.get("live_turn_max_chars", 0)),
+            color_transcript=bool(runtime_data.get("color_transcript", True)),
+            final_summary=str(runtime_data.get("final_summary", "compact")),
+            feedback_response_max_tokens=int(runtime_data.get("feedback_response_max_tokens", 4096)),
         ),
         context_compaction=CompactionConfig(**data["context_compaction"]),
         loop=LoopConfig(
             max_iterations=int(loop_data.get("max_iterations", 3)),
-            stop_when_review_clean=bool(loop_data.get("stop_when_review_clean", True)),
         ),
         phases=_phases(data, loop_data),
         resolution_policy=_resolution_policy(data),

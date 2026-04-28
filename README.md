@@ -1,19 +1,25 @@
 # agenticFeedbackCoding
 
-`agenticFeedbackCoding` runs a local AI coding workflow where one agent implements a project and a second agent reviews every step with tests, git diffs, command output, and evidence before accepting it. Normal work runs inside Docker for safety: only the generated project workspace is mounted out to the host, while the local model server stays outside and is reached through an OpenAI-compatible API.
+`agenticFeedbackCoding` runs a Docker-isolated local AI coding workflow: edit one JSON prompt, start an OpenAI-compatible model server, and let one agent implement while a second agent reviews every step with tests, git diffs, command output, file evidence, and screenshots/reports when available.
 
-The project is intentionally config-driven. One JSON file defines the model endpoint, workspace, review strictness, allowed tools, web/offline mode, and the project prompt.
+The main tested setup uses `Qwen3.6-27B Q4_K_M` GGUF served by llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395 / Strix Halo. A second comparison run used `Gemma4-26B-A4B Q4_K_M` through the same endpoint shape. Other OpenAI-compatible local or remote models can be configured, but the evidence in this README comes from those local GGUF runs. Normal work runs inside Docker for safety: only the generated project workspace is mounted out to the host, while the model server stays outside the agent container.
+
+The project is intentionally config-driven. One JSON file defines the model endpoint, workspace, review strictness, allowed tools, web/offline mode, context-safety limits, and the project prompt.
 
 ## Quick Start
 
-Start the local model server, then run a real benchmark through Docker:
+Clone the repo, start the local model server, then run a real benchmark through Docker:
 
 ```bash
+git clone https://github.com/krzyszsz/agenticFeedbackCoding.git
+cd agenticFeedbackCoding
 MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
 bash scripts/build_and_run.sh --config config.real-palindrome.json
 ```
 
 That run builds the agent container, mounts only the configured workspace, asks the local model to build the project, and stores the full transcript plus review evidence under `workspaces/real-palindrome/.agent_state/`.
+
+The live transcript is printed while the run is active, so a long job should visibly move through requirements, plan review, implementation attempts, and feedback. The final terminal output is compact by default; the full evidence is written under `.agent_state/`.
 
 ## One Config File
 
@@ -31,9 +37,11 @@ The important fields are usually enough:
     "base_url": "http://127.0.0.1:8161/v1",
     "model": "local-gguf",
     "context_window": 76800,
-    "max_tokens": 2048,
+    "max_tokens": 32768,
     "temperature": 0.25,
-    "request_timeout_seconds": 21600
+    "request_timeout_seconds": 21600,
+    "retry_attempts": 20,
+    "retry_sleep_seconds": 30
   },
   "feedback_model": null,
   "mcp_tools": {
@@ -43,9 +51,17 @@ The important fields are usually enough:
   },
   "runtime": {
     "docker_isolation": true,
+    "docker_user": "host",
     "workspace": "workspaces/my-new-project",
+    "plan_file": "PLAN.md",
+    "requirements_file": "REQUIREMENTS.md",
+    "research_file": "RESEARCH.md",
     "command_timeout_seconds": 120,
-    "max_command_timeout_seconds": 21600
+    "max_command_timeout_seconds": 21600,
+    "color_transcript": true,
+    "live_turn_max_chars": 0,
+    "final_summary": "compact",
+    "feedback_response_max_tokens": 4096
   },
   "web_research": { "enabled": false },
   "project_design": {
@@ -63,20 +79,40 @@ The important fields are usually enough:
 
 That request is clamped by `runtime.max_command_timeout_seconds`. Model calls use `implementation_model.request_timeout_seconds`, which is set high by default for long local-model runs.
 
+`runtime.final_summary` controls only the final stdout block after the live transcript:
+
+- `compact` prints status, step counts, and evidence paths.
+- `full` prints the full nested `summary.json` object.
+- `none` suppresses the final block.
+
+`runtime.live_turn_max_chars` controls live console output for each transcript turn. The default `0` prints each turn fully as it happens. Set a positive value, for example `30000`, if you want progress to remain visible without a single huge tool payload flooding the terminal. Saved transcript files are not truncated by this setting.
+
 ## Safety Model
 
 Normal agentic work runs inside Docker. `scripts/run_agent.sh` refuses to run the workflow directly on the host unless `ALLOW_HOST_AGENT_RUN=1` is explicitly set for harness development.
 
 The container gets one writable mount: the configured `runtime.workspace`, mapped to `/workspace/project`. The config file is mounted read-only. The Docker socket is not mounted. Host networking is used only so the agent container can reach a local OpenAI-compatible model server such as `127.0.0.1:8161`.
 
-The agent container includes Python, Chromium, Playwright, `pytest`, `curl`, `git`, `jq`, `requests`, and `beautifulsoup4`, so generated projects can run tests, browser checks, and scraping-style tasks without installing those tools into the host project folder.
+The agent container includes Python, Python Playwright with a preinstalled Chromium browser, system Chromium, `pytest`, `curl`, `git`, `jq`, `requests`, and `beautifulsoup4`, so generated projects can run tests, browser checks, and scraping-style tasks without installing those tools into the host project folder.
+
+Browser validation is intentionally Python-first. The container does not include Node, npm, npx, or `@playwright/test` by default, so prompts and generated validation scripts should use `from playwright.sync_api import sync_playwright` unless you deliberately extend the Dockerfile.
+
+`runtime.docker_user` defaults to `host`, so generated files are owned by the host user. Set it to `root` only for tasks that intentionally need package-manager access inside the disposable agent container, for example a workflow that checks disk space, installs a small diagnostic tool with `apt-get`, runs it, and writes a report into the mounted workspace. That still does not grant access to the host filesystem outside the configured workspace.
+
+Direct host execution is deliberately awkward:
+
+```bash
+ALLOW_HOST_AGENT_RUN=1 bash scripts/run_agent.sh --config config.my-project.json
+```
+
+Use that only for harness development. For normal agentic coding, Docker isolation is the supported path.
 
 ## Install And Model Setup
 
-Clone and enter the repo:
+If you did not already clone it in Quick Start, clone and enter the repo:
 
 ```bash
-git clone git@github.com:YOUR_USER/agenticFeedbackCoding.git
+git clone https://github.com/krzyszsz/agenticFeedbackCoding.git
 cd agenticFeedbackCoding
 ```
 
@@ -113,6 +149,17 @@ Start the default llama.cpp/Vulkan server:
 ```bash
 MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
 ```
+
+By default this starts llama.cpp with `CTX_SIZE=76800`, `PARALLEL=1`,
+`MEM_LIMIT=75g`, `MEMORY_SWAP=75g`, `GPU_LAYERS=999`, and port `8161`.
+`PARALLEL=1` keeps one server slot instead of multiplying the long context
+across several idle slots. Override these values in the shell if you need a
+smaller context, more concurrent slots, or CPU fallback.
+Set `REBUILD_SERVER_IMAGE=1` when you want to force a fresh llama.cpp/Vulkan
+server image build after changing `docker/llama-cpp-run.sh` or its Dockerfile.
+The agent runner similarly reuses `agentic-feedback-coding:local` after the
+first build; set `REBUILD_AGENT_IMAGE=1` after changing the harness Dockerfile
+or Python code copied into that image.
 
 The default configs expect:
 
@@ -160,6 +207,33 @@ The workflow is deliberately more structured than one-pass code generation:
 
 Both agents share one durable chat history. New feedback is appended at the end; previous requirements, implementation attempts, reviews, and correction requests stay visible until compaction is needed.
 
+## Existing Projects
+
+The harness can work on an existing codebase instead of creating a new project from scratch. Point `runtime.workspace` at the project folder and, if the project already has its own `PLAN.md` or `REQUIREMENTS.md`, give the harness separate state filenames:
+
+```json
+"runtime": {
+  "docker_isolation": true,
+  "workspace": "workspaces/existing-bugfix-demo",
+  "plan_file": "AGENT_PLAN.md",
+  "requirements_file": "AGENT_REQUIREMENTS.md",
+  "research_file": "AGENT_RESEARCH.md"
+}
+```
+
+The checked example seeds a small invoice calculator with a syntax error and a logic bug, then asks the agents to diagnose and repair it without rebuilding the project:
+
+```bash
+bash scripts/seed_existing_bugfix_fixture.sh
+bash scripts/build_and_run.sh --config config.gemma4-existing-bugfix.json
+```
+
+In the verified run, the reviewer first pushed back on vague investigation evidence, then caught that the implementation had fixed only the syntax error while leaving the tax calculation bug. The accepted result fixed both issues, preserved the public API, added `BUGFIX_NOTES.md`, and passed `python -m unittest discover -v`.
+
+## Terminal View
+
+When `runtime.print_transcript=true`, the implementation and feedback turns stream live so a long run shows progress instead of going silent. If stdout is a TTY and `runtime.color_transcript=true`, implementation turns use one color and feedback turns another; redirected logs stay plain text.
+
 ## Feedback Review Tools
 
 The feedback agent does not only read the implementation agent's claims. Before each step review, the harness gives the feedback phase its own evidence:
@@ -168,11 +242,26 @@ The feedback agent does not only read the implementation agent's claims. Before 
 - an independent run of the current plan step's `validation_commands`
 - return codes, stdout/stderr tails, and timeout flags from those commands
 - `git status --short`
-- meaningful changed paths, ignoring harness bookkeeping files such as `PLAN.md` and `.agent_state/`
+- meaningful changed paths, ignoring harness bookkeeping files such as the configured plan/requirements/research documents and `.agent_state/`
 - `git diff --stat`
 - a truncated `git diff`
 
 The automatic evidence gate uses that feedback-side evidence first. In hard-pushback mode it rejects a step if validation is missing, fails, times out, or if the implementation claims completion without meaningful git changes.
+
+The plan checker also rejects validation commands that would accidentally loop
+the agents, such as a raw `python -c "mean([])"` command for an expected
+exception path. Expected failures must use `expected_returncode` or a wrapper
+assertion that exits 0 only when the intended error occurs.
+
+## Context And Tool Output Resilience
+
+The harness has two separate context-protection layers:
+
+- Conversation compaction runs before model calls and also accounts for the next prompt plus the configured response budget.
+- Tool evidence is bounded before it can enter the live transcript. Command stdout/stderr are drained with a bounded tail buffer, workspace file snapshots keep capped excerpts, and git diffs are capped.
+- Bounded reviewer evidence remains available in local run summaries, but the feedback pasted back into the next implementation turn uses a compact evidence summary instead of the raw file/output/diff payload.
+
+This matters because a single noisy command, giant generated file, or huge git diff can otherwise overflow the next local-model request even when ordinary chat-history compaction is enabled.
 
 ## Git Checkpointing
 
@@ -205,18 +294,20 @@ Web research is optional. The project can run fully locally/offline if you disab
 }
 ```
 
-When enabled, web research only runs if the prompt explicitly asks to search/research/browse, look up current/latest information, or includes source URLs. The harness then fetches pages, writes `RESEARCH.md`, appends the research result to the transcript, injects compact research notes into later prompts, and asks the generated project to cite/apply source URLs when sources were actually fetched.
+When enabled, web research only runs if the prompt explicitly asks to search/research/browse, look up current/latest information, or includes source URLs. The harness then fetches pages, writes the configured research file, appends the research result to the transcript, injects compact research notes into later prompts, and asks the generated project to cite/apply source URLs when sources were actually fetched.
 
 ## Output Files
 
-Each run creates a generated workspace under `workspaces/` and writes:
+Each run creates or updates the configured workspace, usually under `workspaces/`, and writes:
 
 - a workspace-local `.git/` repository with baseline, accepted-step, and final-review commits when `git_policy.enabled=true`
-- `RESEARCH.md` when web research was requested and enabled
-- `REQUIREMENTS.md` with refined requirements and assumptions
-- `PLAN.md` with ordered tasks, acceptance criteria, validation commands, and status
-- `.agent_state/conversation.jsonl` with the full machine-readable agent chat
-- `.agent_state/conversation.md` with the same transcript in readable Markdown
+- the configured research file, normally `RESEARCH.md`, when web research was requested and enabled
+- the configured requirements file, normally `REQUIREMENTS.md`, with refined requirements and assumptions
+- the configured plan file, normally `PLAN.md`, with ordered tasks, acceptance criteria, validation commands, and status
+- `.agent_state/conversation.full.jsonl` with the append-only full machine-readable agent chat
+- `.agent_state/conversation.full.md` with the append-only transcript in readable Markdown
+- `.agent_state/conversation.jsonl` with the active model context, which may be compacted during long runs
+- `.agent_state/conversation.md` with the active model context in readable Markdown
 - `.agent_state/summary.json` with step results, review statuses, and feedback evidence
 
 Generated workspaces, logs, reports, transcripts, and test evidence are ignored by git. They are useful locally, but they should not be published by accident.
@@ -228,23 +319,37 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 | `implementation_model.name` | Human-readable model profile name. | `qwen3.6-27b-q4km` |
 | `implementation_model.base_url` | OpenAI-compatible endpoint used by the implementation agent. | `http://127.0.0.1:8161/v1` |
 | `implementation_model.model` | Model id sent to the endpoint. llama.cpp accepts `local-gguf`. | `local-gguf` |
-| `implementation_model.context_window` | Context budget used by compaction logic. | `32768`, `76800` |
-| `implementation_model.max_tokens` | Max response length per model call. | `1024` to `4096` |
+| `implementation_model.context_window` | Context budget used by compaction logic. The default server script starts llama.cpp with `CTX_SIZE=76800`. | `76800` |
+| `implementation_model.max_tokens` | Max response length per model call. This is an upper bound, not a target; prompts still ask for compact JSON. | `32768` |
 | `implementation_model.temperature` | Generation randomness. Lower is usually better for coding. | `0.1` to `0.3` |
 | `implementation_model.request_timeout_seconds` | HTTP timeout for one model response. This is separate from terminal command timeouts. | `21600` |
+| `implementation_model.retry_attempts` | Model HTTP retry budget for temporary server/network failures. Retry progress is printed to stderr. | `20` |
+| `implementation_model.retry_sleep_seconds` | Delay between model HTTP retries. Use `0` only for tests. | `30` |
 | `feedback_model` | Optional separate reviewer model. `null` reuses the implementation model. | `null` or another model block |
 | `mcp_tools.terminal` | Allows command execution for implementation and reviewer validation. | `true` |
 | `mcp_tools.web_scraping` | Allows web research/scraping when a task asks for it. | `true` or `false` |
-| `mcp_tools.web_interaction` | Allows browser-style validation. | `true` or `false` |
+| `mcp_tools.web_interaction` | Adds browser-validation guidance and reviewer expectations. The tested container path is Python Playwright with preinstalled Chromium. | `true` or `false` |
 | `runtime.docker_isolation` | Runs generated project work in a container. Normal use should keep this true. | `true` |
 | `runtime.docker_image` | Agent container image tag. | `agentic-feedback-coding:local` |
+| `runtime.docker_user` | User used inside the agent container. `host` maps to the host UID/GID; `root` is useful only for deliberate container-local package installs. | `host`, `root` |
 | `runtime.workspace` | Host-visible output folder for generated project files. | `workspaces/my-task` |
+| `runtime.plan_file` | Harness-owned plan filename inside the workspace. Use a custom name when editing an existing repo that already has `PLAN.md`. | `PLAN.md`, `AGENT_PLAN.md` |
+| `runtime.requirements_file` | Harness-owned requirements filename inside the workspace. | `REQUIREMENTS.md`, `AGENT_REQUIREMENTS.md` |
+| `runtime.research_file` | Harness-owned research filename inside the workspace. | `RESEARCH.md`, `AGENT_RESEARCH.md` |
 | `runtime.command_timeout_seconds` | Default timeout for one terminal command. Commands can override it with `{"cmd": [...], "timeout_seconds": N}`. | `60` to `300` |
 | `runtime.max_command_timeout_seconds` | Maximum accepted per-command override. Prevents accidental unbounded terminal commands. | `3600` to `21600` |
 | `runtime.print_transcript` | Prints the live agent conversation. | `true` for debugging |
+| `runtime.color_transcript` | Uses ANSI colors for live transcript roles when stdout is a terminal. Redirected logs stay plain text. | `true` |
+| `runtime.live_turn_max_chars` | Optional per-turn cap for live terminal printing only. Saved full transcripts remain append-only and untruncated. | `0` for unlimited, or `30000` |
+| `runtime.final_summary` | Final stdout summary mode after the live transcript. Full evidence is always written to `.agent_state/summary.json`. | `compact`, `full`, `none` |
+| `runtime.feedback_response_max_tokens` | Separate reviewer output cap. Keep this lower than implementation `max_tokens` because feedback should be compact JSON. Set `0` to use the model's full ceiling. | `4096` |
 | `context_compaction.enabled` | Enables transcript compaction near context limits. | `true` |
 | `context_compaction.threshold_ratio` | Trigger compaction at this fraction of context. | `0.8` |
 | `context_compaction.keep_recent_turns` | Recent turns kept verbatim during compaction. | `6` to `12` |
+| `context_compaction.tool_output_max_chars` | Max stdout/stderr tail kept from each terminal command. The process is drained continuously so verbose tools cannot flood memory/context. | `4000` |
+| `context_compaction.workspace_file_max_bytes` | Max bytes read per workspace file for reviewer evidence. Larger files are represented by first/last excerpts plus size metadata. | `20000` |
+| `context_compaction.git_diff_max_chars` | Max git diff text retained for reviewer evidence. | `20000` |
+| `context_compaction.transcript_review_max_chars` | Max compact review payload pasted back into the live implementation chat. | `24000` |
 | `phases.requirements_refinement.max_iterations` | Requirement refinement retry budget. | `2` |
 | `phases.plan_validation.max_iterations` | Plan validation retry budget. | `2` |
 | `phases.implementation.max_iterations` | Per-step implementation retry budget. | `7` |
@@ -262,12 +367,16 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 
 ## Real Example Configs
 
-These configs are intended to run against a real local model endpoint. `config.real-palindrome.json` and `config.real-arithmetic.json` are the compact verified evidence runs documented below; the others are reusable starting points for larger tasks.
+These configs are intended to run against a real local model endpoint. `config.real-palindrome.json` and `config.real-website.json` are the fresh simple/complex evidence runs documented below; the others are reusable starting points for larger tasks.
 
 - `config.example.json` - starter task tracker project.
 - `config.real-palindrome.json` - small verified CLI benchmark used as the current evidence run.
 - `config.real-arithmetic.json` - small verified arithmetic package task.
 - `config.real-website.json` - static website plus browser interaction task.
+- `config.gemma4-palindrome.json` - same small CLI benchmark using Gemma4-26B-A4B.
+- `config.gemma4-website.json` - same static website/browser benchmark using Gemma4-26B-A4B and a bounded live transcript.
+- `config.gemma4-existing-bugfix.json` - existing-project repair benchmark using separate agent-owned state files.
+- `config.gemma4-jsonl-stats.json` - fresh JSONL statistics CLI benchmark using Gemma4-26B-A4B.
 - `config.real-city-research.json` - web-research manifest task.
 - `config.real-platformer.json` - browser platformer task with Playwright validation requirements.
 - `config.gpx-editor.json` - GPX editor task with browser/map-style interaction requirements.
@@ -282,50 +391,88 @@ These configs are intended to run against a real local model endpoint. `config.r
 | `scripts/start_default_model_server.sh` | Builds if needed and starts the default llama.cpp/Vulkan model server on port `8161`. |
 | `scripts/build_and_run.sh` | Convenience wrapper to build/run the agent harness from a config. |
 | `scripts/run_agent.sh` | Lower-level runner that re-enters Docker when `runtime.docker_isolation=true`. |
+| `scripts/seed_existing_bugfix_fixture.sh` | Creates the existing-project repair fixture with planted syntax and logic bugs. |
 | `scripts/env.sh` | Shared path/model defaults. Override values in the shell. |
 
 ## Verified Real Runs
 
-Two real Docker-isolated Qwen3.6-27B Q4_K_M runs were executed with:
+The table below keeps the latest successful evidence for each real Docker-isolated workload. The Qwen palindrome and Gemma website rows were rerun after adding model HTTP retry handling and the separate feedback-response token cap; the other rows are the latest preserved successful evidence for those configs.
+
+The Qwen server used the default script and port:
 
 ```bash
 HF_ROOT=/mnt/hf MODEL_ROOT=/mnt/hf/models bash scripts/start_default_model_server.sh
 bash scripts/build_and_run.sh --config config.real-palindrome.json
-bash scripts/build_and_run.sh --config config.real-arithmetic.json
+bash scripts/build_and_run.sh --config config.real-website.json
 ```
 
-Observed `config.real-palindrome.json` result:
+The Gemma comparison used the same llama.cpp/Vulkan server wrapper with model overrides:
+
+```bash
+HF_ROOT=/mnt/hf MODEL_ROOT=/mnt/hf/models \
+MODEL_PATH=/mnt/hf/models/gemma4-26b-a4b-it-gguf/gemma-4-26B-A4B-it-Q4_K_M.gguf \
+MMPROJ_PATH=/mnt/hf/models/gemma4-26b-a4b-it-gguf/mmproj-gemma-4-26B-A4B-it-f16.gguf \
+CONTAINER=agentic-gemma4-server PORT=8161 CTX_SIZE=76800 \
+bash scripts/start_default_model_server.sh
+
+bash scripts/build_and_run.sh --config config.gemma4-palindrome.json
+bash scripts/build_and_run.sh --config config.gemma4-website.json
+```
+
+The model server was configured for `CTX_SIZE=76800`, `PARALLEL=1`, and the configs used `max_tokens=32768` as a response ceiling. The local models usually returned much smaller compact JSON because the prompts ask for parseable structured output.
+
+| Model | Workload | Config | Result | Time | Step attempts | Notes |
+|---|---|---|---|---:|---|---|
+| Qwen3.6-27B Q4_K_M | Palindrome CLI with unit tests and docs | `config.real-palindrome.json` | resolved | 1,621s | S1=1, S2=1, S3=2, S4=1 | Slower, but disciplined. The reviewer rejected a shallow documentation validator, requested stricter evidence, then accepted the corrected step. |
+| Qwen3.6-27B Q4_K_M | Three-page website with JS interaction and Playwright validation | `config.real-website.json` | resolved | 4,889s | S1=3, S2=3, S3=1, S4=2 | Most robust complex run. The reviewer rejected shallow validation and required browser/runtime evidence before final acceptance. |
+| Gemma4-26B-A4B Q4_K_M | Palindrome CLI with unit tests and docs | `config.gemma4-palindrome.json` | resolved | 195s | S1=1, S2=1, S3=1 | Much faster on the small task and completed without reviewer rework. |
+| Gemma4-26B-A4B Q4_K_M | Three-page website with JS interaction and Python Playwright validation | `config.gemma4-website.json` | resolved | 630s | S1=1, S2=1, S3=5, S4=2 | Fast overall, but more incremental. The reviewer caught missing website files, then caught a broken Playwright assertion before accepting the fixed browser validation. |
+| Gemma4-26B-A4B Q4_K_M | Existing invoice project bug fix | `config.gemma4-existing-bugfix.json` | resolved | 510s | S1=3, S2=2, S3=1 | Confirmed the harness can repair an existing project. The reviewer rejected vague investigation and caught the remaining tax-rate logic bug after the syntax fix. |
+| Gemma4-26B-A4B Q4_K_M | JSONL statistics CLI from scratch | `config.gemma4-jsonl-stats.json` | resolved | 950s | S1=1, S2=4, S3=3, S4=3 | Confirmed a fresh project run after the recent harness changes. The reviewer caught missing tests, syntax/runtime errors, missing sample data, and insufficient final evidence. |
+
+Observed Qwen simple workload result:
 
 - The run entered Docker via `scripts/run_agent.sh` because `runtime.docker_isolation=true`.
 - The generated project was written to `workspaces/real-palindrome` through the `/workspace/project` mount.
-- The local model created `DESIGN_NOTES.md`, `palindrome.py`, `cli.py`, `test_palindrome.py`, `test_cli.py`, and `README.md`.
-- Requirements refinement was challenged once because the first draft skipped the required research/structure-planning step and included a redundant end-to-end step.
-- Plan validation then accepted a three-step plan: core module/tests, CLI/tests, and documentation.
-- Feedback-side validation independently ran `python -m unittest test_palindrome -v`, `python -m unittest discover -v`, `python cli.py racecar`, `python cli.py hello`, `test -f PLAN.md`, `test -f palindrome.py`, `test -f README.md`, and `test -f DESIGN_NOTES.md`.
-- The generated project passed 20 `unittest` cases, including core palindrome behavior, CLI integration, missing-argument handling, case-insensitivity, punctuation handling, non-palindromes, empty strings, and Unicode-aware alphanumeric filtering.
+- Feedback-side validation independently ran the generated unit tests and CLI checks, including positive and negative examples.
+- The latest rerun passed 10 `unittest` cases plus CLI subprocess checks covering core palindrome behavior, case-insensitivity, punctuation handling, non-palindromes, empty strings, and command-line integration.
 - Workspace git recorded a baseline commit, one accepted commit per completed plan step, and a final review commit.
-- Final whole-project review resolved with a clean git state after rerunning all plan validation commands.
 
-Observed `config.real-arithmetic.json` result:
+Observed Qwen complex workload result:
 
-- The run entered Docker via the same isolated `/workspace/project` mount and wrote `workspaces/real-arithmetic`.
-- The fresh Docker build path was exercised for both the llama.cpp/Vulkan server image and the agent image.
-- The first plan was rejected by the feedback agent because it skipped the required research/structure-planning step and did not independently verify README contents.
-- The revised plan added `S0` for available-knowledge notes and project structure planning, then `S1` for code/tests, then `S2` for docs.
-- The local model created `PROJECT_NOTES.md`, `arithmetic_box.py`, `test_arithmetic_box.py`, and `README.md`.
-- Feedback-side validation independently ran the `PROJECT_NOTES.md` assertion, `python -m unittest discover -v`, and README content assertions for `add`, `multiply`, `mean`, and test instructions.
-- The generated project passed 22 `unittest` cases for numeric happy paths, mixed int/float behavior, negative/zero cases, generator input for `mean`, `TypeError` cases, and `ValueError` for empty mean input.
-- Workspace git recorded a baseline commit, one accepted commit per completed plan step, and a final review commit.
-- Final whole-project review resolved with a clean git state.
+- The run entered Docker via the same isolated `/workspace/project` mount and wrote `workspaces/real-website`.
+- Requirements and plan review rejected shallow planning until the steps were independently verifiable.
+- The model created a static website, JavaScript interaction, README/notes, and a Playwright validation script.
+- Feedback required runtime proof that navigation and the JavaScript interaction worked, not only file-existence checks.
+- The accepted project produced browser evidence under the generated workspace, including `out/results.json` and screenshots.
+
+Observed Gemma comparison result:
+
+- Gemma4 was dramatically faster on these two runs, especially the simple CLI task.
+- It handled the simple CLI workload cleanly.
+- On browser work it needed more explicit environmental guidance and more feedback. In the latest rerun, it first produced partial website files, then a failing Playwright test; the reviewer forced the missing files and assertion fix before final acceptance.
+- On the existing-project repair run, configurable state filenames kept the fixture's own files separate from the harness plan/requirements documents.
+- On the JSONL CLI run, the feedback loop did useful work: it caught broken generated code and missing validation evidence before accepting the project.
+- This is not a universal model ranking. It only says that in this harness and with these prompts, Qwen behaved more conservatively on complex coding, while Gemma was much faster and good enough when the tool environment was described tightly.
 
 The evidence is stored locally in ignored generated workspaces:
 
 ```text
 workspaces/real-palindrome/.agent_state/summary.json
-workspaces/real-palindrome/.agent_state/conversation.md
-workspaces/real-arithmetic/.agent_state/summary.json
-workspaces/real-arithmetic/.agent_state/conversation.md
+workspaces/real-palindrome/.agent_state/conversation.full.md
+workspaces/real-website/.agent_state/summary.json
+workspaces/real-website/.agent_state/conversation.full.md
+workspaces/gemma4-palindrome/.agent_state/summary.json
+workspaces/gemma4-palindrome/.agent_state/conversation.full.md
+workspaces/gemma4-website/.agent_state/summary.json
+workspaces/gemma4-website/.agent_state/conversation.full.md
+workspaces/existing-bugfix-demo/.agent_state/summary.json
+workspaces/existing-bugfix-demo/.agent_state/conversation.full.md
+workspaces/gemma4-jsonl-stats/.agent_state/summary.json
+workspaces/gemma4-jsonl-stats/.agent_state/conversation.full.md
 ```
+
+`config.real-arithmetic.json` is also kept as a compact reusable benchmark config; its local workspace can be regenerated the same way if needed.
 
 ## Tests
 

@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from .bounds import clamp_text, estimate_tokens
 from .compaction import maybe_compact
 from .config import AgentConfig
 from .conversation import Conversation
@@ -57,6 +58,10 @@ descriptions and acceptance criteria short enough to fit in one local-model
 response.
 Commands may be argv lists or {"cmd": ["python", "script.py"], "timeout_seconds": 7200}
 when one specific tool call legitimately needs longer than the default timeout.
+Avoid embedding Python source, f-strings, braces, list comprehensions, or other
+quote-heavy snippets inside JSON command strings during planning. Prefer simple
+argv checks such as ["test", "-f", "README.md"]. For complex validation, add a
+plan step that creates a validation script and then run ["python", "validate.py"].
 For expected failure-path tests, use {"cmd": ["python", "-m", "app"], "expected_returncode": 2}
 and assert the stderr/stdout message in a small wrapper command when possible.
 """
@@ -86,13 +91,16 @@ Return strict compact JSON only:
 Do not repeat the full requirements. Keep strings short. Validation commands
 must terminate and assert behavior. Do not use `python -m http.server` by
 itself; wrap any server startup inside a script that performs checks and exits.
+Do not embed inline Python source in JSON command strings. Prefer simple argv
+checks such as ["test", "-f", "index.html"], or run a generated validation
+script such as ["python", "validate.py"].
 """
 
 
 IMPLEMENTATION_CONTRACT = """
 Return strict JSON only:
 {
-  "plan_note": "short note for PLAN.md",
+  "plan_note": "short note for the configured plan file",
   "files": [{"path": "relative/path", "content": "complete file content"}],
   "commands": [["python", "-m", "unittest", "-v"]],
   "test_evidence": ["short description of command/report/screenshot evidence produced"],
@@ -106,6 +114,8 @@ review request in one JSON object because local models may exceed the response
 budget.
 Commands may be argv lists or {"cmd": ["python", "script.py"], "timeout_seconds": 7200}
 when one specific tool call legitimately needs longer than the default timeout.
+Avoid quote-heavy inline Python in JSON command strings. If validation needs
+logic, write a small validation file and run it as a command.
 For expected failure-path tests, use {"cmd": ["python", "-m", "app"], "expected_returncode": 2}
 or, better, a small assertion command that checks the non-zero return code and error text.
 """
@@ -136,16 +146,20 @@ The harness, not the implementation agent, owns git staging and commits after a
 step is accepted. Treat untracked meaningful files as reviewable pre-acceptance
 diff evidence, and do not request `git add` or `git commit` from the
 implementation agent.
-The harness also writes PLAN.md notes and marks a plan step resolved after
-feedback accepts it. During review, accept a current-step PLAN.md marker that is
-still pending/in-progress when the implementation evidence is otherwise
-complete; do not require the implementation agent to mark a step completed
-before you have accepted it.
+The harness also writes configured plan-file notes and marks a plan step
+resolved after feedback accepts it. During review, accept a current-step
+plan-file marker that is still pending/in-progress when the implementation
+evidence is otherwise complete; do not require the implementation agent to mark
+a step completed before you have accepted it.
 Reject shallow or tautological validation. Tests must exercise user-visible
 behavior for the current requirement, not merely check that a file contains a
 string or that a script exists. For browser work, prefer real interaction
 evidence through Playwright, screenshots, and JSON reports when web interaction
-tools are enabled.
+tools are enabled. Do not ask generated validation scripts to install browsers
+or packages at runtime; the harness container is responsible for browser/tool
+availability. In compromise mode, accept a clearly-labelled fallback only when
+browser launch fails under bounded timeouts and the fallback still proves the
+user-visible behavior as directly as possible.
 Expected failure paths are valid evidence when the command declares an
 expected_returncode or uses a wrapper assertion to check the non-zero exit code
 and error text. Do not reject such evidence just because the user-facing command
@@ -186,7 +200,10 @@ class FeedbackLoopAgent:
         self.state_dir = self.workspace / ".agent_state"
         self.conversation = Conversation(
             self.state_dir / "conversation.jsonl",
+            full_path=self.state_dir / "conversation.full.jsonl",
             echo=config.runtime.print_transcript,
+            echo_limit_chars=config.runtime.live_turn_max_chars,
+            color=config.runtime.color_transcript,
         )
         self.impl_client = implementation_client or OpenAICompatClient(config.implementation_model)
         self.feedback_client = feedback_client or OpenAICompatClient(config.feedback_model or config.implementation_model)
@@ -200,10 +217,55 @@ class FeedbackLoopAgent:
         }
         self.git_baseline_ref = ""
 
+    def _plan_path(self) -> Any:
+        return self.workspace / self.config.runtime.plan_file
+
+    def _requirements_path(self) -> Any:
+        return self.workspace / self.config.runtime.requirements_file
+
+    def _research_path(self) -> Any:
+        return self.workspace / self.config.runtime.research_file
+
+    def _harness_doc_names(self) -> set[str]:
+        return {
+            self.config.runtime.plan_file,
+            self.config.runtime.requirements_file,
+            self.config.runtime.research_file,
+            "PLAN.md",
+            "REQUIREMENTS.md",
+            "RESEARCH.md",
+            "AGENT_PLAN.md",
+            "AGENT_REQUIREMENTS.md",
+            "AGENT_RESEARCH.md",
+        }
+
+    def _ensure_plan(self) -> None:
+        ensure_plan(self.workspace, self.config.runtime.plan_file)
+
+    def _append_plan_note(self, note: str) -> None:
+        append_plan_note(self.workspace, note, self.config.runtime.plan_file)
+
+    def _write_plan_doc(self) -> None:
+        write_plan_doc(
+            self.workspace,
+            self.requirements,
+            self.plan_steps,
+            self.plan_notes,
+            self.config.runtime.plan_file,
+        )
+
+    def _write_requirements_doc(self, review: dict[str, Any] | None = None) -> None:
+        write_requirements_doc(
+            self.workspace,
+            self.requirements,
+            review,
+            self.config.runtime.requirements_file,
+        )
+
     def initialize(self) -> None:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        ensure_plan(self.workspace)
+        self._ensure_plan()
         if self.config.git_policy.enabled:
             ensure_git_repo(
                 self.workspace,
@@ -216,13 +278,16 @@ class FeedbackLoopAgent:
                 (
                     "You are an agentic coding/workflow model. Work in explicit phases: "
                     "requirements refinement, plan validation, then one implementation feedback loop per plan step. "
-                    "Maintain PLAN.md and REQUIREMENTS.md. Keep all work inside the project workspace. "
+                    f"Maintain {self.config.runtime.plan_file} and {self.config.runtime.requirements_file}. "
+                    "Keep all work inside the project workspace. "
                     "The workspace is a git repository when git_policy is enabled; accepted plan steps are "
                     "committed only by the harness after feedback review agrees they are complete. "
                     "Implementation turns may inspect git status and diffs, but must not run git add, "
                     "git commit, git reset, git checkout, or other repository-mutating git commands. "
                     "This transcript is durable chat memory: IMPLEMENTATION_AGENT_REQUEST/RESPONSE and "
-                    "FEEDBACK_AGENT_REQUEST/RESPONSE blocks are cumulative context, not isolated prompts."
+                    "FEEDBACK_AGENT_REQUEST/RESPONSE blocks are cumulative context, not isolated prompts. "
+                    f"Harness-owned state files are {self.config.runtime.plan_file}, "
+                    f"{self.config.runtime.requirements_file}, and {self.config.runtime.research_file}."
                 ),
             )
             self.conversation.append(
@@ -237,15 +302,24 @@ class FeedbackLoopAgent:
         turns see model answers but not the exact task/review that caused them,
         which makes long local-model sessions drift quickly.
         """
+        content = "IMPLEMENTATION_AGENT_REQUEST:\n" + prompt
+        expected_response_tokens = max_tokens or self.config.implementation_model.max_tokens
+        maybe_compact(
+            self.conversation,
+            self.config,
+            self.impl_client,
+            context_window=self.config.implementation_model.context_window,
+            incoming_tokens=estimate_tokens(content) + expected_response_tokens,
+        )
+        self.conversation.append("user", content)
+        raw = self.impl_client.chat(self.conversation.messages(), max_tokens=max_tokens)
+        self.conversation.append("assistant", "IMPLEMENTATION_AGENT_RESPONSE:\n" + raw)
         maybe_compact(
             self.conversation,
             self.config,
             self.impl_client,
             context_window=self.config.implementation_model.context_window,
         )
-        self.conversation.append("user", "IMPLEMENTATION_AGENT_REQUEST:\n" + prompt)
-        raw = self.impl_client.chat(self.conversation.messages(), max_tokens=max_tokens)
-        self.conversation.append("assistant", "IMPLEMENTATION_AGENT_RESPONSE:\n" + raw)
         return raw
 
     def _feedback_chat(self, prompt: str, *, temperature: float = 0.1) -> str:
@@ -257,21 +331,31 @@ class FeedbackLoopAgent:
         previous reviews, which gives it continuity across loops.
         """
         feedback_cfg = self.config.feedback_model or self.config.implementation_model
+        response_tokens = self._feedback_response_tokens(feedback_cfg)
+        content = "FEEDBACK_AGENT_REQUEST:\n" + prompt
+        maybe_compact(
+            self.conversation,
+            self.config,
+            self.feedback_client,
+            context_window=feedback_cfg.context_window,
+            incoming_tokens=estimate_tokens(content) + response_tokens,
+        )
+        self.conversation.append("user", content)
+        raw = self.feedback_client.chat(
+            [
+                {"role": "system", "content": FEEDBACK_SYSTEM_PROMPT},
+                *self.conversation.messages(system_as_user=True),
+            ],
+            max_tokens=response_tokens,
+            temperature=temperature,
+        )
+        self.conversation.append("user", "FEEDBACK_AGENT_RESPONSE:\n" + raw)
         maybe_compact(
             self.conversation,
             self.config,
             self.feedback_client,
             context_window=feedback_cfg.context_window,
         )
-        self.conversation.append("user", "FEEDBACK_AGENT_REQUEST:\n" + prompt)
-        raw = self.feedback_client.chat(
-            [
-                {"role": "system", "content": FEEDBACK_SYSTEM_PROMPT},
-                *self.conversation.messages(system_as_user=True),
-            ],
-            temperature=temperature,
-        )
-        self.conversation.append("user", "FEEDBACK_AGENT_RESPONSE:\n" + raw)
         return raw
 
     def _feedback_chat_with_compact_context(
@@ -289,17 +373,47 @@ class FeedbackLoopAgent:
         request and response are still appended to the durable transcript, but
         the model call receives a compact summary plus the final-review payload.
         """
-        self.conversation.append("user", "FEEDBACK_AGENT_REQUEST:\n" + prompt)
+        feedback_cfg = self.config.feedback_model or self.config.implementation_model
+        response_tokens = self._feedback_response_tokens(feedback_cfg)
+        content = "FEEDBACK_AGENT_REQUEST:\n" + prompt
+        maybe_compact(
+            self.conversation,
+            self.config,
+            self.feedback_client,
+            context_window=feedback_cfg.context_window,
+            incoming_tokens=estimate_tokens(content) + response_tokens,
+        )
+        self.conversation.append("user", content)
         raw = self.feedback_client.chat(
             [
                 {"role": "system", "content": FEEDBACK_SYSTEM_PROMPT},
                 {"role": "user", "content": "COMPACT_TRANSCRIPT_CONTEXT:\n" + context_note},
                 {"role": "user", "content": "FEEDBACK_AGENT_REQUEST:\n" + prompt},
             ],
+            max_tokens=response_tokens,
             temperature=temperature,
         )
         self.conversation.append("user", "FEEDBACK_AGENT_RESPONSE:\n" + raw)
+        maybe_compact(
+            self.conversation,
+            self.config,
+            self.feedback_client,
+            context_window=feedback_cfg.context_window,
+        )
         return raw
+
+    def _feedback_response_tokens(self, feedback_cfg) -> int:
+        """Keep reviewer JSON bounded even when implementation output can be large.
+
+        The implementation model may need a high ceiling for generated files,
+        but feedback turns should normally be compact JSON. Without a separate
+        cap, a local model can spend many minutes filling the full implementation
+        ceiling after it has already said enough for review.
+        """
+        configured = self.config.runtime.feedback_response_max_tokens
+        if configured <= 0:
+            return feedback_cfg.max_tokens
+        return max(512, min(feedback_cfg.max_tokens, configured))
 
     def _extract_json_or_retry(
         self,
@@ -339,7 +453,9 @@ class FeedbackLoopAgent:
                 "implementation tried to write too many files, return exactly one small file in "
                 "this repair; the feedback loop can request the rest later. Keep validation "
                 "commands concise, runnable in the project workspace, terminating, and assertion-based. "
-                "Do not use python -m http.server by itself as validation. Per-attempt file limits are "
+                "Do not use python -m http.server by itself as validation. Avoid inline python -c, "
+                "f-strings, braces, list comprehensions, and quote-heavy snippets in JSON command strings; "
+                "prefer simple argv checks or a generated validation script. Per-attempt file limits are "
                 "not plan-step limits. For expected failure-path checks, use expected_returncode or a "
                 "wrapper assertion that verifies the non-zero code and error text." + step_limit_text + "\n\n"
                 f"Required contract:\n{contract}\n\n"
@@ -355,8 +471,10 @@ class FeedbackLoopAgent:
             try:
                 return extract_json_object(repaired)
             except Exception as repair_exc:
+                if feedback:
+                    return self._malformed_feedback_fallback(phase, exc, repair_exc)
                 if "REQUIREMENTS" not in phase:
-                    raise
+                    return self._malformed_implementation_fallback(phase, exc, repair_exc)
                 last_chance_prompt = (
                     f"{phase}_MINIMAL_JSON_REPAIR\n"
                     f"The previous repair also failed: {repair_exc}\n"
@@ -364,11 +482,64 @@ class FeedbackLoopAgent:
                     "Use max 5 plan steps. Each step must have only: id, title, one-sentence description, "
                     "depends_on, two acceptance_criteria, and one validation_commands entry. "
                     "Use max 6 refined_requirements, max 3 assumptions, max 2 open_questions. "
+                    "Use only simple validation commands such as [\"test\", \"-f\", \"index.html\"] "
+                    "or [\"python\", \"validate.py\"]. Do not use inline python -c. "
                     "JSON starts with { and ends with }.\n\n"
                     f"Required contract:\n{contract}"
                 )
                 repaired_minimal = self._implementation_chat(last_chance_prompt, max_tokens=4096)
                 return extract_json_object(repaired_minimal)
+
+    def _malformed_feedback_fallback(
+        self,
+        phase: str,
+        parse_error: Exception,
+        repair_error: Exception,
+    ) -> dict[str, Any]:
+        """Convert an unparseable reviewer turn into bounded actionable feedback.
+
+        Some local models occasionally drift into half-JSON or repeated analysis
+        even during the repair turn. Crashing at that point loses a long run.
+        This deterministic fallback keeps the transcript honest: it records that
+        the reviewer failed to produce usable JSON and asks the implementation
+        side for a smaller, more easily reviewed next attempt.
+        """
+        summary = f"{phase} reviewer response was malformed after JSON repair."
+        return {
+            "status": "needs_rework",
+            "needs_rework": True,
+            "summary": summary,
+            "required_changes": [
+                "Retry the current step with a smaller directly verifiable change.",
+                "Provide concise test evidence so the next review does not depend on long free-form reasoning.",
+            ],
+            "verification_evidence": [
+                "Harness parser could not extract valid reviewer JSON from the original or repair response."
+            ],
+            "parse_error": str(parse_error),
+            "repair_error": str(repair_error),
+        }
+
+    def _malformed_implementation_fallback(
+        self,
+        phase: str,
+        parse_error: Exception,
+        repair_error: Exception,
+    ) -> dict[str, Any]:
+        """Return a no-op implementation payload when the model cannot emit JSON.
+
+        The feedback loop can then reject the empty attempt through the normal
+        git/evidence gates instead of terminating the whole run.
+        """
+        return {
+            "plan_note": f"{phase} implementation response was malformed after JSON repair.",
+            "files": [],
+            "commands": [],
+            "test_evidence": [],
+            "resolution_request": "none",
+            "parse_error": str(parse_error),
+            "repair_error": str(repair_error),
+        }
 
     def run(self) -> dict:
         self.initialize()
@@ -379,17 +550,21 @@ class FeedbackLoopAgent:
         step_results: list[dict[str, Any]] = []
         for step in self.plan_steps:
             step_results.append(self._implementation_loop_for_step(step))
-            write_plan_doc(self.workspace, self.requirements, self.plan_steps, self.plan_notes)
+            self._write_plan_doc()
             if step_results[-1]["status"] == "cannot_resolve" and self.config.resolution_policy.stop_on_cannot_resolve:
                 break
         final_review = self._final_review_phase(step_results)
         git_finalize = self._git_finalize_policy()
-        transcript_md = self.state_dir / "conversation.md"
-        self.conversation.write_markdown(transcript_md)
+        active_transcript_md = self.state_dir / "conversation.md"
+        full_transcript_md = self.state_dir / "conversation.full.md"
+        self.conversation.write_markdown(active_transcript_md)
+        self.conversation.write_markdown(full_transcript_md, full=True)
         summary = {
             "workspace": str(self.workspace),
-            "transcript_jsonl": ".agent_state/conversation.jsonl",
-            "transcript_markdown": ".agent_state/conversation.md",
+            "transcript_jsonl": ".agent_state/conversation.full.jsonl",
+            "transcript_markdown": ".agent_state/conversation.full.md",
+            "active_transcript_jsonl": ".agent_state/conversation.jsonl",
+            "active_transcript_markdown": ".agent_state/conversation.md",
             "web_research": research_result,
             "requirements_refinement": req_result,
             "plan_validation": plan_result,
@@ -412,7 +587,7 @@ class FeedbackLoopAgent:
         This is deliberately orchestration-owned rather than model-owned. Local
         models are good at using notes, but they are unreliable at proving they
         actually browsed. The harness therefore records fetched source evidence
-        in RESEARCH.md, injects a compact version into later prompts, and lets
+        in the configured research file, injects a compact version into later prompts, and lets
         review gates reject generated work that ignores the fetched sources.
         """
         if not self.config.mcp_tools.web_scraping:
@@ -425,10 +600,12 @@ class FeedbackLoopAgent:
         else:
             result = run_web_research(self.config.project_design.prompt, self.config.web_research)
         self.web_research_result = result
-        (self.workspace / "RESEARCH.md").write_text(research_to_markdown(result), encoding="utf-8")
+        self._research_path().write_text(research_to_markdown(result), encoding="utf-8")
         self.conversation.append("user", "WEB_RESEARCH_TOOL_RESULT:\n" + json.dumps(result, indent=2))
         if result.get("requested"):
-            append_plan_note(self.workspace, f"[research] {result.get('status')}: web research evidence written to RESEARCH.md")
+            self._append_plan_note(
+                f"[research] {result.get('status')}: web research evidence written to {self.config.runtime.research_file}"
+            )
         return result
 
     def _requirements_refinement_phase(self, extra_context: str | None = None) -> dict:
@@ -486,18 +663,22 @@ class FeedbackLoopAgent:
             self.plan_steps = normalize_plan_steps(latest.get("plan", []))
             for step in self.plan_steps:
                 step.setdefault("status", "pending")
-            write_requirements_doc(self.workspace, self.requirements)
-            write_plan_doc(self.workspace, self.requirements, self.plan_steps, self.plan_notes)
+            self._write_requirements_doc()
+            self._write_plan_doc()
             review = self._requirements_review(index, latest)
             iterations.append({"iteration": index, "requirements": latest, "review": review})
             if self._status(review) == "resolved":
-                write_requirements_doc(self.workspace, self.requirements, review)
-                append_plan_note(self.workspace, f"[requirements] resolved after iteration {index}: {review.get('summary', '')}")
+                self._write_requirements_doc(review)
+                self._append_plan_note(f"[requirements] resolved after iteration {index}: {review.get('summary', '')}")
                 return {"status": "resolved", "iterations": iterations}
-            self.conversation.append("user", "REQUIREMENTS_REWORK_DIRECTIVE:\nRevise requirements using this review:\n" + json.dumps(review, indent=2))
+            self.conversation.append(
+                "user",
+                "REQUIREMENTS_REWORK_DIRECTIVE:\nRevise requirements using this review:\n"
+                + json.dumps(self._compact_review_for_transcript(review), indent=2),
+            )
         fallback = self._fallback_resolution("requirements", review)
         self.requirements.setdefault("assumptions", []).append(fallback["note"])
-        write_requirements_doc(self.workspace, self.requirements, review)
+        self._write_requirements_doc(review)
         return {"status": fallback["status"], "iterations": iterations, "resolution": fallback}
 
     def _requirements_review(self, index: int, requirements: dict[str, Any]) -> dict:
@@ -546,14 +727,14 @@ class FeedbackLoopAgent:
             review = self._plan_validation_review(index)
             iterations.append({"iteration": index, "review": review, "plan": self.plan_steps})
             if self._status(review) == "resolved":
-                append_plan_note(self.workspace, f"[plan] validated after iteration {index}: {review.get('summary', '')}")
-                write_plan_doc(self.workspace, self.requirements, self.plan_steps, self.plan_notes)
+                self._append_plan_note(f"[plan] validated after iteration {index}: {review.get('summary', '')}")
+                self._write_plan_doc()
                 return {"status": "resolved", "iterations": iterations}
             refined = self._plan_refinement_pass(index, review)
             iterations[-1]["refinement"] = refined
         fallback = self._fallback_resolution("plan", review)
         self.plan_notes.append(fallback["note"])
-        write_plan_doc(self.workspace, self.requirements, self.plan_steps, self.plan_notes)
+        self._write_plan_doc()
         return {"status": fallback["status"], "iterations": iterations, "resolution": fallback}
 
     def _plan_validation_review(self, index: int) -> dict:
@@ -629,9 +810,9 @@ class FeedbackLoopAgent:
             f"Requirements summary: {self._requirements_summary_for_prompt()}\n"
             f"Current plan: {json.dumps(self.plan_steps)}\n"
             f"Web research evidence: {compact_research_for_prompt(self.web_research_result)}\n"
-            f"Review: {json.dumps(review)}\n\n{PLAN_REFINEMENT_CONTRACT}"
+            f"Review: {json.dumps(self._compact_review_for_transcript(review))}\n\n{PLAN_REFINEMENT_CONTRACT}"
         )
-        raw = self._implementation_chat(prompt, max_tokens=2048)
+        raw = self._implementation_chat(prompt)
         try:
             payload = self._extract_json_or_retry(
                 raw,
@@ -653,7 +834,7 @@ class FeedbackLoopAgent:
             self.requirements["planning_confirmation"] = payload["planning_confirmation"]
         self.plan_steps = normalize_plan_steps(payload.get("plan", self.plan_steps))
         self.plan_notes.append(f"Plan refined after review iteration {index}.")
-        write_plan_doc(self.workspace, self.requirements, self.plan_steps, self.plan_notes)
+        self._write_plan_doc()
         return payload
 
     def _implementation_loop_for_step(self, step: dict[str, Any]) -> dict:
@@ -676,28 +857,27 @@ class FeedbackLoopAgent:
             last_summary = summary
             if status in {"resolved", "resolved_with_compromise", "skipped_with_note"}:
                 step["status"] = "resolved"
-                append_plan_note(self.workspace, f"[{step['id']}] resolved: {summary}")
-                write_plan_doc(self.workspace, self.requirements, self.plan_steps, self.plan_notes)
+                self._append_plan_note(f"[{step['id']}] resolved: {summary}")
+                self._write_plan_doc()
                 attempts[-1]["git_commit"] = self._git_commit_completed_step(step)
                 return {"step_id": step["id"], "status": "resolved", "attempts": attempts}
             if status == "needs_plan_change":
                 self._plan_refinement_pass(attempt, review)
             elif status == "needs_requirements_change":
-                self._requirements_refinement_phase(extra_context=json.dumps(review))
+                self._requirements_refinement_phase(extra_context=json.dumps(self._compact_review_for_transcript(review)))
             elif status == "cannot_resolve":
                 step["status"] = "cannot_resolve"
-                append_plan_note(self.workspace, f"[{step['id']}] cannot resolve: {summary}")
+                self._append_plan_note(f"[{step['id']}] cannot resolve: {summary}")
                 return {"step_id": step["id"], "status": "cannot_resolve", "attempts": attempts}
             if same_error_count >= self.config.resolution_policy.max_same_error_repeats:
-                append_plan_note(
-                    self.workspace,
+                self._append_plan_note(
                     f"[{step['id']}] repeated review pattern in {review_mode} mode; continuing because retry budget is bounded.",
                 )
             self.conversation.append(
                 "user",
                 "NEXT_IMPLEMENTATION_DIRECTIVE:\nApply this step review in the next attempt. "
                 "Keep previous requirements, plan validation, and this step context in mind:\n"
-                + json.dumps(review, indent=2),
+                + json.dumps(self._compact_review_for_transcript(review), indent=2),
             )
         resolution = self._fallback_resolution(f"step {step['id']}", attempts[-1]["review"] if attempts else {})
         step["status"] = resolution["status"]
@@ -712,8 +892,8 @@ class FeedbackLoopAgent:
             "criteria and include validation commands that prove the step whenever terminal tools are enabled.\n"
             "Do not stage or commit with git. The harness owns git add/commit after feedback accepts a step. "
             "You may run read-only git commands such as git status or git diff for your own evidence.\n"
-            "Do not rewrite PLAN.md just to mark the current step complete; put progress in plan_note. "
-            "The harness appends notes and marks resolved after feedback accepts the step. Only edit PLAN.md "
+            f"Do not rewrite {self.config.runtime.plan_file} just to mark the current step complete; put progress in plan_note. "
+            f"The harness appends notes and marks resolved after feedback accepts the step. Only edit {self.config.runtime.plan_file} "
             "when the feedback request specifically requires substantive plan content changes.\n"
             "Keep this attempt small and parseable: write exactly one meaningful file, or two tiny files only if they "
             "are inseparable. If feedback requested several changes, choose the single most blocking file, note what "
@@ -722,6 +902,8 @@ class FeedbackLoopAgent:
             f"Validated plan step ids: {[step.get('id') for step in self.plan_steps]}\n"
             f"Current step: {json.dumps(step)}\n\n{IMPLEMENTATION_CONTRACT}"
         )
+        if self._looks_like_browser_step(step):
+            prompt += "\n" + self._browser_validation_guidance()
         if self._has_completed_research():
             prompt += (
                 "\nWEB_RESEARCH_USAGE_REQUIREMENT:\n"
@@ -756,9 +938,10 @@ class FeedbackLoopAgent:
                 payload.get("commands", []),
                 self.config.runtime.command_timeout_seconds,
                 self.config.runtime.max_command_timeout_seconds,
+                output_limit_chars=self.config.context_compaction.tool_output_max_chars,
             )
         note = payload.get("plan_note") or f"{step['id']} attempt {attempt} implementation pass completed."
-        append_plan_note(self.workspace, f"[{step['id']} attempt {attempt}] {note}")
+        self._append_plan_note(f"[{step['id']} attempt {attempt}] {note}")
         return {"written": written, "commands": command_results, "raw": payload}
 
     def _step_review_pass(
@@ -769,7 +952,7 @@ class FeedbackLoopAgent:
         review_mode: str,
     ) -> dict:
         """Critique one step using reviewer-owned file and command evidence."""
-        plan_text = (self.workspace / "PLAN.md").read_text(encoding="utf-8")
+        plan_text = self._plan_path().read_text(encoding="utf-8")
         feedback_tool_evidence = self._step_feedback_tool_evidence(step)
         evidence_findings = self._evidence_findings(step, implementation, feedback_tool_evidence)
         evidence_findings.extend(self._research_usage_findings(step, feedback_tool_evidence))
@@ -796,15 +979,18 @@ class FeedbackLoopAgent:
                 "Use feedback_tool_evidence.git.status_short/diff_stat/diff to review changes since the last accepted step commit.",
                 "Untracked meaningful paths are valid pre-acceptance implementation evidence; the harness will stage and commit after acceptance.",
                 "If git meaningful_changed_paths is empty for an implementation step, request the missing change and name the current plan requirement.",
+                "Validation-only steps may have no git diff when reviewer-owned validation commands pass; do not reject those solely for an empty working tree.",
                 "Do not ask the implementation agent to run git add or git commit; repository mutation is harness-owned.",
-                "Do not require the implementation agent to pre-mark the current step completed in PLAN.md; the harness marks resolved after acceptance.",
+                f"Do not require the implementation agent to pre-mark the current step completed in {self.config.runtime.plan_file}; the harness marks resolved after acceptance.",
                 "Do not accept a step just because the implementation agent claims tests passed.",
                 "Reject validation that is too shallow for the requirement; require evidence that exercises the feature from the user's perspective.",
                 "For negative-path behavior, prefer wrapper commands that assert return code and error text, or commands with expected_returncode set.",
                 "If web_research_evidence has completed sources, confirm the generated work actually cites and applies those source URLs.",
                 "If test evidence is absent in hard_pushback mode, return needs_rework.",
                 "If evidence remains imperfect in compromise mode, either return needs_rework with a small bounded fix or resolved_with_compromise/skipped_with_note with an explicit diluted requirement note.",
-                "For browser/game work, require Playwright-style interaction evidence and screenshot/report artifacts when configured.",
+                "For browser/game work, prefer Playwright-style interaction evidence and screenshot/report artifacts when configured.",
+                "Do not request package/browser installation inside generated validation scripts; request bounded browser launch timeouts and graceful fallback instead.",
+                "In compromise mode, accept a clearly labelled non-browser fallback only when browser launch cannot be made reliable and the fallback still gives concrete evidence.",
                 "Return needs_plan_change if this step cannot be independently verified as written.",
                 "Return needs_requirements_change if the requirements are contradictory or impossible.",
                 "Return cannot_resolve only when bounded retries are unlikely to help.",
@@ -826,7 +1012,7 @@ class FeedbackLoopAgent:
             "against its acceptance criteria and test evidence.\n"
             + json.dumps(prompt),
             context_note=(
-                "The full multi-turn transcript is stored in .agent_state/conversation.jsonl. "
+                "The full multi-turn transcript is stored in .agent_state/conversation.full.jsonl. "
                 "Use this compact step-review payload plus reviewer-owned validation reruns. "
                 "If the compact evidence shows failed commands, missing files, or no meaningful git diff, "
                 "request concrete implementation changes instead of accepting the step. Do not request git add/commit."
@@ -842,7 +1028,7 @@ class FeedbackLoopAgent:
         review = self._enforce_evidence_policy(review, evidence_findings, review_mode)
         review["feedback_tool_evidence"] = feedback_tool_evidence
         review["deterministic_evidence_findings"] = evidence_findings
-        append_plan_note(self.workspace, f"[{step['id']} attempt {attempt}] review: {review.get('summary', 'no summary')}")
+        self._append_plan_note(f"[{step['id']} attempt {attempt}] review: {review.get('summary', 'no summary')}")
         return review
 
     def _final_review_phase(self, step_results: list[dict[str, Any]]) -> dict:
@@ -852,8 +1038,8 @@ class FeedbackLoopAgent:
             review = self._final_project_review(attempt, step_results)
             item: dict[str, Any] = {"attempt": attempt, "review": review}
             if self._status(review) in {"resolved", "resolved_with_compromise", "skipped_with_note"}:
-                append_plan_note(self.workspace, f"[final review] resolved: {review.get('summary', '')}")
-                write_plan_doc(self.workspace, self.requirements, self.plan_steps, self.plan_notes)
+                self._append_plan_note(f"[final review] resolved: {review.get('summary', '')}")
+                self._write_plan_doc()
                 item["git_commit"] = self._git_commit_final_review()
                 iterations.append(item)
                 return {"status": self._status(review), "iterations": iterations}
@@ -861,7 +1047,7 @@ class FeedbackLoopAgent:
             item["correction"] = correction
             iterations.append(item)
         fallback = self._fallback_resolution("final review", iterations[-1]["review"] if iterations else {})
-        append_plan_note(self.workspace, f"[final review] {fallback['status']}: {fallback['note']}")
+        self._append_plan_note(f"[final review] {fallback['status']}: {fallback['note']}")
         return {"status": fallback["status"], "iterations": iterations, "resolution": fallback}
 
     def _final_project_review(self, attempt: int, step_results: list[dict[str, Any]]) -> dict:
@@ -889,7 +1075,7 @@ class FeedbackLoopAgent:
             "and all test evidence. Push back if the project lacks proof or contradicts requirements.\n"
             + json.dumps(prompt),
             context_note=(
-                "The full multi-turn transcript is stored in .agent_state/conversation.jsonl. "
+                "The full multi-turn transcript is stored in .agent_state/conversation.full.jsonl. "
                 "Use this compact final-review payload plus reviewer-owned validation reruns to decide. "
                 "All individual plan steps were reviewed before this final pass."
             ),
@@ -952,7 +1138,10 @@ class FeedbackLoopAgent:
     def _compact_command_results_for_prompt(self, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Trim command results for prompts while preserving pass/fail signals."""
         compact: list[dict[str, Any]] = []
+        limit = max(2000, min(self.config.context_compaction.tool_output_max_chars, 12000))
         for result in results:
+            stdout = str(result.get("stdout", ""))
+            stderr = str(result.get("stderr", ""))
             compact.append({
                 "command": result.get("command"),
                 "timeout_seconds": result.get("timeout_seconds"),
@@ -960,8 +1149,10 @@ class FeedbackLoopAgent:
                 "expected_returncode": result.get("expected_returncode"),
                 "returncode_matches_expected": result.get("returncode_matches_expected"),
                 "timed_out": result.get("timed_out"),
-                "stdout_excerpt": str(result.get("stdout", ""))[:800],
-                "stderr_excerpt": str(result.get("stderr", ""))[:800],
+                "stdout": self._prompt_excerpt(stdout, limit),
+                "stderr": self._prompt_excerpt(stderr, limit),
+                "stdout_prompt_truncated": len(stdout) > limit,
+                "stderr_prompt_truncated": len(stderr) > limit,
             })
         return compact
 
@@ -981,12 +1172,7 @@ class FeedbackLoopAgent:
         """Summarize reviewer-owned step evidence for local-model context limits."""
         files = []
         for item in evidence.get("workspace_files", []):
-            content = str(item.get("content", ""))
-            files.append({
-                "path": item.get("path"),
-                "size": len(content.encode("utf-8")),
-                "excerpt": content[:1000],
-            })
+            files.append(self._compact_file_for_prompt(item, default_limit=1800))
         git = evidence.get("git") or {}
         return {
             "kind": evidence.get("kind"),
@@ -1008,12 +1194,7 @@ class FeedbackLoopAgent:
         """Summarize final tool evidence without dumping full file contents."""
         files = []
         for item in evidence.get("workspace_files", []):
-            content = str(item.get("content", ""))
-            files.append({
-                "path": item.get("path"),
-                "size": len(content.encode("utf-8")),
-                "excerpt": content[:500],
-            })
+            files.append(self._compact_file_for_prompt(item, default_limit=1200))
         validations = []
         for validation in evidence.get("step_validations", []):
             results = []
@@ -1024,8 +1205,10 @@ class FeedbackLoopAgent:
                     "expected_returncode": result.get("expected_returncode"),
                     "returncode_matches_expected": result.get("returncode_matches_expected"),
                     "timed_out": result.get("timed_out"),
-                    "stdout_excerpt": str(result.get("stdout", ""))[:500],
-                    "stderr_excerpt": str(result.get("stderr", ""))[:500],
+                    "stdout": self._prompt_excerpt(str(result.get("stdout", "")), 2000),
+                    "stderr": self._prompt_excerpt(str(result.get("stderr", "")), 2000),
+                    "stdout_prompt_truncated": len(str(result.get("stdout", ""))) > 2000,
+                    "stderr_prompt_truncated": len(str(result.get("stderr", ""))) > 2000,
                 })
             validations.append({
                 "step_id": validation.get("step_id"),
@@ -1046,13 +1229,104 @@ class FeedbackLoopAgent:
             },
         }
 
+    def _compact_file_for_prompt(self, item: dict[str, Any], *, default_limit: int) -> dict[str, Any]:
+        """Prepare a workspace file for reviewer prompts without false truncation signals.
+
+        The workspace snapshot records whether the source file itself was
+        truncated. Reviewer prompts may need a smaller excerpt. Keep those two
+        facts separate so the feedback model does not misread a prompt-budget
+        excerpt as missing test evidence.
+        """
+        content = str(item.get("content", ""))
+        path = str(item.get("path", ""))
+        important = path.endswith((
+            "validation_evidence.log",
+            "results.json",
+            "report.json",
+            "playwright-report.json",
+        ))
+        limit = 12000 if important else default_limit
+        prompt_truncated = len(content) > limit
+        return {
+            "path": path,
+            "size": item.get("size", len(content.encode("utf-8"))),
+            "source_truncated": item.get("truncated", False),
+            "prompt_truncated": prompt_truncated,
+            "content": self._prompt_excerpt(content, limit),
+        }
+
+    def _prompt_excerpt(self, text: str, limit: int) -> str:
+        """Return text for a model prompt with an explicit middle truncation marker."""
+        if len(text) <= limit:
+            return text
+        head = max(1, limit // 2)
+        tail = max(1, limit - head)
+        return (
+            text[:head]
+            + f"\n\n[prompt payload truncated: kept first {head} and last {tail} chars]\n\n"
+            + text[-tail:]
+        )
+
+    def _compact_review_for_transcript(self, review: dict[str, Any]) -> dict[str, Any]:
+        """Return review data safe to paste back into the live chat.
+
+        Full review objects can contain reviewer-owned file snapshots, command
+        output, and git diffs. Those are kept in `summary.json`, but the next
+        implementation turn only needs the decision, concrete requests, and a
+        bounded evidence summary. This is the main guard against one verbose
+        tool call overflowing the next model context.
+        """
+        keep_keys = (
+            "status",
+            "needs_rework",
+            "summary",
+            "required_changes",
+            "cross_check_questions",
+            "verification_evidence",
+            "compromise_note",
+            "planning_confirmation",
+        )
+        compact = {key: review[key] for key in keep_keys if key in review}
+        if "deterministic_evidence_findings" in review:
+            compact["deterministic_evidence_findings"] = review["deterministic_evidence_findings"]
+        evidence = review.get("feedback_tool_evidence")
+        if isinstance(evidence, dict):
+            if evidence.get("kind") == "final_feedback_tools":
+                compact["feedback_tool_evidence_summary"] = self._compact_final_evidence_for_prompt(evidence)
+            else:
+                compact["feedback_tool_evidence_summary"] = self._compact_step_evidence_for_prompt(evidence)
+        as_json = json.dumps(compact, ensure_ascii=False)
+        limit = self.config.context_compaction.transcript_review_max_chars
+        if len(as_json) <= limit:
+            return compact
+        return {
+            "status": compact.get("status"),
+            "needs_rework": compact.get("needs_rework"),
+            "summary": compact.get("summary"),
+            "required_changes": self._clip_list_for_transcript(compact.get("required_changes", [])),
+            "deterministic_evidence_findings": self._clip_list_for_transcript(
+                compact.get("deterministic_evidence_findings", [])
+            ),
+            "review_truncation_note": clamp_text(as_json, limit, marker="review transcript payload truncated"),
+        }
+
+    def _clip_list_for_transcript(self, values: Any) -> list[str]:
+        if not isinstance(values, list):
+            values = [values]
+        return [
+            clamp_text(str(value), 1200, marker="list item truncated")
+            for value in values[:12]
+        ]
+
     def _final_correction_pass(self, attempt: int, review: dict[str, Any]) -> dict:
         prompt = (
             f"FINAL_PROJECT_CORRECTION_PHASE attempt={attempt}\n"
             "Apply only the final review changes needed to make the whole project consistent with requirements. "
             "Include validation commands and test evidence.\n"
-            f"Review: {json.dumps(review)}\n\n{IMPLEMENTATION_CONTRACT}"
+            f"Review: {json.dumps(self._compact_review_for_transcript(review))}\n\n{IMPLEMENTATION_CONTRACT}"
         )
+        if any(self._looks_like_browser_step(step) for step in self.plan_steps):
+            prompt += "\n" + self._browser_validation_guidance()
         raw = self._implementation_chat(prompt)
         payload = self._extract_json_or_retry(
             raw,
@@ -1067,8 +1341,9 @@ class FeedbackLoopAgent:
                 payload.get("commands", []),
                 self.config.runtime.command_timeout_seconds,
                 self.config.runtime.max_command_timeout_seconds,
+                output_limit_chars=self.config.context_compaction.tool_output_max_chars,
             )
-        append_plan_note(self.workspace, f"[final correction attempt {attempt}] {payload.get('plan_note', 'completed')}")
+        self._append_plan_note(f"[final correction attempt {attempt}] {payload.get('plan_note', 'completed')}")
         return {"written": written, "commands": command_results, "raw": payload}
 
     def _plan_structural_findings(self) -> list[str]:
@@ -1107,11 +1382,17 @@ class FeedbackLoopAgent:
                 str(first.get("description", "")),
                 " ".join(first.get("acceptance_criteria", [])),
             ]).lower()
-            if not (
-                ("research" in first_text or "patterns" in first_text or "knowledge" in first_text)
-                and ("structure" in first_text or "architecture" in first_text)
-                and ("plan" in first_text or "order" in first_text)
-            ):
+            research_present = any(marker in first_text for marker in ("research", "patterns", "knowledge", "investigate"))
+            structure_present = any(marker in first_text for marker in ("structure", "architecture", "dependencies", "module"))
+            # Existing-project repair work often starts with architecture mapping
+            # rather than a greenfield "plan the structure" step. Treat mapping
+            # or dependency analysis as satisfying the planning intent: the agent
+            # has to inspect the current shape before changing it.
+            planning_present = any(
+                marker in first_text
+                for marker in ("plan", "order", "mapping", "map", "architecture", "dependencies")
+            )
+            if not (research_present and structure_present and planning_present):
                 findings.append(
                     "First plan step must research needed patterns/knowledge, plan project structure/architecture, "
                     "and rewrite the remaining plan if structure changes task order."
@@ -1172,7 +1453,50 @@ class FeedbackLoopAgent:
                 findings.append(
                     f"{step_id} validation starts an HTTP server but does not assert behavior; wrap server startup in a validation script that exits."
                 )
+            if self._looks_like_unwrapped_expected_failure_validation(step, command, parts):
+                findings.append(
+                    f"{step_id} validation appears to test an expected failure path without declaring expected_returncode "
+                    "or wrapping the exception assertion. Replace it with a command object using expected_returncode, "
+                    "or a small wrapper command/script that exits 0 only when the expected error occurs."
+                )
         return findings
+
+    def _command_expected_returncode(self, command: list[Any] | dict[str, Any]) -> int:
+        if isinstance(command, dict):
+            return int(command.get("expected_returncode", 0))
+        return 0
+
+    def _looks_like_unwrapped_expected_failure_validation(
+        self,
+        step: dict[str, Any],
+        command: list[Any] | dict[str, Any],
+        parts: list[str],
+    ) -> bool:
+        """Catch plan commands that prove errors by accidentally failing.
+
+        Local models often write a correct acceptance criterion such as
+        "raises ValueError on empty input" and then add `python -c mean([])` as
+        the validation command. That command will fail forever under the
+        reviewer-owned validation pass because plain argv-list commands expect
+        return code 0. The plan must either declare `expected_returncode` or use
+        a wrapper assertion that returns 0 only when the expected exception is
+        observed.
+        """
+        if self._command_expected_returncode(command) != 0:
+            return False
+        if len(parts) < 3 or not parts[0].endswith("python") or parts[1] != "-c":
+            return False
+        step_text = " ".join([
+            str(step.get("title", "")),
+            str(step.get("description", "")),
+            " ".join(str(item) for item in step.get("acceptance_criteria", [])),
+        ]).lower()
+        if not any(marker in step_text for marker in ("raise", "raises", "exception", "error", "empty", "invalid")):
+            return False
+        code = parts[2].lower()
+        if any(marker in code for marker in ("try:", "except", "raises", "assertraises", "pytest.raises", "returncode")):
+            return False
+        return "[]" in code or "raise " in code or "sys.exit" in code
 
     def _looks_like_browser_step(self, step: dict[str, Any]) -> bool:
         text = " ".join([
@@ -1196,6 +1520,26 @@ class FeedbackLoopAgent:
             "javascript",
         )
         return any(marker in text for marker in markers)
+
+    def _browser_validation_guidance(self) -> str:
+        """Guidance for generated projects that need browser/UI validation."""
+        if not self.config.mcp_tools.web_interaction:
+            return (
+                "BROWSER_VALIDATION_GUIDANCE:\n"
+                "Web interaction tools are disabled for this run. Do not claim Playwright/browser evidence. "
+                "Use bounded HTTP/content checks or code-level checks and label them as non-browser fallback evidence.\n"
+            )
+        return (
+            "BROWSER_VALIDATION_GUIDANCE:\n"
+            "The agent Docker image already includes Python Playwright and Chromium. Generated validation scripts "
+            "must not run `playwright install`, `apt install`, `npm install`, or `pip install`; those can hang and "
+            "pollute reproducibility. Unless the config explicitly says Node.js is available, assume there is no "
+            "`node`, `npm`, `npx`, or `@playwright/test` runner. Prefer a Python validation script that imports "
+            "`from playwright.sync_api import sync_playwright` and drives Chromium directly. Set short browser/page "
+            "timeouts (for example 10-15 seconds), always close browser contexts and local servers in finally blocks, "
+            "and write clear evidence to a log/JSON file. If browser launch fails under those bounded timeouts, fall "
+            "back to the most direct non-browser verification available and explicitly label that evidence as a fallback.\n"
+        )
 
     def _default_quality_policy_payload(self) -> dict[str, Any]:
         return {
@@ -1255,7 +1599,7 @@ class FeedbackLoopAgent:
     ) -> list[str]:
         """Reject research/architecture work that ignores fetched sources.
 
-        RESEARCH.md is generated by the harness, so it does not count as model
+        The configured research file is generated by the harness, so it does not count as model
         usage. The generated deliverable must cite at least one researched URL
         in ARCHITECTURE.md or another project file for the research step to pass.
         """
@@ -1271,22 +1615,41 @@ class FeedbackLoopAgent:
         generated_files = [
             item
             for item in feedback_tool_evidence.get("workspace_files", [])
-            if item.get("path") not in {"RESEARCH.md", "PLAN.md", "REQUIREMENTS.md"}
+            if item.get("path") not in self._harness_doc_names()
         ]
         generated_text = "\n".join(str(item.get("content", "")) for item in generated_files)
         if any(url in generated_text for url in self._research_source_urls()):
             return []
         return [
-            "Web research evidence exists but generated project work did not cite/use any researched source URL outside RESEARCH.md."
+            "Web research evidence exists but generated project work did not cite/use any researched source URL outside the configured research file."
         ]
 
-    def _git_diff_findings(self, step: dict[str, Any], feedback_tool_evidence: dict[str, Any]) -> list[str]:
+    def _git_diff_findings(
+        self,
+        step: dict[str, Any],
+        implementation: dict[str, Any],
+        feedback_tool_evidence: dict[str, Any],
+    ) -> list[str]:
         """Reject a step when the reviewer has no implementation diff to inspect."""
         if not (self.config.git_policy.enabled and self.config.git_policy.require_step_diff):
             return []
         git = feedback_tool_evidence.get("git") or {}
         changed_paths = git.get("meaningful_changed_paths") or []
         if changed_paths:
+            return []
+        if self._is_validation_only_step(step) and self._reviewer_validation_passed(feedback_tool_evidence):
+            return []
+        if self._is_previously_implemented_attempt(implementation) and self._reviewer_validation_passed(feedback_tool_evidence):
+            return []
+        status_short = str(git.get("status_short") or "")
+        step_text = " ".join([
+            str(step.get("id", "")),
+            str(step.get("title", "")),
+            str(step.get("description", "")),
+            " ".join(str(item) for item in step.get("acceptance_criteria", [])),
+        ]).lower()
+        harness_plan_name = self.config.runtime.plan_file.lower()
+        if harness_plan_name in status_short.lower() and harness_plan_name in step_text:
             return []
         step_id = step.get("id", "step")
         requirement = "; ".join(step.get("acceptance_criteria", [])[:2]) or step.get("title", "the planned work")
@@ -1296,6 +1659,96 @@ class FeedbackLoopAgent:
                 f"Please implement the plan requirement before review can accept it: {requirement}"
             )
         ]
+
+    def _is_previously_implemented_attempt(self, implementation: dict[str, Any]) -> bool:
+        """Allow validation of artifacts already created by an earlier step.
+
+        A model can over-complete a file during a skeleton/planning step. If a
+        later step explicitly says it is validating already-created work and
+        reviewer-owned validation passes, requiring a fresh edit would encourage
+        meaningless churn. The feedback model still reviews the file snapshot.
+        """
+        if implementation.get("written"):
+            return False
+        raw = implementation.get("raw") if isinstance(implementation.get("raw"), dict) else {}
+        text = " ".join([
+            str(implementation.get("plan_note", "")),
+            str(raw.get("plan_note", "")),
+            " ".join(str(item) for item in implementation.get("test_evidence", [])),
+            " ".join(str(item) for item in raw.get("test_evidence", [])),
+        ]).lower()
+        return any(marker in text for marker in ("already implemented", "already created", "already exists"))
+
+    def _is_validation_only_step(self, step: dict[str, Any]) -> bool:
+        """Identify QA/checkpoint steps that should not be forced to edit files.
+
+        Most plan steps should leave a meaningful diff. A final integration
+        validation step is different: its deliverable is the independently
+        rerun command evidence. Without this exception, the feedback loop can
+        reject a perfectly good validation step forever because there is
+        intentionally no new implementation work to inspect.
+        """
+        title = str(step.get("title", "")).lower()
+        description = str(step.get("description", "")).lower()
+        criteria = " ".join(str(item).lower() for item in step.get("acceptance_criteria", []))
+        text = " ".join([title, description, criteria])
+        validation_markers = (
+            "validation",
+            "validate",
+            "verify",
+            "verification",
+            "integration",
+            "run all tests",
+            "all tests pass",
+            "end-to-end",
+        )
+        implementation_markers = (
+            "add ",
+            "build ",
+            "create ",
+            "implement ",
+            "write ",
+            "generate ",
+            "exists",
+        )
+        return any(marker in text for marker in validation_markers) and not any(
+            marker in text for marker in implementation_markers
+        )
+
+    def _is_failure_investigation_step(self, step: dict[str, Any]) -> bool:
+        """Allow failing test commands as evidence for diagnosis-only steps.
+
+        Bug-fix workflows often start with a step whose purpose is to run the
+        broken test suite and document the failure. In that narrow phase, a
+        non-zero test command is useful evidence instead of an automatic step
+        failure, as long as the agent also leaves a meaningful investigation
+        artifact for the reviewer.
+        """
+        text = " ".join([
+            str(step.get("title", "")),
+            str(step.get("description", "")),
+            " ".join(str(item) for item in step.get("acceptance_criteria", [])),
+        ]).lower()
+        if any(marker in text for marker in ("all tests pass", "final verification", "fix calculation", "fix syntax")):
+            return False
+        investigation_markers = (
+            "investigation",
+            "identify failures",
+            "failing tests",
+            "error messages",
+            "document failures",
+            "syntax/import blockers",
+        )
+        return any(marker in text for marker in investigation_markers)
+
+    def _reviewer_validation_passed(self, feedback_tool_evidence: dict[str, Any]) -> bool:
+        results = feedback_tool_evidence.get("validation_results") or []
+        if not results:
+            return False
+        for result in results:
+            if result.get("timed_out") or not self._command_returncode_matches_expected(result):
+                return False
+        return True
 
     def _review_mode(self, attempt: int) -> str:
         if attempt <= self.config.review_policy.hard_pushback_iterations:
@@ -1318,14 +1771,22 @@ class FeedbackLoopAgent:
                 validation_commands,
                 self.config.runtime.command_timeout_seconds,
                 self.config.runtime.max_command_timeout_seconds,
+                output_limit_chars=self.config.context_compaction.tool_output_max_chars,
             )
         return {
             "kind": "step_feedback_tools",
             "step_id": step.get("id"),
-            "workspace_files": collect_workspace_files(self.workspace),
+            "workspace_files": collect_workspace_files(
+                self.workspace,
+                self.config.context_compaction.workspace_file_max_bytes,
+            ),
             "validation_commands": validation_commands,
             "validation_results": validation_results,
-            "git": git_evidence(self.workspace) if self.config.git_policy.enabled else {"enabled": False},
+            "git": (
+                git_evidence(self.workspace, max_diff_chars=self.config.context_compaction.git_diff_max_chars)
+                if self.config.git_policy.enabled
+                else {"enabled": False}
+            ),
         }
 
     def _final_feedback_tool_evidence(self) -> dict[str, Any]:
@@ -1340,6 +1801,7 @@ class FeedbackLoopAgent:
                     commands,
                     self.config.runtime.command_timeout_seconds,
                     self.config.runtime.max_command_timeout_seconds,
+                    output_limit_chars=self.config.context_compaction.tool_output_max_chars,
                 )
             step_validations.append({
                 "step_id": step.get("id"),
@@ -1348,9 +1810,16 @@ class FeedbackLoopAgent:
             })
         return {
             "kind": "final_feedback_tools",
-            "workspace_files": collect_workspace_files(self.workspace),
+            "workspace_files": collect_workspace_files(
+                self.workspace,
+                self.config.context_compaction.workspace_file_max_bytes,
+            ),
             "step_validations": step_validations,
-            "git": git_evidence(self.workspace) if self.config.git_policy.enabled else {"enabled": False},
+            "git": (
+                git_evidence(self.workspace, max_diff_chars=self.config.context_compaction.git_diff_max_chars)
+                if self.config.git_policy.enabled
+                else {"enabled": False}
+            ),
         }
 
     def _evidence_findings(
@@ -1368,7 +1837,7 @@ class FeedbackLoopAgent:
         for result in feedback_results:
             if result.get("timed_out"):
                 findings.append(f"Feedback validation command timed out: {result.get('command')}")
-            if not self._command_returncode_matches_expected(result):
+            if not self._command_returncode_matches_expected(result) and not self._is_failure_investigation_step(step):
                 findings.append(
                     f"Feedback validation command returned {result.get('returncode')} but expected "
                     f"{result.get('expected_returncode', 0)}: {result.get('command')}"
@@ -1378,15 +1847,20 @@ class FeedbackLoopAgent:
                         "Plan validation command appears malformed before it can test the project; request a plan change "
                         "with a simpler script or corrected command instead of asking for implementation-only changes."
                     )
+                if self._looks_like_unwrapped_expected_failure_result(step, result):
+                    findings.append(
+                        "Plan validation command appears to run an expected failure path without declaring expected_returncode "
+                        "or wrapping the assertion; request a plan change instead of asking for implementation-only changes."
+                    )
         for result in implementation_commands:
             if result.get("timed_out"):
                 findings.append(f"Implementation command timed out: {result.get('command')}")
-            if not self._command_returncode_matches_expected(result):
+            if not self._command_returncode_matches_expected(result) and not self._is_failure_investigation_step(step):
                 findings.append(
                     f"Implementation command returned {result.get('returncode')} but expected "
                     f"{result.get('expected_returncode', 0)}: {result.get('command')}"
                 )
-        findings.extend(self._git_diff_findings(step, feedback_tool_evidence or {}))
+        findings.extend(self._git_diff_findings(step, implementation, feedback_tool_evidence or {}))
         return findings
 
     def _command_returncode_matches_expected(self, result: dict[str, Any]) -> bool:
@@ -1419,6 +1893,24 @@ class FeedbackLoopAgent:
             and "SyntaxError" in stderr
         )
 
+    def _looks_like_unwrapped_expected_failure_result(self, step: dict[str, Any], result: dict[str, Any]) -> bool:
+        """Identify reviewer failures caused by a bad plan, not bad code."""
+        if int(result.get("expected_returncode", 0)) != 0 or int(result.get("returncode", 0)) == 0:
+            return False
+        command = result.get("command") or []
+        command_text = " ".join(str(part) for part in command)
+        stderr = str(result.get("stderr") or "")
+        if "python -c" not in command_text or "Traceback" not in stderr:
+            return False
+        step_text = " ".join([
+            str(step.get("title", "")),
+            str(step.get("description", "")),
+            " ".join(str(item) for item in step.get("acceptance_criteria", [])),
+        ]).lower()
+        if "valueerror" in stderr.lower() and any(marker in step_text for marker in ("valueerror", "raise", "raises", "empty")):
+            return True
+        return "exception" in step_text or "error" in step_text
+
     def _project_evidence_findings(
         self,
         step_results: list[dict[str, Any]],
@@ -1438,13 +1930,14 @@ class FeedbackLoopAgent:
                 findings.append(f"Step {step_id} has no attempts.")
             validation = final_validations.get(step_id)
             if validation is not None:
+                step = next((item for item in self.plan_steps if str(item.get("id")) == step_id), {})
                 results = validation.get("validation_results", [])
                 if validation.get("validation_commands") and not results:
                     findings.append(f"Step {step_id} final feedback validation produced no command evidence.")
                 for result in results:
                     if result.get("timed_out"):
                         findings.append(f"Step {step_id} final feedback validation timed out: {result.get('command')}")
-                    if not self._command_returncode_matches_expected(result):
+                    if not self._command_returncode_matches_expected(result) and not self._is_failure_investigation_step(step):
                         findings.append(
                             f"Step {step_id} final feedback validation returned {result.get('returncode')} "
                             f"but expected {result.get('expected_returncode', 0)}: {result.get('command')}"
@@ -1470,7 +1963,7 @@ class FeedbackLoopAgent:
         if not evidence_findings:
             return review
         review = dict(review)
-        if any("Plan validation command appears malformed" in item for item in evidence_findings):
+        if any("Plan validation command appears" in item for item in evidence_findings):
             existing = [str(item) for item in review.get("required_changes", [])]
             review["status"] = "needs_plan_change"
             review["needs_rework"] = True
@@ -1554,13 +2047,22 @@ class FeedbackLoopAgent:
         if not self.config.git_policy.enabled:
             return {"enabled": False}
         if not self.config.git_policy.leave_final_changes_uncommitted:
-            return {"enabled": True, "left_uncommitted": False, "git": git_evidence(self.workspace)}
+            return {
+                "enabled": True,
+                "left_uncommitted": False,
+                "git": git_evidence(self.workspace, max_diff_chars=self.config.context_compaction.git_diff_max_chars),
+            }
         reset = reset_to_ref(
             self.workspace,
             self.git_baseline_ref,
             mode=self.config.git_policy.final_reset_mode,
         )
-        return {"enabled": True, "left_uncommitted": True, "reset": reset, "git": git_evidence(self.workspace)}
+        return {
+            "enabled": True,
+            "left_uncommitted": True,
+            "reset": reset,
+            "git": git_evidence(self.workspace, max_diff_chars=self.config.context_compaction.git_diff_max_chars),
+        }
 
     def _final_status(self, step_results: list[dict[str, Any]], final_review: dict[str, Any] | None = None) -> str:
         if not step_results:

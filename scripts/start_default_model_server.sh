@@ -10,9 +10,10 @@ CONTAINER="${CONTAINER:-agentic-qwen36-server}"
 MODEL_PATH="${MODEL_PATH:-$QWEN36_LOCAL_DIR/$QWEN36_MODEL_FILE}"
 MMPROJ_PATH="${MMPROJ_PATH:-$QWEN36_LOCAL_DIR/$QWEN36_MMPROJ_FILE}"
 PORT="${PORT:-8161}"
-CTX_SIZE="${CTX_SIZE:-32768}"
+CTX_SIZE="${CTX_SIZE:-76800}"
 GPU_LAYERS="${GPU_LAYERS:-999}"
 THREADS="${THREADS:-8}"
+PARALLEL="${PARALLEL:-1}"
 MEM_LIMIT="${MEM_LIMIT:-75g}"
 MEMORY_SWAP="${MEMORY_SWAP:-75g}"
 MEM_RESERVATION="${MEM_RESERVATION:-67g}"
@@ -44,7 +45,7 @@ if ! docker info >/dev/null 2>&1; then
   DOCKER=(sudo docker)
 fi
 
-if ! "${DOCKER[@]}" image inspect "$SERVER_IMAGE" >/dev/null 2>&1; then
+if [ "${REBUILD_SERVER_IMAGE:-0}" = "1" ] || ! "${DOCKER[@]}" image inspect "$SERVER_IMAGE" >/dev/null 2>&1; then
   "${DOCKER[@]}" build \
     -f "$REPO_ROOT/docker/llama-cpp-vulkan.Dockerfile" \
     --build-arg "LLAMA_CPP_REF=${LLAMA_CPP_REF:-master}" \
@@ -79,6 +80,7 @@ esac
   -e CTX_SIZE="$CTX_SIZE" \
   -e GPU_LAYERS="$GPU_LAYERS" \
   -e THREADS="$THREADS" \
+  -e PARALLEL="$PARALLEL" \
   -e EXTRA_ARGS="$EXTRA_ARGS" \
   "$SERVER_IMAGE" >/dev/null
 
