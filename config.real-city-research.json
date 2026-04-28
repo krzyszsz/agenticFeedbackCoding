@@ -4,22 +4,22 @@
     "base_url": "http://127.0.0.1:8161/v1",
     "api_key": "not-needed",
     "model": "local-gguf",
-    "context_window": 32768,
-    "max_tokens": 1536,
-    "temperature": 0.15,
+    "context_window": 46080,
+    "max_tokens": 2048,
+    "temperature": 0.2,
     "request_timeout_seconds": 21600
   },
   "feedback_model": null,
   "mcp_tools": {
     "terminal": true,
     "web_scraping": true,
-    "web_interaction": true
+    "web_interaction": false
   },
   "runtime": {
     "docker_isolation": true,
     "docker_image": "agentic-feedback-coding:local",
-    "workspace": "workspaces/qwen36-smoke",
-    "command_timeout_seconds": 60,
+    "workspace": "workspaces/real-city-research",
+    "command_timeout_seconds": 120,
     "print_transcript": true,
     "max_command_timeout_seconds": 21600
   },
@@ -27,15 +27,15 @@
     "enabled": true,
     "threshold_ratio": 0.8,
     "keep_recent_turns": 8,
-    "summary_max_tokens": 512
+    "summary_max_tokens": 1024
   },
   "loop": {
-    "max_iterations": 1,
+    "max_iterations": 3,
     "stop_when_review_clean": true
   },
   "project_design": {
-    "title": "Tiny arithmetic package smoke test",
-    "prompt": "Build a tiny Python module called arithmetic_box.py with add, multiply, and mean functions, plus unittest coverage. Keep it very small. Maintain PLAN.md during the work."
+    "title": "Real web research city image manifest benchmark",
+    "prompt": "Use web research to choose four large world cities and collect public Wikipedia/Wikimedia image candidates for them. Build a small documented manifest project with attribution/source URLs, a validation script that checks the manifest structure, and README instructions. The agent must use fetched web research evidence instead of prewritten data. Maintain PLAN.md during the work."
   },
   "phases": {
     "requirements_refinement": {

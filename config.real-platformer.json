@@ -6,20 +6,20 @@
     "model": "local-gguf",
     "context_window": 76800,
     "max_tokens": 2048,
-    "temperature": 0.25,
+    "temperature": 0.2,
     "request_timeout_seconds": 21600
   },
   "feedback_model": null,
   "mcp_tools": {
     "terminal": true,
-    "web_scraping": true,
+    "web_scraping": false,
     "web_interaction": true
   },
   "runtime": {
     "docker_isolation": true,
     "docker_image": "agentic-feedback-coding:local",
-    "workspace": "workspaces/mock-platformer",
-    "command_timeout_seconds": 180,
+    "workspace": "workspaces/real-platformer",
+    "command_timeout_seconds": 120,
     "print_transcript": true,
     "max_command_timeout_seconds": 21600
   },
@@ -34,8 +34,8 @@
     "stop_when_review_clean": true
   },
   "project_design": {
-    "title": "Browser platformer with external levels and scriptable actors",
-    "prompt": "Build a browser game where the user controls a 2D Mario-like platform person. Levels must be designed externally in a text file. Enemies and NPC friends must be scriptable from data, and the game must support savepoints. The feedback loop must validate that the game is easy to control through Playwright keyboard input, can produce screenshots for visual review, and has simple visual markers that a VL model could inspect from screenshots."
+    "title": "Real browser platformer benchmark",
+    "prompt": "Build a small browser platformer game with a 2D character, keyboard controls, externally stored level data, at least one scripted enemy or NPC, and a savepoint. Include Playwright validation that opens the page, presses controls, captures a screenshot, and writes a JSON report proving the game responds. Maintain PLAN.md during the work. Keep each implementation step independently verifiable."
   },
   "phases": {
     "requirements_refinement": {
@@ -64,7 +64,7 @@
     "final_review_iterations": 1
   },
   "web_research": {
-    "enabled": true,
+    "enabled": false,
     "max_search_results": 3,
     "max_pages": 3,
     "timeout_seconds": 15,

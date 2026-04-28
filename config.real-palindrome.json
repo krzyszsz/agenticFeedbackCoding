@@ -4,21 +4,21 @@
     "base_url": "http://127.0.0.1:8161/v1",
     "api_key": "not-needed",
     "model": "local-gguf",
-    "context_window": 76800,
+    "context_window": 46080,
     "max_tokens": 2048,
-    "temperature": 0.25,
+    "temperature": 0.2,
     "request_timeout_seconds": 21600
   },
   "feedback_model": null,
   "mcp_tools": {
     "terminal": true,
-    "web_scraping": true,
-    "web_interaction": true
+    "web_scraping": false,
+    "web_interaction": false
   },
   "runtime": {
     "docker_isolation": true,
     "docker_image": "agentic-feedback-coding:local",
-    "workspace": "workspaces/mock-emptydiff",
+    "workspace": "workspaces/real-palindrome",
     "command_timeout_seconds": 120,
     "print_transcript": true,
     "max_command_timeout_seconds": 21600
@@ -34,8 +34,8 @@
     "stop_when_review_clean": true
   },
   "project_design": {
-    "title": "Mock empty-diff feedback exercise",
-    "prompt": "Build the empty-diff no-change marker-file project. The first attempt may accidentally produce no changes; the feedback agent must detect that using git and request the missing implementation."
+    "title": "Real palindrome CLI benchmark",
+    "prompt": "Build a minimal Python CLI tool that checks whether a provided string is a palindrome, ignoring case, punctuation, and spaces. It must include a core function, a CLI script, unit tests, README documentation, and a short notes file explaining the design choices. Keep it small but complete. Maintain PLAN.md during the work. Prefer at most 4 independently verifiable implementation steps."
   },
   "phases": {
     "requirements_refinement": {
@@ -64,7 +64,7 @@
     "final_review_iterations": 1
   },
   "web_research": {
-    "enabled": true,
+    "enabled": false,
     "max_search_results": 3,
     "max_pages": 3,
     "timeout_seconds": 15,

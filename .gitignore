@@ -1,0 +1,19 @@
+# Generated harness outputs
+workspaces/
+runs/
+reports/
+logs/
+TEST_EVIDENCE.md
+*.log
+
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets/config
+.env
+hf.key
+*.key

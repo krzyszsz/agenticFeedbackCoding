@@ -1,0 +1,12 @@
+.git
+workspaces
+runs
+reports
+logs
+TEST_EVIDENCE.md
+__pycache__
+*.pyc
+*.log
+.env
+hf.key
+*.key

@@ -6,7 +6,6 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$PROJECT_DIR"
 
 CONFIG_PATH="$PROJECT_DIR/config.example.json"
-MOCK=0
 ARGS=()
 
 while [ "$#" -gt 0 ]; do
@@ -16,11 +15,6 @@ while [ "$#" -gt 0 ]; do
       ARGS+=("$1" "$2")
       shift 2
       ;;
-    --mock)
-      MOCK=1
-      ARGS+=("$1")
-      shift
-      ;;
     *)
       ARGS+=("$1")
       shift
@@ -29,10 +23,6 @@ while [ "$#" -gt 0 ]; do
 done
 
 CONFIG_ABS="$(realpath "$CONFIG_PATH")"
-MOCK_ARGS=()
-if [ "$MOCK" = "1" ]; then
-  MOCK_ARGS=(--mock)
-fi
 
 docker_enabled="$(python3 - "$CONFIG_ABS" "$REPO_ROOT" <<'PY'
 import json
@@ -78,7 +68,7 @@ PY
     -e REPO_ROOT=/app \
     -v "$workspace:/workspace/project" \
     -v "$CONFIG_ABS:/app/config.json:ro" \
-    "$image" --config /app/config.json "${MOCK_ARGS[@]}"
+    "$image" --config /app/config.json
   exit 0
 fi
 
@@ -94,4 +84,4 @@ ERROR
 fi
 
 cd "$REPO_ROOT"
-PYTHONPATH="$PROJECT_DIR" python3 -m feedback_agent.cli --config "$CONFIG_ABS" "${MOCK_ARGS[@]}"
+PYTHONPATH="$PROJECT_DIR" python3 -m feedback_agent.cli --config "$CONFIG_ABS"

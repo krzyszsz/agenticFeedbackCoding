@@ -10,11 +10,11 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from typing import Any
 
 from feedback_agent.agent import FeedbackLoopAgent
 from feedback_agent.config import load_config
-from feedback_agent.llm import MockClient
-from feedback_agent.workspace import run_commands, write_plan_doc
+from feedback_agent.workspace import extract_json_object, run_commands, write_plan_doc
 
 
 class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -24,6 +24,37 @@ class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
 class ReusableTCPServer(socketserver.TCPServer):
     allow_reuse_address = True
+
+
+class ScriptedClient:
+    """Tiny test double for model calls.
+
+    Production code always talks to an OpenAI-compatible endpoint. Unit tests use
+    this in-memory client only to make phase/review behavior deterministic enough
+    to test without requiring a local 27B model for every assertion.
+    """
+
+    def __init__(self, responses: list[str] | None = None):
+        self.responses = list(responses or [])
+        self.calls: list[dict[str, Any]] = []
+
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> str:
+        self.calls.append({"messages": messages, "max_tokens": max_tokens, "temperature": temperature})
+        if self.responses:
+            return self.responses.pop(0)
+        return json.dumps({
+            "status": "resolved",
+            "needs_rework": False,
+            "summary": "Scripted review accepted the evidence.",
+            "required_changes": [],
+            "verification_evidence": ["reviewer-owned validation evidence inspected"],
+        })
 
 
 @contextlib.contextmanager
@@ -43,7 +74,7 @@ def write_config(root: Path, workspace: Path, title: str, prompt: str) -> Path:
     config_path = root / "config.json"
     config_path.write_text(json.dumps({
         "implementation_model": {
-            "name": "mock",
+            "name": "scripted-test-client",
             "base_url": "http://127.0.0.1:1/v1",
             "api_key": "not-needed",
             "model": "local-gguf",
@@ -112,18 +143,55 @@ def write_config(root: Path, workspace: Path, title: str, prompt: str) -> Path:
     return config_path
 
 
+def load_test_agent(
+    root: Path,
+    workspace: Path,
+    *,
+    title: str = "checked artifact",
+    prompt: str = "Build a small checked artifact.",
+    feedback_responses: list[str] | None = None,
+    implementation_responses: list[str] | None = None,
+) -> FeedbackLoopAgent:
+    cfg = load_config(write_config(root, workspace, title, prompt), repo_root=root)
+    return FeedbackLoopAgent(
+        cfg,
+        implementation_client=ScriptedClient(implementation_responses),
+        feedback_client=ScriptedClient(feedback_responses),
+    )
+
+
+def base_requirements(summary: str = "Checked artifact") -> dict[str, Any]:
+    return {
+        "project_summary": summary,
+        "refined_requirements": ["Feedback must verify evidence independently."],
+        "assumptions": [],
+        "planning_confirmation": {
+            "is_feasible": True,
+            "is_clear": True,
+            "is_verifiable": True,
+            "verification_strategy": "Run reviewer-owned validation commands for each plan step.",
+            "remaining_risks": [],
+        },
+    }
+
+
 class FeedbackLoopAgentTests(unittest.TestCase):
+    def test_json_extractor_recovers_first_balanced_object_from_noisy_output(self) -> None:
+        payload = extract_json_object(
+            "<think>not json { nope }</think>\n"
+            "{\"status\":\"resolved\",\"needs_rework\":false}\n"
+            "trailing duplicate-ish text {broken"
+        )
+
+        self.assertEqual(payload["status"], "resolved")
+        self.assertFalse(payload["needs_rework"])
+
     def test_command_timeout_can_be_overridden_per_command_and_clamped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             results = run_commands(
                 root,
-                [
-                    {
-                        "cmd": ["python", "-c", "print('long command shape accepted')"],
-                        "timeout_seconds": 999,
-                    }
-                ],
+                [{"cmd": ["python", "-c", "print('long command shape accepted')"], "timeout_seconds": 999}],
                 timeout_seconds=1,
                 max_timeout_seconds=7,
             )
@@ -132,92 +200,159 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(results[0]["timeout_seconds"], 7)
             self.assertIn("long command shape accepted", results[0]["stdout"])
 
-    def test_mock_feedback_loop_has_distinct_phases_and_per_step_reviews(self) -> None:
+    def test_expected_nonzero_returncode_is_successful_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = run_commands(
+                root,
+                [{"cmd": ["python", "-c", "import sys; print('usage: app text', file=sys.stderr); sys.exit(2)"], "expected_returncode": 2}],
+                timeout_seconds=30,
+                max_timeout_seconds=300,
+            )
+
+            self.assertEqual(results[0]["returncode"], 2)
+            self.assertEqual(results[0]["expected_returncode"], 2)
+            self.assertTrue(results[0]["returncode_matches_expected"])
+            self.assertIn("usage", results[0]["stderr"])
+
+    def test_server_only_validation_command_is_rejected_without_hanging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = run_commands(root, [["python", "-m", "http.server", "8080"]], 30, 300)
+
+            self.assertEqual(results[0]["returncode"], 125)
+            self.assertFalse(results[0]["timed_out"])
+            self.assertTrue(results[0]["skipped_as_non_verifying_server"])
+            self.assertIn("does not assert behavior", results[0]["stderr"])
+
+    def test_agent_commands_cannot_mutate_git_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            results = run_commands(
+                root,
+                [
+                    ["git", "status", "--short"],
+                    ["git", "add", "anything.txt"],
+                    ["git", "commit", "-m", "agent-owned commit"],
+                ],
+                30,
+                300,
+            )
+
+            self.assertEqual(results[0]["returncode"], 0)
+            self.assertEqual(results[1]["returncode"], 126)
+            self.assertEqual(results[2]["returncode"], 126)
+            self.assertTrue(results[1]["blocked_git_mutation"])
+            self.assertIn("harness owns", results[1]["stderr"])
+
+    def test_shared_transcript_keeps_implementation_and_feedback_context_together(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
-            config_path = write_config(root, workspace, "mock tracker", "Build and test a task tracker.")
-            cfg = load_config(config_path, repo_root=root)
-            summary = FeedbackLoopAgent(cfg, mock=True).run()
+            impl = ScriptedClient([json.dumps({"note": "implementation turn"})])
+            reviewer = ScriptedClient()
+            cfg = load_config(write_config(root, workspace, "chat continuity", "Build anything."), repo_root=root)
+            agent = FeedbackLoopAgent(cfg, implementation_client=impl, feedback_client=reviewer)
+            agent.initialize()
 
-            self.assertEqual(summary["requirements_refinement"]["status"], "resolved")
-            self.assertEqual(summary["plan_validation"]["status"], "resolved")
-            self.assertEqual(summary["final_status"], "resolved")
-            self.assertGreaterEqual(len(summary["steps"]), 2)
-            self.assertTrue(all(step["status"] == "resolved" for step in summary["steps"]))
-            self.assertTrue(any(len(step["attempts"]) >= 2 for step in summary["steps"]))
-            self.assertTrue((workspace / "REQUIREMENTS.md").exists())
-            self.assertTrue((workspace / "PLAN.md").exists())
-            self.assertTrue((workspace / "ARCHITECTURE.md").exists())
-            self.assertTrue((workspace / "task_tracker.py").exists())
-            self.assertTrue((workspace / "test_task_tracker.py").exists())
-            self.assertTrue((workspace / ".agent_state" / "conversation.md").exists())
-            transcript = (workspace / ".agent_state" / "conversation.jsonl").read_text()
-            self.assertIn("IMPLEMENTATION_AGENT_REQUEST", transcript)
-            self.assertIn("IMPLEMENTATION_AGENT_RESPONSE", transcript)
+            agent._implementation_chat("Create the first file.")
+            agent._feedback_chat("Review the first file.")
+
+            feedback_context = "\n".join(message["content"] for message in reviewer.calls[0]["messages"])
+            transcript = (workspace / ".agent_state" / "conversation.jsonl").read_text(encoding="utf-8")
+            self.assertIn("IMPLEMENTATION_AGENT_REQUEST", feedback_context)
+            self.assertIn("IMPLEMENTATION_AGENT_RESPONSE", feedback_context)
             self.assertIn("FEEDBACK_AGENT_REQUEST", transcript)
             self.assertIn("FEEDBACK_AGENT_RESPONSE", transcript)
-            self.assertIn("planning_confirmation", transcript)
-            self.assertIn("FINAL_PROJECT_REVIEW_PHASE", transcript)
 
-    def test_mock_website_scenario_builds_browser_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workspace = root / "website"
-            config_path = write_config(root, workspace, "mock website", "Build a tiny static website with a browser clicker game.")
-            cfg = load_config(config_path, repo_root=root)
-            summary = FeedbackLoopAgent(cfg, mock=True).run()
-
-            self.assertEqual(summary["final_status"], "resolved")
-            for name in ["index.html", "about.html", "game.html", "style.css", "app.js"]:
-                self.assertTrue((workspace / name).exists(), name)
-            self.assertIn("id=\"increment\"", (workspace / "game.html").read_text())
-            self.assertIn("addEventListener", (workspace / "app.js").read_text())
-
-    def test_mock_non_development_city_collection(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workspace = root / "cities"
-            config_path = write_config(root, workspace, "mock cities", "Use web scraping style workflow to collect images of big cities from Wikipedia.")
-            cfg = load_config(config_path, repo_root=root)
-            summary = FeedbackLoopAgent(cfg, mock=True).run()
-
-            self.assertEqual(summary["final_status"], "resolved")
-            manifest = json.loads((workspace / "city_image_manifest.json").read_text())
-            self.assertGreaterEqual(len(manifest["cities"]), 4)
-            self.assertTrue((workspace / "scripts" / "collect_city_images.py").exists())
-            self.assertTrue((workspace / "collection_status.txt").exists())
-
-    def test_platformer_review_rejects_failed_playwright_command(self) -> None:
-        client = MockClient()
-        prompt = json.dumps({
-            "phase": "STEP_REVIEW_PHASE",
-            "step": {"id": "S2", "title": "Add controllable movement and savepoints"},
-            "requirements": {"project_summary": "platformer savepoint browser game"},
-            "implementation": {
-                "commands": [
-                    {"command": ["python", "scripts/playwright_game_check.py"], "returncode": 1, "timed_out": False}
-                ]
-            },
-        })
-
-        review = json.loads(client.chat([{"role": "user", "content": prompt}]))
-
-        self.assertEqual(review["status"], "needs_rework")
-        self.assertIn("validation command failed", review["summary"])
-
-    def test_feedback_review_runs_plan_validation_even_without_implementation_commands(self) -> None:
+    def test_plan_validation_enforces_step_limit_and_server_only_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
-            config_path = write_config(root, workspace, "tool evidence", "Build a tiny checked artifact.")
-            cfg = load_config(config_path, repo_root=root)
-            agent = FeedbackLoopAgent(cfg, mock=True)
+            agent = load_test_agent(
+                root,
+                workspace,
+                title="strict plan",
+                prompt=(
+                    "Build a small browser app. Hard limit: group the implementation plan into "
+                    "at most 1 independently verifiable steps."
+                ),
+            )
             agent.initialize()
-            agent.requirements = {
-                "project_summary": "Tool evidence smoke test",
-                "refined_requirements": ["Feedback must verify evidence independently."],
-            }
+            agent.requirements = base_requirements("Strict plan")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Research required patterns and plan project structure",
+                    "description": "Research and choose structure.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ARCHITECTURE.md records Structure and Plan order"],
+                    "validation_commands": [["test", "-f", "ARCHITECTURE.md"]],
+                    "status": "pending",
+                },
+                {
+                    "id": "S2",
+                    "title": "Browser UI",
+                    "description": "Render browser UI.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["UI renders"],
+                    "validation_commands": [["python", "-m", "http.server", "8080"]],
+                    "status": "pending",
+                },
+            ]
+
+            review = agent._plan_validation_review(1)
+
+            self.assertEqual(review["status"], "needs_plan_change")
+            changes = "\n".join(review["required_changes"])
+            self.assertIn("at most 1", changes)
+            self.assertIn("HTTP server", changes)
+
+    def test_soft_step_limit_does_not_block_verifiable_quality_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                title="soft plan",
+                prompt="Build a small checked app. Prefer at most 1 independently verifiable steps.",
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Soft plan")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Research required patterns and plan project structure",
+                    "description": "Research patterns, choose structure, and record plan order.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["Structure is recorded"],
+                    "validation_commands": [["python", "-c", "print('structure ok')"]],
+                    "status": "pending",
+                },
+                {
+                    "id": "S2",
+                    "title": "Implement checked artifact",
+                    "description": "Create the artifact.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["Artifact is checked"],
+                    "validation_commands": [["python", "-c", "print('artifact ok')"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("at most 1", "\n".join(findings))
+
+    def test_feedback_review_runs_reviewer_owned_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements()
             step = {
                 "id": "T1",
                 "title": "Create checked artifact",
@@ -227,7 +362,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                 "validation_commands": [[
                     "python",
                     "-c",
-                    "from pathlib import Path; assert Path('ok.txt').read_text().strip() == 'pass'; print('feedback tool evidence ok')",
+                    "from pathlib import Path; assert Path('ok.txt').read_text().strip() == 'pass'; print('review evidence ok')",
                 ]],
                 "status": "pending",
             }
@@ -238,7 +373,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             review = agent._step_review_pass(
                 step,
                 1,
-                {"written": ["ok.txt"], "commands": [], "raw": {"test_evidence": []}},
+                {"written": ["ok.txt"], "commands": [], "raw": {"test_evidence": ["ok.txt validation"]}},
                 "hard_pushback",
             )
 
@@ -248,18 +383,13 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(evidence["validation_results"][0]["returncode"], 0)
             self.assertIn("ok.txt", {item["path"] for item in evidence["workspace_files"]})
 
-    def test_feedback_review_rejects_failing_feedback_tool_validation(self) -> None:
+    def test_feedback_review_rejects_failing_reviewer_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
-            config_path = write_config(root, workspace, "tool evidence failure", "Build a tiny checked artifact.")
-            cfg = load_config(config_path, repo_root=root)
-            agent = FeedbackLoopAgent(cfg, mock=True)
+            agent = load_test_agent(root, workspace)
             agent.initialize()
-            agent.requirements = {
-                "project_summary": "Tool evidence failure smoke test",
-                "refined_requirements": ["Feedback must reject failing reviewer-owned validation."],
-            }
+            agent.requirements = base_requirements("Failing reviewer validation")
             step = {
                 "id": "T1",
                 "title": "Create checked artifact",
@@ -284,22 +414,110 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             )
 
             self.assertEqual(review["status"], "needs_rework")
-            self.assertTrue(review["needs_rework"])
-            self.assertIn("Feedback validation command failed", "\n".join(review["required_changes"]))
-            self.assertNotEqual(review["feedback_tool_evidence"]["validation_results"][0]["returncode"], 0)
+            self.assertIn("Feedback validation command returned 1 but expected 0", "\n".join(review["required_changes"]))
+
+    def test_feedback_review_accepts_expected_negative_path_returncode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Expected negative path")
+            step = {
+                "id": "T1",
+                "title": "Validate missing argument behavior",
+                "description": "Command should exit 2 and print usage.",
+                "depends_on": [],
+                "acceptance_criteria": ["CLI reports usage for missing required argument"],
+                "validation_commands": [{
+                    "cmd": ["python", "-c", "import sys; print('usage: app text', file=sys.stderr); sys.exit(2)"],
+                    "expected_returncode": 2,
+                }],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            (workspace / "cli.py").write_text("print('placeholder')\n", encoding="utf-8")
+
+            review = agent._step_review_pass(
+                step,
+                1,
+                {"written": ["cli.py"], "commands": [], "raw": {"test_evidence": ["negative path checked"]}},
+                "hard_pushback",
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertEqual(review["deterministic_evidence_findings"], [])
+            result = review["feedback_tool_evidence"]["validation_results"][0]
+            self.assertEqual(result["returncode"], 2)
+            self.assertTrue(result["returncode_matches_expected"])
+
+    def test_feedback_review_routes_malformed_validation_command_to_plan_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Malformed validation")
+            step = {
+                "id": "T1",
+                "title": "Create checked artifact",
+                "description": "Validate with a malformed python -c command.",
+                "depends_on": [],
+                "acceptance_criteria": ["artifact exists"],
+                "validation_commands": [["python", "-c", "assert True]"]],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            (workspace / "artifact.txt").write_text("present\n", encoding="utf-8")
+
+            review = agent._step_review_pass(
+                step,
+                1,
+                {"written": ["artifact.txt"], "commands": [], "raw": {"test_evidence": []}},
+                "hard_pushback",
+            )
+
+            self.assertEqual(review["status"], "needs_plan_change")
+            self.assertIn("Plan validation command appears malformed", "\n".join(review["required_changes"]))
+
+    def test_git_diff_gate_rejects_no_change_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("No-change attempt")
+            step = {
+                "id": "T1",
+                "title": "Create marker file",
+                "description": "Write marker.txt.",
+                "depends_on": [],
+                "acceptance_criteria": ["marker.txt exists"],
+                "validation_commands": [],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+
+            review = agent._step_review_pass(
+                step,
+                1,
+                {"written": [], "commands": [], "raw": {"test_evidence": []}},
+                "hard_pushback",
+            )
+
+            self.assertEqual(review["status"], "needs_rework")
+            self.assertIn("Git working tree has no implementation changes", "\n".join(review["required_changes"]))
 
     def test_final_review_reruns_plan_validation_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
-            config_path = write_config(root, workspace, "final tool evidence", "Build a tiny checked artifact.")
-            cfg = load_config(config_path, repo_root=root)
-            agent = FeedbackLoopAgent(cfg, mock=True)
+            agent = load_test_agent(root, workspace)
             agent.initialize()
-            agent.requirements = {
-                "project_summary": "Final review tool evidence smoke test",
-                "refined_requirements": ["Final review must rerun plan validations."],
-            }
+            agent.requirements = base_requirements("Final review evidence")
             step = {
                 "id": "T1",
                 "title": "Create checked artifact",
@@ -327,51 +545,43 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             validations = review["feedback_tool_evidence"]["step_validations"]
             self.assertEqual(validations[0]["validation_results"][0]["returncode"], 0)
 
-    def test_web_research_is_fetched_and_used_in_structure_step(self) -> None:
+    def test_web_research_phase_records_local_source_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             site = root / "site"
             site.mkdir()
             (site / "research.html").write_text(
-                "<html><head><title>Harness Research Fixture</title></head>"
-                "<body><main>CITATION_MARKER_ALPHA: use a small adapter boundary, "
+                "<html><head><title>Harness Research Page</title></head>"
+                "<body><main>CITATION_MARKER_ALPHA: use an adapter boundary, "
                 "write deterministic tests, and cite this source in architecture notes.</main></body></html>",
                 encoding="utf-8",
             )
             with local_http_server(site) as base_url:
                 workspace = root / "workspace"
                 url = f"{base_url}/research.html"
-                config_path = write_config(
+                agent = load_test_agent(
                     root,
                     workspace,
-                    "mock researched tracker",
-                    f"Research this source before planning and building the tiny task tracker: {url}",
+                    title="researched artifact",
+                    prompt=f"Research this source before planning and building a small artifact: {url}",
                 )
-                cfg = load_config(config_path, repo_root=root)
-                summary = FeedbackLoopAgent(cfg, mock=True).run()
+                agent.initialize()
+                result = agent._web_research_phase()
 
-            self.assertEqual(summary["final_status"], "resolved")
-            self.assertEqual(summary["web_research"]["status"], "completed")
-            self.assertTrue(summary["web_research"]["requested"])
-            self.assertEqual(summary["web_research"]["targets"][0]["status"], "ok")
+            self.assertEqual(result["status"], "completed")
+            self.assertTrue(result["requested"])
+            self.assertEqual(result["targets"][0]["status"], "ok")
             research_doc = (workspace / "RESEARCH.md").read_text(encoding="utf-8")
-            architecture = (workspace / "ARCHITECTURE.md").read_text(encoding="utf-8")
             transcript = (workspace / ".agent_state" / "conversation.jsonl").read_text(encoding="utf-8")
             self.assertIn(url, research_doc)
-            self.assertIn(url, architecture)
-            self.assertIn("CITATION_MARKER_ALPHA", architecture)
+            self.assertIn("CITATION_MARKER_ALPHA", research_doc)
             self.assertIn("WEB_RESEARCH_TOOL_RESULT", transcript)
-            self.assertIn("WEB_RESEARCH_USAGE_REQUIREMENT", transcript)
-            first_step_review = summary["steps"][0]["attempts"][-1]["review"]
-            self.assertEqual(first_step_review["deterministic_evidence_findings"], [])
 
-    def test_research_usage_gate_rejects_ignored_research(self) -> None:
+    def test_research_usage_gate_rejects_ignored_source_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
-            config_path = write_config(root, workspace, "ignored research", "Research this source: http://example.test/research")
-            cfg = load_config(config_path, repo_root=root)
-            agent = FeedbackLoopAgent(cfg, mock=True)
+            agent = load_test_agent(root, workspace, prompt="Research this source: http://example.test/research")
             agent.initialize()
             agent.web_research_result = {
                 "status": "completed",
@@ -383,10 +593,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                     "excerpt": "Use this evidence in architecture notes.",
                 }],
             }
-            agent.requirements = {
-                "project_summary": "Research must be used",
-                "refined_requirements": ["Generated architecture must cite researched source URLs."],
-            }
+            agent.requirements = base_requirements("Research must be used")
             step = {
                 "id": "S1",
                 "title": "Research required patterns and plan project structure",
@@ -417,80 +624,46 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(review["status"], "needs_rework")
             self.assertIn("researched source URL", "\n".join(review["required_changes"]))
 
-    def test_git_commits_each_accepted_plan_step_and_final_review(self) -> None:
+    def test_git_commits_accepted_step_and_can_leave_final_changes_uncommitted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
-            config_path = write_config(root, workspace, "mock tracker git", "Build and test a task tracker.")
-            cfg = load_config(config_path, repo_root=root)
-            summary = FeedbackLoopAgent(cfg, mock=True).run()
-
-            self.assertEqual(summary["final_status"], "resolved")
-            self.assertTrue((workspace / ".git").exists())
-            status = subprocess.run(
-                ["git", "-C", str(workspace), "status", "--short"],
-                text=True,
-                capture_output=True,
-                check=True,
-            ).stdout.strip()
-            log = subprocess.run(
-                ["git", "-C", str(workspace), "log", "--oneline", "--reverse"],
-                text=True,
-                capture_output=True,
-                check=True,
-            ).stdout
-
-            self.assertEqual(status, "")
-            self.assertIn("harness baseline: requirements and validated plan", log)
-            self.assertIn("S1: Research required patterns and plan project structure", log)
-            self.assertIn("S2: Implement task tracker core", log)
-            self.assertIn("S3: Add persistence tests and documentation", log)
-            self.assertIn("final review: accepted project state", log)
-            self.assertTrue(all("git_commit" in step["attempts"][-1] for step in summary["steps"]))
-
-    def test_git_diff_gate_rejects_no_change_attempt_then_accepts_fix(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workspace = root / "workspace"
-            config_path = write_config(
-                root,
-                workspace,
-                "mock empty-diff",
-                "Build the empty-diff no-change marker-file project.",
-            )
-            cfg = load_config(config_path, repo_root=root)
-            summary = FeedbackLoopAgent(cfg, mock=True).run()
-
-            self.assertEqual(summary["final_status"], "resolved")
-            s2 = next(step for step in summary["steps"] if step["step_id"] == "S2")
-            self.assertGreaterEqual(len(s2["attempts"]), 2)
-            first_review = s2["attempts"][0]["review"]
-            self.assertEqual(first_review["status"], "needs_rework")
-            self.assertIn("Git working tree has no implementation changes", "\n".join(first_review["required_changes"]))
-            self.assertTrue((workspace / "marker.txt").exists())
-            self.assertEqual((workspace / "marker.txt").read_text().strip(), "done")
-
-    def test_git_policy_can_leave_final_changes_uncommitted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workspace = root / "workspace"
-            config_path = write_config(root, workspace, "mock tracker soft reset", "Build and test a task tracker.")
+            config_path = write_config(root, workspace, "git policy", "Build a small checked artifact.")
             data = json.loads(config_path.read_text(encoding="utf-8"))
             data["git_policy"]["leave_final_changes_uncommitted"] = True
-            config_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            config_path.write_text(json.dumps(data), encoding="utf-8")
             cfg = load_config(config_path, repo_root=root)
-            summary = FeedbackLoopAgent(cfg, mock=True).run()
+            agent = FeedbackLoopAgent(
+                cfg,
+                implementation_client=ScriptedClient(),
+                feedback_client=ScriptedClient(),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Git policy")
+            agent.plan_steps = [{
+                "id": "S1",
+                "title": "Create checked artifact",
+                "description": "Write file.txt.",
+                "depends_on": [],
+                "acceptance_criteria": ["file.txt exists"],
+                "validation_commands": [],
+                "status": "resolved",
+            }]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            agent._git_baseline_commit()
+            (workspace / "file.txt").write_text("done\n", encoding="utf-8")
+            step_commit = agent._git_commit_completed_step(agent.plan_steps[0])
+            finalize = agent._git_finalize_policy()
 
-            self.assertEqual(summary["final_status"], "resolved")
-            self.assertTrue(summary["git"]["finalize"]["left_uncommitted"])
+            self.assertTrue(step_commit["committed"])
+            self.assertTrue(finalize["left_uncommitted"])
             status = subprocess.run(
                 ["git", "-C", str(workspace), "status", "--short"],
                 text=True,
                 capture_output=True,
                 check=True,
             ).stdout
-            self.assertIn("ARCHITECTURE.md", status)
-            self.assertIn("task_tracker.py", status)
+            self.assertIn("file.txt", status)
 
 
 if __name__ == "__main__":

@@ -4,9 +4,9 @@
     "base_url": "http://127.0.0.1:8161/v1",
     "api_key": "not-needed",
     "model": "local-gguf",
-    "context_window": 76800,
-    "max_tokens": 2048,
-    "temperature": 0.25,
+    "context_window": 32768,
+    "max_tokens": 1536,
+    "temperature": 0.15,
     "request_timeout_seconds": 21600
   },
   "feedback_model": null,
@@ -18,8 +18,8 @@
   "runtime": {
     "docker_isolation": true,
     "docker_image": "agentic-feedback-coding:local",
-    "workspace": "workspaces/example-task-tracker",
-    "command_timeout_seconds": 120,
+    "workspace": "workspaces/real-arithmetic",
+    "command_timeout_seconds": 60,
     "print_transcript": true,
     "max_command_timeout_seconds": 21600
   },
@@ -27,15 +27,15 @@
     "enabled": true,
     "threshold_ratio": 0.8,
     "keep_recent_turns": 8,
-    "summary_max_tokens": 1024
+    "summary_max_tokens": 512
   },
   "loop": {
-    "max_iterations": 3,
+    "max_iterations": 1,
     "stop_when_review_clean": true
   },
   "project_design": {
-    "title": "Starter task tracker project",
-    "prompt": "Build a small Python command-line task tracker. It should support adding tasks, marking tasks done, listing tasks, and saving state as JSON. Keep the implementation small, testable, and documented. Maintain PLAN.md during the work."
+    "title": "Real arithmetic package benchmark",
+    "prompt": "Build a tiny Python module called arithmetic_box.py with add, multiply, and mean functions, plus unittest coverage. Keep it very small. Maintain PLAN.md during the work."
   },
   "phases": {
     "requirements_refinement": {

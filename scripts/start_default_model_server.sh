@@ -59,6 +59,12 @@ if [ "$USE_DRI" = "1" ]; then
   DEVICE_ARGS+=(--device=/dev/dri)
 fi
 
+VOLUME_ARGS=(-v "$HF_ROOT:$HF_ROOT:ro")
+case "$MODEL_ROOT" in
+  "$HF_ROOT"|"$HF_ROOT"/*) ;;
+  *) VOLUME_ARGS+=(-v "$MODEL_ROOT:$MODEL_ROOT:ro") ;;
+esac
+
 "${DOCKER[@]}" run -d --name "$CONTAINER" \
   --memory="$MEM_LIMIT" \
   --memory-swap="$MEMORY_SWAP" \
@@ -67,7 +73,7 @@ fi
   "${DEVICE_ARGS[@]}" \
   --security-opt label=disable \
   --ipc=host --network=host \
-  -v "$HF_ROOT:$HF_ROOT:ro" \
+  "${VOLUME_ARGS[@]}" \
   -e MODEL="$MODEL_PATH" \
   -e PORT="$PORT" \
   -e CTX_SIZE="$CTX_SIZE" \

@@ -3,11 +3,17 @@ FROM ubuntu:24.04 AS build
 ARG LLAMA_CPP_REF=master
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ca-certificates build-essential cmake ninja-build pkg-config \
-    python3 python3-venv python3-pip \
-    libvulkan-dev vulkan-tools glslang-tools glslc \
- && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    apt-get update; \
+    apt-get install -y --fix-missing --no-install-recommends ca-certificates; \
+    sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
+    apt-get update; \
+    apt-get install -y --fix-missing --no-install-recommends \
+      git build-essential cmake ninja-build pkg-config \
+      python3 python3-venv python3-pip \
+      libvulkan-dev vulkan-tools glslang-tools glslc spirv-headers; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt
 RUN set -eux; \
@@ -34,10 +40,16 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl libstdc++6 libgomp1 \
-    libvulkan1 mesa-vulkan-drivers vulkan-tools \
- && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \
+    apt-get update; \
+    apt-get install -y --fix-missing --no-install-recommends ca-certificates; \
+    sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true; \
+    apt-get update; \
+    apt-get install -y --fix-missing --no-install-recommends \
+      curl libstdc++6 libgomp1 \
+      libvulkan1 mesa-vulkan-drivers vulkan-tools; \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 COPY --from=build /opt/llama.cpp/build/bin/llama-cli /usr/local/bin/llama-cli

@@ -1,19 +1,29 @@
 # agenticFeedbackCoding
 
-`agenticFeedbackCoding` runs a local AI coding workflow where one agent implements a project and a second agent reviews every step with tests, git diffs, and evidence before accepting it. It is config-driven, Docker-isolated by default, can run fully offline, and keeps long agent conversations coherent with a shared transcript, PLAN.md, git checkpoints, and context compaction.
+`agenticFeedbackCoding` runs a local AI coding workflow where one agent implements a project and a second agent reviews every step with tests, git diffs, command output, and evidence before accepting it. Normal work runs inside Docker for safety: only the generated project workspace is mounted out to the host, while the local model server stays outside and is reached through an OpenAI-compatible API.
 
-Fast local smoke test after cloning:
+The project is intentionally config-driven. One JSON file defines the model endpoint, workspace, review strictness, allowed tools, web/offline mode, and the project prompt.
+
+## Quick Start
+
+Start the local model server, then run a real benchmark through Docker:
 
 ```bash
-bash scripts/bootstrap_ubuntu.sh
-bash scripts/build_and_run.sh --config config.example.json --mock
+MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
+bash scripts/build_and_run.sh --config config.real-palindrome.json
 ```
 
-The mock run does not need a model or Hugging Face token. It builds the Docker harness, writes a tiny project to `workspaces/demo`, and proves the planning, review, test-evidence, and git-checkpoint flow works.
+That run builds the agent container, mounts only the configured workspace, asks the local model to build the project, and stores the full transcript plus review evidence under `workspaces/real-palindrome/.agent_state/`.
 
 ## One Config File
 
-A run is controlled from one JSON file. Copy `config.example.json`, edit the task prompt, choose the workspace, and decide whether web research is allowed:
+Copy a real config and edit the prompt/workspace:
+
+```bash
+cp config.example.json config.my-project.json
+```
+
+The important fields are usually enough:
 
 ```json
 {
@@ -45,8 +55,6 @@ A run is controlled from one JSON file. Copy `config.example.json`, edit the tas
 }
 ```
 
-The full config has more knobs for retry budgets, strict review, git policy, and context compaction. The important idea is simple: project intent and harness behavior live together in one file.
-
 `command_timeout_seconds` is only the default timeout for one terminal command. It is not the model response timeout. If a generated test or build step needs longer, the agent can request it per command:
 
 ```json
@@ -57,13 +65,13 @@ That request is clamped by `runtime.max_command_timeout_seconds`. Model calls us
 
 ## Safety Model
 
-Normal agentic work runs inside Docker. `scripts/run_agent.sh` refuses to run the workflow on the host unless you explicitly set `ALLOW_HOST_AGENT_RUN=1`, which is intended only for harness development.
+Normal agentic work runs inside Docker. `scripts/run_agent.sh` refuses to run the workflow directly on the host unless `ALLOW_HOST_AGENT_RUN=1` is explicitly set for harness development.
 
-The container gets one writable mount: the configured `runtime.workspace`, mapped to `/workspace/project`, so generated output is visible on the host. The config file is mounted read-only. The Docker socket is not mounted. Host networking is used only so the container can reach a local OpenAI-compatible model server such as `127.0.0.1:8161`.
+The container gets one writable mount: the configured `runtime.workspace`, mapped to `/workspace/project`. The config file is mounted read-only. The Docker socket is not mounted. Host networking is used only so the agent container can reach a local OpenAI-compatible model server such as `127.0.0.1:8161`.
 
-The agent container includes Python, Chromium, Playwright, `curl`, `git`, `jq`, `requests`, and `beautifulsoup4`, so generated projects can run small tests, browser checks, and scraping-style tasks without installing those tools directly into the host project folder.
+The agent container includes Python, Chromium, Playwright, `pytest`, `curl`, `git`, `jq`, `requests`, and `beautifulsoup4`, so generated projects can run tests, browser checks, and scraping-style tasks without installing those tools into the host project folder.
 
-## Quick Start Details
+## Install And Model Setup
 
 Clone and enter the repo:
 
@@ -78,77 +86,21 @@ Install host dependencies, Docker, Python requirements, Ubuntu/Mesa Vulkan packa
 bash scripts/bootstrap_ubuntu.sh
 ```
 
-Run the deterministic smoke scenario:
-
-```bash
-bash scripts/build_and_run.sh --config config.example.json --mock
-```
-
-That is enough to validate the harness itself. It does not download a model.
-
-## Building A New Project
-
-1. Copy a config:
-
-```bash
-cp config.example.json config.my-project.json
-```
-
-2. Edit these fields in `config.my-project.json`:
-
-```json
-"runtime": {
-  "docker_isolation": true,
-  "workspace": "workspaces/my-project"
-},
-"project_design": {
-  "title": "My project",
-  "prompt": "Describe exactly what the agents should build."
-}
-```
-
-3. If you want a fully offline run, disable web research in both places:
-
-```json
-"mcp_tools": {
-  "web_scraping": false
-},
-"web_research": {
-  "enabled": false
-}
-```
-
-4. Run it:
-
-```bash
-bash scripts/build_and_run.sh --config config.my-project.json --real
-```
-
-Use `--mock` instead of `--real` only for deterministic harness tests.
-
-## Local Model Setup
-
-The harness talks to any OpenAI-compatible chat endpoint. The tested local profile uses llama.cpp/Vulkan serving `Qwen3.6-27B Q4_K_M` on an AMD Ryzen AI Max+ 395 / Strix Halo machine with 96GB unified memory. Other GPUs, CPUs, cloud endpoints, and model servers should work if they expose an OpenAI-compatible `/v1/chat/completions` API, but they were not validated here.
-
-For the tested Qwen3.6 profile, run:
+For the tested Qwen3.6 profile, download/build the default model tooling:
 
 ```bash
 HF_TOKEN_FILE=$HOME/hf.key MODEL_ROOT=$HOME/hf/models \
   bash scripts/bootstrap_ubuntu.sh --download-model --build-llama-vulkan
 ```
 
-What is `hf.key`?
-
-- It is a plain text file outside this repo containing a Hugging Face access token.
-- You only need it for downloads that require authentication or when you prefer authenticated Hugging Face requests.
-- Create it like this after generating a token on Hugging Face:
+`hf.key` is a plain text Hugging Face token outside this repo. Create it only if you need authenticated Hugging Face access:
 
 ```bash
 printf '%s' 'hf_your_token_here' > "$HOME/hf.key"
 chmod 600 "$HOME/hf.key"
 ```
 
-The model download is large. Keep models outside the repo. Default paths are defined in `scripts/env.sh`:
+Default model paths are defined in `scripts/env.sh`:
 
 ```bash
 HF_ROOT=$HOME/hf
@@ -162,13 +114,7 @@ Start the default llama.cpp/Vulkan server:
 MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
 ```
 
-Then run the real-model smoke config:
-
-```bash
-bash scripts/build_and_run.sh --config config.qwen36-smoke.json --real
-```
-
-The default config expects:
+The default configs expect:
 
 ```text
 http://127.0.0.1:8161/v1
@@ -176,7 +122,7 @@ http://127.0.0.1:8161/v1
 
 ## AMD And Driver Notes
 
-The validated local path for this project is Vulkan, not ROCm. On the Strix Halo machine used during development, llama.cpp with Vulkan was more reliable than ROCm for GGUF serving.
+The validated local path for this project is Vulkan, not ROCm. On the AMD Ryzen AI Max+ 395 / Strix Halo machine used during development, llama.cpp with Vulkan was more reliable than ROCm for GGUF serving.
 
 The Ubuntu bootstrap installs these AMD-relevant packages:
 
@@ -200,13 +146,7 @@ USE_DRI=0 GPU_LAYERS=0 MODEL_ROOT=$HOME/hf/models bash scripts/start_default_mod
 
 That is much slower, but it avoids GPU-driver paths. ROCm is not required and is intentionally not automated here.
 
-References:
-
-- Docker Ubuntu install: https://docs.docker.com/engine/install/ubuntu/
-- Ubuntu `mesa-vulkan-drivers`: https://packages.ubuntu.com/mesa-vulkan-drivers
-- AMD ROCm Linux install docs: https://rocm.docs.amd.com/en/latest/deploy/linux/installer/install.html
-
-## What The Harness Does
+## Workflow
 
 The workflow is deliberately more structured than one-pass code generation:
 
@@ -232,7 +172,7 @@ The feedback agent does not only read the implementation agent's claims. Before 
 - `git diff --stat`
 - a truncated `git diff`
 
-The deterministic evidence gate uses that feedback-side evidence first. In hard-pushback mode it rejects a step if validation is missing, fails, times out, or if the implementation claims completion without meaningful git changes.
+The automatic evidence gate uses that feedback-side evidence first. In hard-pushback mode it rejects a step if validation is missing, fails, times out, or if the implementation claims completion without meaningful git changes.
 
 ## Git Checkpointing
 
@@ -265,14 +205,7 @@ Web research is optional. The project can run fully locally/offline if you disab
 }
 ```
 
-When enabled, web research only runs if the prompt explicitly asks to search/research/browse, look up current/latest information, or includes source URLs. The harness then:
-
-- fetches source URLs directly, or performs a small best-effort DuckDuckGo HTML search when no URL was provided
-- extracts page title and readable text excerpts
-- writes the evidence to `RESEARCH.md`
-- appends `WEB_RESEARCH_TOOL_RESULT` to the durable transcript
-- injects compact research notes into requirements, planning, and implementation prompts
-- requires generated project work to cite/apply fetched source URLs outside tool-generated `RESEARCH.md`
+When enabled, web research only runs if the prompt explicitly asks to search/research/browse, look up current/latest information, or includes source URLs. The harness then fetches pages, writes `RESEARCH.md`, appends the research result to the transcript, injects compact research notes into later prompts, and asks the generated project to cite/apply source URLs when sources were actually fetched.
 
 ## Output Files
 
@@ -289,8 +222,6 @@ Each run creates a generated workspace under `workspaces/` and writes:
 Generated workspaces, logs, reports, transcripts, and test evidence are ignored by git. They are useful locally, but they should not be published by accident.
 
 ## Configuration Knobs
-
-The main settings live in JSON config files.
 
 | Field | Purpose | Typical values |
 |---|---|---|
@@ -323,57 +254,23 @@ The main settings live in JSON config files.
 | `quality_policy.assume_code_quality_when_unspecified` | Adds default structure/tests/docs requirement unless prompt overrides it. | `true` |
 | `quality_policy.require_research_and_structure_step` | Requires a first research/architecture step. | `true` |
 | `web_research.enabled` | Enables harness-owned web research before requirements refinement. | `true` or `false` |
-| `web_research.max_search_results` | Search results to collect when no URL is provided. | `3` |
-| `web_research.max_pages` | Maximum pages fetched per run. | `3` |
-| `web_research.timeout_seconds` | Per-page network timeout. | `15` |
-| `web_research.max_page_bytes` | Maximum bytes read from one page. | `1000000` |
-| `web_research.excerpt_chars` | Characters kept per source excerpt. | `3000` |
-| `web_research.user_agent` | User-Agent for fetch/search requests. | project default |
 | `git_policy.enabled` | Initializes a workspace-local git repository and records git evidence. | `true` |
 | `git_policy.commit_completed_steps` | Commits each accepted plan step after feedback resolves it. | `true` |
 | `git_policy.require_step_diff` | Rejects step acceptance when there are no meaningful implementation changes to review. | `true` |
-| `git_policy.leave_final_changes_uncommitted` | Soft-resets accepted commits at the end so the final project is visible as uncommitted changes. | `false` |
-| `git_policy.final_reset_mode` | Reset mode used when leaving changes uncommitted. | `soft` or `mixed` |
-| `git_policy.commit_user_name` | Local git author name used inside generated workspaces. | `agenticFeedbackCoding` |
-| `git_policy.commit_user_email` | Local git author email used inside generated workspaces. | `agentic-feedback@example.local` |
 | `project_design.title` | Short task title. | Any string |
 | `project_design.prompt` | Actual task prompt. | Detailed project brief |
 
-## Default Quality Policy
+## Real Example Configs
 
-Unless the user prompt explicitly says otherwise, requirements refinement assumes the project should be well structured, well tested, and well documented. When that default applies, the first implementation step must research needed patterns/knowledge, plan the project structure/architecture, and rewrite or confirm the remaining task order.
+These configs are intended to run against a real local model endpoint. `config.real-palindrome.json` and `config.real-arithmetic.json` are the compact verified evidence runs documented below; the others are reusable starting points for larger tasks.
 
-Disable that behavior only when you really want a throwaway run:
-
-```json
-"quality_policy": {
-  "assume_code_quality_when_unspecified": false,
-  "require_research_and_structure_step": false
-}
-```
-
-## Critical Review Policy
-
-Feedback is strict first, then bounded so it cannot loop forever:
-
-```json
-"review_policy": {
-  "hard_pushback_iterations": 3,
-  "compromise_iterations": 4,
-  "final_review_iterations": 1
-}
-```
-
-During hard-pushback iterations, feedback rejects missing or inconsistent evidence. During compromise iterations, it may accept a diluted requirement or `skipped_with_note`, but it must record the limitation.
-
-## Config Files
-
-- `config.example.json` - default deterministic task-tracker project.
-- `config.mock-website.json` - static multi-page website and clicker interaction.
-- `config.mock-cities.json` - non-development city image manifest workflow.
-- `config.mock-emptydiff.json` - no-change attempt exercise proving git-diff feedback pushback.
-- `config.mock-platformer.json` - browser platformer stress scenario with Playwright screenshot validation.
-- `config.qwen36-smoke.json` - small real-model profile for Qwen3.6 via a local OpenAI-compatible endpoint.
+- `config.example.json` - starter task tracker project.
+- `config.real-palindrome.json` - small verified CLI benchmark used as the current evidence run.
+- `config.real-arithmetic.json` - small verified arithmetic package task.
+- `config.real-website.json` - static website plus browser interaction task.
+- `config.real-city-research.json` - web-research manifest task.
+- `config.real-platformer.json` - browser platformer task with Playwright validation requirements.
+- `config.gpx-editor.json` - GPX editor task with browser/map-style interaction requirements.
 
 ## Scripts
 
@@ -387,29 +284,66 @@ During hard-pushback iterations, feedback rejects missing or inconsistent eviden
 | `scripts/run_agent.sh` | Lower-level runner that re-enters Docker when `runtime.docker_isolation=true`. |
 | `scripts/env.sh` | Shared path/model defaults. Override values in the shell. |
 
-## Running Mock Scenarios
+## Verified Real Runs
+
+Two real Docker-isolated Qwen3.6-27B Q4_K_M runs were executed with:
 
 ```bash
-bash scripts/build_and_run.sh --config config.mock-website.json --mock
-bash scripts/build_and_run.sh --config config.mock-cities.json --mock
-bash scripts/build_and_run.sh --config config.mock-emptydiff.json --mock
-bash scripts/build_and_run.sh --config config.mock-platformer.json --mock
+HF_ROOT=/mnt/hf MODEL_ROOT=/mnt/hf/models bash scripts/start_default_model_server.sh
+bash scripts/build_and_run.sh --config config.real-palindrome.json
+bash scripts/build_and_run.sh --config config.real-arithmetic.json
 ```
 
-Mock mode uses deterministic local responses, so these runs validate the harness itself without needing a local model server.
+Observed `config.real-palindrome.json` result:
+
+- The run entered Docker via `scripts/run_agent.sh` because `runtime.docker_isolation=true`.
+- The generated project was written to `workspaces/real-palindrome` through the `/workspace/project` mount.
+- The local model created `DESIGN_NOTES.md`, `palindrome.py`, `cli.py`, `test_palindrome.py`, `test_cli.py`, and `README.md`.
+- Requirements refinement was challenged once because the first draft skipped the required research/structure-planning step and included a redundant end-to-end step.
+- Plan validation then accepted a three-step plan: core module/tests, CLI/tests, and documentation.
+- Feedback-side validation independently ran `python -m unittest test_palindrome -v`, `python -m unittest discover -v`, `python cli.py racecar`, `python cli.py hello`, `test -f PLAN.md`, `test -f palindrome.py`, `test -f README.md`, and `test -f DESIGN_NOTES.md`.
+- The generated project passed 20 `unittest` cases, including core palindrome behavior, CLI integration, missing-argument handling, case-insensitivity, punctuation handling, non-palindromes, empty strings, and Unicode-aware alphanumeric filtering.
+- Workspace git recorded a baseline commit, one accepted commit per completed plan step, and a final review commit.
+- Final whole-project review resolved with a clean git state after rerunning all plan validation commands.
+
+Observed `config.real-arithmetic.json` result:
+
+- The run entered Docker via the same isolated `/workspace/project` mount and wrote `workspaces/real-arithmetic`.
+- The fresh Docker build path was exercised for both the llama.cpp/Vulkan server image and the agent image.
+- The first plan was rejected by the feedback agent because it skipped the required research/structure-planning step and did not independently verify README contents.
+- The revised plan added `S0` for available-knowledge notes and project structure planning, then `S1` for code/tests, then `S2` for docs.
+- The local model created `PROJECT_NOTES.md`, `arithmetic_box.py`, `test_arithmetic_box.py`, and `README.md`.
+- Feedback-side validation independently ran the `PROJECT_NOTES.md` assertion, `python -m unittest discover -v`, and README content assertions for `add`, `multiply`, `mean`, and test instructions.
+- The generated project passed 22 `unittest` cases for numeric happy paths, mixed int/float behavior, negative/zero cases, generator input for `mean`, `TypeError` cases, and `ValueError` for empty mean input.
+- Workspace git recorded a baseline commit, one accepted commit per completed plan step, and a final review commit.
+- Final whole-project review resolved with a clean git state.
+
+The evidence is stored locally in ignored generated workspaces:
+
+```text
+workspaces/real-palindrome/.agent_state/summary.json
+workspaces/real-palindrome/.agent_state/conversation.md
+workspaces/real-arithmetic/.agent_state/summary.json
+workspaces/real-arithmetic/.agent_state/conversation.md
+```
 
 ## Tests
 
-Run the Python unit/integration tests without Docker:
+Run the harness unit tests without Docker:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 -m unittest discover -s tests -v
 ```
 
-Run Docker mock harness checks:
+Run a real Docker-isolated benchmark:
 
 ```bash
-bash scripts/build_and_run.sh --config config.example.json --mock
-bash scripts/build_and_run.sh --config config.mock-emptydiff.json --mock
-bash scripts/build_and_run.sh --config config.mock-platformer.json --mock
+MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
+bash scripts/build_and_run.sh --config config.real-palindrome.json
+```
+
+If your model cache lives outside `$HOME/hf`, override both roots:
+
+```bash
+HF_ROOT=/mnt/hf MODEL_ROOT=/mnt/hf/models bash scripts/start_default_model_server.sh
 ```

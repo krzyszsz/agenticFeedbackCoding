@@ -44,17 +44,55 @@ def append_plan_note(workspace: Path, note: str) -> None:
         f.write(f"\n- {note.strip()}\n")
 
 
+def _json_object_candidates(text: str) -> list[str]:
+    """Return balanced JSON-object-looking substrings from noisy model output."""
+    candidates: list[str] = []
+    start: int | None = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+            continue
+        if char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidates.append(text[start:index + 1])
+                start = None
+    return candidates
+
+
 def extract_json_object(text: str) -> dict:
     stripped = text.strip()
     if stripped.startswith("```"):
         stripped = stripped.strip("`")
         if stripped.startswith("json"):
             stripped = stripped[4:].strip()
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        raise ValueError(f"No JSON object found in model output: {text[:200]}")
-    return json.loads(stripped[start:end + 1])
+    # Qwen-family models often prepend reasoning even when asked for JSON.
+    # We do not treat that as success, but the parser can still recover the
+    # first complete object so the orchestration loop can keep moving.
+    for candidate in _json_object_candidates(stripped):
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError(f"No JSON object found in model output: {text[:200]}")
 
 
 def _safe_relpath(path_text: str) -> Path:
@@ -85,22 +123,70 @@ def _command_parts_and_timeout(
     command: list[Any] | dict[str, Any],
     default_timeout_seconds: int,
     max_timeout_seconds: int,
-) -> tuple[list[str], int]:
+) -> tuple[list[str], int, int]:
     """Normalize command formats used by implementation and validation plans.
 
     Most commands are simple argv lists. For long-running tools, a model may use
-    {"cmd": [...], "timeout_seconds": 7200}; the harness clamps that request to
-    runtime.max_command_timeout_seconds so a typo cannot create an accidental
-    infinite process.
+    {"cmd": [...], "timeout_seconds": 7200}; for expected negative-path tests,
+    it may also use {"cmd": [...], "expected_returncode": 2}. The harness clamps
+    timeouts so a typo cannot create an accidental infinite process.
     """
     if isinstance(command, dict):
         parts = command.get("cmd") or command.get("command") or []
         requested_timeout = int(command.get("timeout_seconds", default_timeout_seconds))
+        expected_returncode = int(command.get("expected_returncode", 0))
     else:
         parts = command
         requested_timeout = default_timeout_seconds
+        expected_returncode = 0
     timeout = max(1, min(requested_timeout, max_timeout_seconds))
-    return [str(part) for part in parts], timeout
+    return [str(part) for part in parts], timeout, expected_returncode
+
+
+def _server_only_command_reason(parts: list[str]) -> str:
+    joined = " ".join(parts).lower()
+    if len(parts) >= 3 and parts[0].endswith("python") and parts[1] == "-m" and parts[2] == "http.server":
+        return "python -m http.server starts a long-running server but does not assert behavior"
+    if "python -m http.server" in joined:
+        return "python -m http.server starts a long-running server but does not assert behavior"
+    if parts and parts[0] in {"http-server", "live-server", "vite"} and not any(
+        marker in joined for marker in ("test", "validate", "check", "playwright", "selenium")
+    ):
+        return f"{parts[0]} starts a long-running server but does not assert behavior"
+    return ""
+
+
+def _git_mutation_reason(parts: list[str]) -> str:
+    """Return a reason when an agent command would mutate repository history.
+
+    The harness owns git staging and commits. Implementation agents may inspect
+    git state (`git status`, `git diff`, `git log`) as evidence, but allowing
+    them to commit during an implementation attempt hides the diff from the
+    feedback agent and breaks the accepted-step commit protocol.
+    """
+    if not parts or parts[0] != "git":
+        return ""
+    readonly = {
+        "status",
+        "diff",
+        "log",
+        "show",
+        "rev-parse",
+        "ls-files",
+        "branch",
+        "config",
+    }
+    subcommand = ""
+    for part in parts[1:]:
+        if not part.startswith("-"):
+            subcommand = part
+            break
+    if not subcommand or subcommand in readonly:
+        return ""
+    return (
+        f"git {subcommand} mutates repository state. The harness owns staging, "
+        "commits, and final reset policy after feedback accepts a step"
+    )
 
 
 def run_commands(
@@ -108,6 +194,7 @@ def run_commands(
     commands: list[list[str] | dict[str, Any]],
     timeout_seconds: int,
     max_timeout_seconds: int | None = None,
+    allow_git_mutation: bool = False,
 ) -> list[dict]:
     """Run bounded validation commands inside the workspace.
 
@@ -120,9 +207,41 @@ def run_commands(
     for command in commands:
         if not command:
             continue
-        parts, command_timeout = _command_parts_and_timeout(command, timeout_seconds, max_timeout)
+        parts, command_timeout, expected_returncode = _command_parts_and_timeout(command, timeout_seconds, max_timeout)
         if not parts:
             continue
+        server_reason = _server_only_command_reason(parts)
+        if server_reason:
+            results.append({
+                "command": parts,
+                "timeout_seconds": command_timeout,
+                "returncode": 125,
+                "expected_returncode": expected_returncode,
+                "returncode_matches_expected": 125 == expected_returncode,
+                "stdout": "",
+                "stderr": (
+                    f"{server_reason}. Put server startup inside a validation script "
+                    "that starts the server, performs assertions, then exits."
+                ),
+                "timed_out": False,
+                "skipped_as_non_verifying_server": True,
+            })
+            continue
+        if not allow_git_mutation:
+            git_reason = _git_mutation_reason(parts)
+            if git_reason:
+                results.append({
+                    "command": parts,
+                    "timeout_seconds": command_timeout,
+                    "returncode": 126,
+                    "expected_returncode": expected_returncode,
+                    "returncode_matches_expected": 126 == expected_returncode,
+                    "stdout": "",
+                    "stderr": git_reason,
+                    "timed_out": False,
+                    "blocked_git_mutation": True,
+                })
+                continue
         try:
             proc = subprocess.run(
                 parts,
@@ -136,6 +255,8 @@ def run_commands(
                 "command": parts,
                 "timeout_seconds": command_timeout,
                 "returncode": proc.returncode,
+                "expected_returncode": expected_returncode,
+                "returncode_matches_expected": proc.returncode == expected_returncode,
                 "stdout": proc.stdout[-4000:],
                 "stderr": proc.stderr[-4000:],
                 "timed_out": False,
@@ -144,6 +265,8 @@ def run_commands(
             results.append({
                 "command": parts,
                 "returncode": 124,
+                "expected_returncode": expected_returncode,
+                "returncode_matches_expected": 124 == expected_returncode,
                 "stdout": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
                 "stderr": (exc.stderr or "")[-4000:] if isinstance(exc.stderr, str) else "",
                 "timed_out": True,

@@ -4,29 +4,29 @@
     "base_url": "http://127.0.0.1:8161/v1",
     "api_key": "not-needed",
     "model": "local-gguf",
-    "context_window": 76800,
-    "max_tokens": 2048,
-    "temperature": 0.25,
+    "context_window": 32768,
+    "max_tokens": 3072,
+    "temperature": 0.18,
     "request_timeout_seconds": 21600
   },
   "feedback_model": null,
   "mcp_tools": {
     "terminal": true,
-    "web_scraping": true,
+    "web_scraping": false,
     "web_interaction": true
   },
   "runtime": {
     "docker_isolation": true,
     "docker_image": "agentic-feedback-coding:local",
-    "workspace": "workspaces/mock-cities",
-    "command_timeout_seconds": 30,
+    "workspace": "workspaces/qwen36-gpx-editor",
+    "command_timeout_seconds": 300,
     "print_transcript": true,
     "max_command_timeout_seconds": 21600
   },
   "context_compaction": {
     "enabled": true,
-    "threshold_ratio": 0.8,
-    "keep_recent_turns": 8,
+    "threshold_ratio": 0.55,
+    "keep_recent_turns": 6,
     "summary_max_tokens": 1024
   },
   "loop": {
@@ -34,18 +34,18 @@
     "stop_when_review_clean": true
   },
   "project_design": {
-    "title": "Wikipedia city image collection",
-    "prompt": "Non-development task: use web-scraping style workflow to collect image candidates for big cities from Wikipedia. Figure out the city list yourself, produce a manifest, document live-vs-fixture behavior, and validate the output."
+    "title": "GPX route editor with map-style track editing",
+    "prompt": "Build a website that loads a GPX file by drag and drop or file picker. The main view should be an intuitive interactive map-style track editor taking most of the visible screen, with only a compact tools palette. It should support zooming, panning/moving, adding points at the end, inserting points in the middle, removing waypoints, and saving/exporting the edited GPX. Level 2: display length in kilometers and miles. Level 3: if real map surface data is not available without a key, use a deterministic local fallback that colors route segments by walking, road-bike, and mountain-bike suitability and summarizes risky/busy segment length. Validation must not require an external map API key. The implementation agent must create the project itself; do not rely on prewritten harness data. Group the implementation plan into at most 5 independently verifiable steps. Keep each implementation attempt small: prefer one vertical slice or no more than 3 files per model response."
   },
   "phases": {
     "requirements_refinement": {
-      "max_iterations": 2
+      "max_iterations": 3
     },
     "plan_validation": {
-      "max_iterations": 2
+      "max_iterations": 4
     },
     "implementation": {
-      "max_iterations": 7
+      "max_iterations": 10
     }
   },
   "resolution_policy": {
@@ -64,7 +64,7 @@
     "final_review_iterations": 1
   },
   "web_research": {
-    "enabled": true,
+    "enabled": false,
     "max_search_results": 3,
     "max_pages": 3,
     "timeout_seconds": 15,
