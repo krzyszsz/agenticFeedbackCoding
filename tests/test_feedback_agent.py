@@ -16,6 +16,7 @@ import urllib.error
 from typing import Any
 
 from feedback_agent.agent import FeedbackLoopAgent
+from feedback_agent.compaction import _clean_compaction_memory, _compaction_memory_is_too_weak
 from feedback_agent.config import load_config
 from feedback_agent.conversation import Conversation
 from feedback_agent.llm import ModelRequestRetrier
@@ -231,6 +232,30 @@ class FeedbackLoopAgentTests(unittest.TestCase):
         self.assertEqual(payload["status"], "resolved")
         self.assertFalse(payload["needs_rework"])
 
+    def test_json_extractor_uses_last_corrected_object(self) -> None:
+        payload = extract_json_object(
+            "```json\n{\"status\":\"needs_rework\",\"summary\":\"first\"}\n```\n"
+            "Wait, corrected object:\n"
+            "```json\n{\"status\":\"resolved\",\"summary\":\"second\"}\n```"
+        )
+
+        self.assertEqual(payload["status"], "resolved")
+        self.assertEqual(payload["summary"], "second")
+
+    def test_json_extractor_repairs_invalid_html_escape(self) -> None:
+        payload = extract_json_object(
+            "{\"status\":\"needs_rework\",\"summary\":\"Fix </div\\> in HTML.\"}"
+        )
+
+        self.assertEqual(payload["summary"], "Fix </div> in HTML.")
+
+    def test_json_extractor_ignores_channel_wrapper(self) -> None:
+        payload = extract_json_object(
+            "<|channel>thought<channel|>{\"status\":\"resolved\",\"summary\":\"ok\"}"
+        )
+
+        self.assertEqual(payload["status"], "resolved")
+
     def test_command_timeout_can_be_overridden_per_command_and_clamped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -244,6 +269,20 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(results[0]["returncode"], 0)
             self.assertEqual(results[0]["timeout_seconds"], 7)
             self.assertIn("long command shape accepted", results[0]["stdout"])
+
+    def test_command_object_accepts_plain_string_cmd_without_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = run_commands(
+                root,
+                [{"cmd": "python -c \"print('string command accepted')\""}],
+                timeout_seconds=30,
+                max_timeout_seconds=300,
+            )
+
+            self.assertEqual(results[0]["command"][:2], ["python", "-c"])
+            self.assertEqual(results[0]["returncode"], 0)
+            self.assertIn("string command accepted", results[0]["stdout"])
 
     def test_command_output_is_bounded_at_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -306,6 +345,26 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("compressed first exchange", active_text)
             self.assertIn("first request", full_text)
             self.assertIn("ACTIVE_CONTEXT_COMPACTED", full_text)
+
+    def test_compaction_memory_strips_think_blocks(self) -> None:
+        cleaned = _clean_compaction_memory("<think>private reasoning</think>\nKeep this decision.")
+
+        self.assertEqual(cleaned, "Keep this decision.")
+
+    def test_compaction_memory_strips_channel_wrappers(self) -> None:
+        cleaned = _clean_compaction_memory("<|channel>thought<channel|>Keep this decision.")
+
+        self.assertEqual(cleaned, "Keep this decision.")
+
+    def test_compaction_memory_strips_multiline_channel_wrappers(self) -> None:
+        cleaned = _clean_compaction_memory("<|channel>thought\n<channel|>Keep this decision.")
+
+        self.assertEqual(cleaned, "Keep this decision.")
+
+    def test_compaction_rejects_useless_tiny_memory(self) -> None:
+        self.assertTrue(_compaction_memory_is_too_weak("fallible_thought"))
+        self.assertTrue(_compaction_memory_is_too_weak("ok"))
+        self.assertFalse(_compaction_memory_is_too_weak("Requirement: keep the tested validation script and the accepted browser evidence."))
 
     def test_live_echo_can_be_bounded_without_truncating_saved_transcripts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -634,6 +693,177 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
             self.assertIn("expected failure path", "\n".join(findings))
 
+    def test_plan_validation_rejects_plain_command_for_intentional_residual_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S2",
+                "title": "Fix syntax errors",
+                "description": "Fix import blockers while leaving the known logic failure for the next step.",
+                "depends_on": [],
+                "acceptance_criteria": [
+                    "The test suite runs without syntax or import errors.",
+                    "The test suite still fails due to the logic error.",
+                ],
+                "validation_commands": [["python", "-m", "unittest", "discover", "-v"]],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertIn("expected failure path", "\n".join(findings))
+
+    def test_plan_validation_rejects_plain_command_for_logic_failure_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S2",
+                "title": "Investigation and initial error resolution",
+                "description": "Fix syntax blockers, then run tests to expose remaining calculator failures.",
+                "depends_on": [],
+                "acceptance_criteria": [
+                    "The test suite runs without syntax or import errors.",
+                    "The failure logs clearly indicate logic errors in the calculator.",
+                ],
+                "validation_commands": [["python", "-m", "unittest", "discover", "-v"]],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertIn("expected failure path", "\n".join(findings))
+
+    def test_plan_validation_accepts_wrapper_for_partial_failure_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S2",
+                "title": "Fix syntax and import errors",
+                "description": "The suite may still fail on logic tests, but it must run without SyntaxError.",
+                "depends_on": [],
+                "acceptance_criteria": [
+                    "The test suite runs without syntax or import errors.",
+                    "Logic tests may still fail, but the suite completes its run.",
+                ],
+                "validation_commands": [{
+                    "cmd": [
+                        "python",
+                        "-c",
+                        "import subprocess; r = subprocess.run(['python', '-m', 'unittest'], capture_output=True, text=True); exit(0 if 'SyntaxError' not in r.stderr else 1)",
+                    ]
+                }],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertNotIn("expected failure path", "\n".join(findings))
+
+    def test_error_identification_step_allows_observed_failing_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S1",
+                "title": "Research, planning, and error identification",
+                "description": "Run the current broken test suite and document failures before fixing code.",
+                "depends_on": [],
+                "acceptance_criteria": [
+                    "Test suite execution results are documented.",
+                    "Syntax/import error is identified.",
+                ],
+                "validation_commands": [["python", "-m", "unittest", "discover", "-v"]],
+                "status": "pending",
+            }
+            implementation = {
+                "written": ["AGENT_RESEARCH.md"],
+                "commands": [{
+                    "command": ["python", "-m", "unittest", "discover", "-v"],
+                    "returncode": 1,
+                    "expected_returncode": 0,
+                    "timed_out": False,
+                }],
+                "raw": {"test_evidence": ["observed failing tests"]},
+            }
+            feedback_evidence = {
+                "validation_results": [{
+                    "command": ["python", "-m", "unittest", "discover", "-v"],
+                    "returncode": 1,
+                    "expected_returncode": 0,
+                    "timed_out": False,
+                }],
+                "workspace_files": [{"path": "AGENT_RESEARCH.md", "content": "failures", "size": 8}],
+                "git": {"meaningful_changed_paths": ["AGENT_RESEARCH.md"]},
+            }
+
+            findings = agent._evidence_findings(step, implementation, feedback_evidence)
+
+            self.assertNotIn("returned 1 but expected 0", "\n".join(findings))
+
+    def test_plan_validation_rejects_python_double_m_typo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S2",
+                "title": "Fix syntax errors",
+                "description": "Fix import blockers while leaving the known logic failure for the next step.",
+                "depends_on": [],
+                "acceptance_criteria": ["The test suite still fails due to the logic error."],
+                "validation_commands": [{
+                    "cmd": ["python", "-mm", "unittest", "discover", "-v"],
+                    "expected_returncode": 1,
+                }],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertIn("malformed Python flag", "\n".join(findings))
+
+    def test_feedback_review_rejects_expected_failure_from_malformed_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Malformed expected failure")
+            step = {
+                "id": "S2",
+                "title": "Fix syntax errors",
+                "description": "Fix import blockers while leaving the known logic failure for the next step.",
+                "depends_on": [],
+                "acceptance_criteria": ["The test suite still fails due to the logic error."],
+                "validation_commands": [{
+                    "cmd": ["python", "-mm", "unittest", "discover", "-v"],
+                    "expected_returncode": 1,
+                }],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            (workspace / "placeholder.py").write_text("print('changed')\n", encoding="utf-8")
+
+            review = agent._step_review_pass(
+                step,
+                1,
+                {"written": ["placeholder.py"], "commands": [], "raw": {"test_evidence": ["expected failure checked"]}},
+                "hard_pushback",
+            )
+
+            self.assertEqual(review["status"], "needs_plan_change")
+            required = "\n".join(review["required_changes"])
+            self.assertIn("python -mm", required)
+            self.assertIn("No module named m", required)
+
     def test_feedback_review_routes_unwrapped_expected_failure_to_plan_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -737,6 +967,39 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(review["status"], "needs_plan_change")
             self.assertIn("Plan validation command appears malformed", "\n".join(review["required_changes"]))
 
+    def test_final_review_rejects_broken_local_doc_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Documentation consistency")
+            step = {
+                "id": "T1",
+                "title": "Write notes",
+                "description": "Document the fix.",
+                "depends_on": [],
+                "acceptance_criteria": ["BUGFIX_NOTES.md references real project files"],
+                "validation_commands": [["test", "-f", "BUGFIX_NOTES.md"]],
+                "status": "resolved",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            (workspace / "invoice_calc").mkdir()
+            (workspace / "invoice_calc" / "discounts.py").write_text("def ok(): pass\n", encoding="utf-8")
+            (workspace / "BUGFIX_NOTES.md").write_text(
+                "Fixed missing colon in `invoice_calc/disintcounts.py`.\n",
+                encoding="utf-8",
+            )
+
+            review = agent._final_project_review(
+                1,
+                [{"step_id": "T1", "status": "resolved", "attempts": [{"implementation": {"commands": []}}]}],
+            )
+
+            self.assertEqual(review["status"], "needs_rework")
+            self.assertIn("invoice_calc/disintcounts.py", "\n".join(review["required_changes"]))
+
     def test_browser_guidance_prefers_python_playwright_without_node_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -748,6 +1011,26 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("sync_playwright", guidance)
             self.assertIn("assume there is no", guidance)
             self.assertIn("npx", guidance)
+
+    def test_browser_step_detection_uses_whole_word_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+
+            docs_step = {
+                "title": "Create README documentation",
+                "description": "Write usage guide and installation guide.",
+                "acceptance_criteria": ["README has usage examples."],
+            }
+            browser_step = {
+                "title": "Validate browser UI",
+                "description": "Open HTML in a browser and click a button.",
+                "acceptance_criteria": ["Screenshot evidence exists."],
+            }
+
+            self.assertFalse(agent._looks_like_browser_step(docs_step))
+            self.assertTrue(agent._looks_like_browser_step(browser_step))
 
     def test_malformed_feedback_repair_becomes_actionable_rework_instead_of_crash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -768,7 +1051,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             )
 
             self.assertEqual(review["status"], "needs_rework")
-            self.assertIn("smaller directly verifiable change", "\n".join(review["required_changes"]))
+            self.assertIn("focused directly verifiable change", "\n".join(review["required_changes"]))
             self.assertIn("parse_error", review)
 
     def test_malformed_implementation_repair_becomes_noop_payload_instead_of_crash(self) -> None:
@@ -923,6 +1206,243 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(review["deterministic_evidence_findings"], [])
             validations = review["feedback_tool_evidence"]["step_validations"]
             self.assertEqual(validations[0]["validation_results"][0]["returncode"], 0)
+
+    def test_final_review_accepts_rerun_step_validation_when_plan_path_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Final review stale plan validation")
+            tests_dir = workspace / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "test_core_logic.py").write_text(
+                "import unittest\n\n"
+                "class CoreLogicTests(unittest.TestCase):\n"
+                "    def test_passes(self):\n"
+                "        self.assertEqual(2 + 2, 4)\n\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n",
+                encoding="utf-8",
+            )
+            step = {
+                "id": "S2",
+                "title": "Core logic implementation",
+                "description": "Implement core logic and validate it with unit tests.",
+                "depends_on": [],
+                "acceptance_criteria": ["Core logic tests pass."],
+                "validation_commands": [["python", "-m", "unittest", "test_core_logic.py"]],
+                "status": "resolved",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+
+            review = agent._final_project_review(
+                1,
+                [{
+                    "step_id": "S2",
+                    "status": "resolved",
+                    "attempts": [{
+                        "review": {"status": "resolved"},
+                        "implementation": {
+                            "commands": [{
+                                "command": ["python", "-m", "unittest", "discover", "tests"],
+                                "returncode": 0,
+                                "expected_returncode": 0,
+                                "timed_out": False,
+                                "stdout": "",
+                                "stderr": "OK",
+                            }],
+                        },
+                    }],
+                }],
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertEqual(review["deterministic_evidence_findings"], [])
+            validations = review["feedback_tool_evidence"]["step_validations"]
+            self.assertEqual(validations[0]["validation_results"][0]["returncode"], 1)
+            self.assertEqual(validations[0]["accepted_validation_results"][0]["returncode"], 0)
+
+    def test_final_review_can_rescue_skipped_step_with_fresh_final_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Final correction rescued skipped step")
+            (workspace / "index.html").write_text("<!doctype html><title>ok</title>\n", encoding="utf-8")
+            step = {
+                "id": "S2",
+                "title": "Static website content",
+                "description": "Create final HTML content.",
+                "depends_on": [],
+                "acceptance_criteria": ["index.html exists"],
+                "validation_commands": [["test", "-f", "index.html"]],
+                "status": "skipped_with_note",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+
+            review = agent._final_project_review(
+                1,
+                [{"step_id": "S2", "status": "skipped_with_note", "attempts": [{"implementation": {"commands": []}}]}],
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertEqual(review["deterministic_evidence_findings"], [])
+            final_status = agent._final_status(
+                [{"step_id": "S2", "status": "skipped_with_note", "attempts": []}],
+                {"status": "resolved", "iterations": [{"review": review}]},
+            )
+            self.assertEqual(final_status, "resolved")
+
+    def test_final_review_still_reports_skipped_step_without_final_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Skipped step remains unproven")
+            step = {
+                "id": "S2",
+                "title": "Static website content",
+                "description": "Create final HTML content.",
+                "depends_on": [],
+                "acceptance_criteria": ["index.html exists"],
+                "validation_commands": [["test", "-f", "index.html"]],
+                "status": "skipped_with_note",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+
+            review = agent._final_project_review(
+                1,
+                [{"step_id": "S2", "status": "skipped_with_note", "attempts": [{"implementation": {"commands": []}}]}],
+            )
+
+            self.assertEqual(review["status"], "needs_rework")
+            self.assertTrue(any("ended with status skipped_with_note" in item for item in review["deterministic_evidence_findings"]))
+
+    def test_final_review_still_rejects_stale_plan_when_accepted_validation_now_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Final review failed replacement validation")
+            tests_dir = workspace / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "test_core_logic.py").write_text(
+                "import unittest\n\n"
+                "class CoreLogicTests(unittest.TestCase):\n"
+                "    def test_fails(self):\n"
+                "        self.assertEqual(2 + 2, 5)\n",
+                encoding="utf-8",
+            )
+            step = {
+                "id": "S2",
+                "title": "Core logic implementation",
+                "description": "Implement core logic and validate it with unit tests.",
+                "depends_on": [],
+                "acceptance_criteria": ["Core logic tests pass."],
+                "validation_commands": [["python", "-m", "unittest", "test_core_logic.py"]],
+                "status": "resolved",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+
+            review = agent._final_project_review(
+                1,
+                [{
+                    "step_id": "S2",
+                    "status": "resolved",
+                    "attempts": [{
+                        "review": {"status": "resolved"},
+                        "implementation": {
+                            "commands": [{
+                                "command": ["python", "-m", "unittest", "discover", "tests"],
+                                "returncode": 0,
+                                "expected_returncode": 0,
+                                "timed_out": False,
+                                "stdout": "",
+                                "stderr": "OK",
+                            }],
+                        },
+                    }],
+                }],
+            )
+
+            self.assertEqual(review["status"], "needs_rework")
+            self.assertTrue(any("accepted validation returned" in item for item in review["deterministic_evidence_findings"]))
+
+    def test_final_review_skips_transient_expected_failure_validations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Existing-project repair")
+            step = {
+                "id": "S2",
+                "title": "Fix syntax and import errors",
+                "description": "The suite should run without syntax/import errors while remaining logic tests still fail.",
+                "depends_on": [],
+                "acceptance_criteria": [
+                    "The test runner successfully discovers and attempts to run tests.",
+                    "The suite still fails due to the remaining logic error.",
+                ],
+                "validation_commands": [{
+                    "cmd": ["python", "-c", "print('final state is now healthy')"],
+                    "expected_returncode": 1,
+                }],
+                "status": "resolved",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+
+            review = agent._final_project_review(
+                1,
+                [{"step_id": "S2", "status": "resolved", "attempts": [{"implementation": {"commands": []}}]}],
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertEqual(review["deterministic_evidence_findings"], [])
+            validations = review["feedback_tool_evidence"]["step_validations"]
+            self.assertEqual(validations[0]["validation_results"], [])
+            self.assertEqual(len(validations[0]["final_validation_commands_skipped"]), 1)
+
+    def test_final_review_still_runs_final_negative_path_validations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("CLI negative-path behavior")
+            step = {
+                "id": "T1",
+                "title": "Implement invalid input error behavior",
+                "description": "Invalid CLI input must exit with code 2.",
+                "depends_on": [],
+                "acceptance_criteria": ["Invalid input exits 2 with a clear error message."],
+                "validation_commands": [{
+                    "cmd": ["python", "-c", "import sys; print('invalid input', file=sys.stderr); sys.exit(2)"],
+                    "expected_returncode": 2,
+                }],
+                "status": "resolved",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+
+            review = agent._final_project_review(
+                1,
+                [{"step_id": "T1", "status": "resolved", "attempts": [{"implementation": {"commands": []}}]}],
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            validations = review["feedback_tool_evidence"]["step_validations"]
+            self.assertEqual(validations[0]["final_validation_commands_skipped"], [])
+            self.assertEqual(validations[0]["validation_results"][0]["returncode"], 2)
 
     def test_web_research_phase_records_local_source_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

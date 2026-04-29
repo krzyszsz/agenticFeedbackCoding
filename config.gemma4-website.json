@@ -45,7 +45,7 @@
   },
   "project_design": {
     "title": "Gemma4 static website benchmark",
-    "prompt": "Build a small static website with three linked pages and a tiny browser interaction. It must include HTML, CSS, JavaScript, README documentation, and validation that proves navigation and the interaction work. Use the Python Playwright package that is already available in the container; do not assume Node.js, npm, npx, or @playwright/test are installed. Maintain PLAN.md during the work. Keep the plan to a small number of independently verifiable steps."
+    "prompt": "Build a static website with three linked pages and a browser interaction. It must include HTML, CSS, JavaScript, README documentation, and validation that proves navigation and the interaction work. Use the Python Playwright package that is already available in the container; do not assume Node.js, npm, npx, or @playwright/test are installed. Maintain PLAN.md during the work. Choose independently verifiable steps that make the implementation and review clear."
   },
   "phases": {
     "requirements_refinement": {
@@ -55,7 +55,7 @@
       "max_iterations": 2
     },
     "implementation": {
-      "max_iterations": 7
+      "max_iterations": 10
     }
   },
   "resolution_policy": {
@@ -69,9 +69,9 @@
     "require_research_and_structure_step": true
   },
   "review_policy": {
-    "hard_pushback_iterations": 3,
-    "compromise_iterations": 4,
-    "final_review_iterations": 1
+    "hard_pushback_iterations": 5,
+    "compromise_iterations": 5,
+    "final_review_iterations": 2
   },
   "web_research": {
     "enabled": false,

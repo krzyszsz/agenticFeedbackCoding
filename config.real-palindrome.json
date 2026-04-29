@@ -45,7 +45,7 @@
   },
   "project_design": {
     "title": "Real palindrome CLI benchmark",
-    "prompt": "Build a minimal Python CLI tool that checks whether a provided string is a palindrome, ignoring case, punctuation, and spaces. It must include a core function, a CLI script, unit tests, README documentation, and a short notes file explaining the design choices. Keep it small but complete. Maintain PLAN.md during the work. Prefer at most 4 independently verifiable implementation steps."
+    "prompt": "Build a Python CLI tool that checks whether a provided string is a palindrome, ignoring case, punctuation, and spaces. It must include a core function, a CLI script, unit tests, README documentation, and a notes file explaining the design choices. Keep it complete, well structured, and easy to validate. Maintain PLAN.md during the work. Choose independently verifiable implementation steps that fit the work without artificial fragmentation."
   },
   "phases": {
     "requirements_refinement": {

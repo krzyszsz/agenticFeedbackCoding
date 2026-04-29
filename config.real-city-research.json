@@ -45,7 +45,7 @@
   },
   "project_design": {
     "title": "Real web research city image manifest benchmark",
-    "prompt": "Use web research to choose four large world cities and collect public Wikipedia/Wikimedia image candidates for them. Build a small documented manifest project with attribution/source URLs, a validation script that checks the manifest structure, and README instructions. The agent must use fetched web research evidence instead of prewritten data. Maintain PLAN.md during the work."
+    "prompt": "Use web research to choose four large world cities and collect public Wikipedia/Wikimedia image candidates for them. Build a documented manifest project with attribution/source URLs, a validation script that checks the manifest structure, and README instructions. The agent must use fetched web research evidence instead of prewritten data. Maintain PLAN.md during the work."
   },
   "phases": {
     "requirements_refinement": {

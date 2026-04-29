@@ -66,7 +66,7 @@ The important fields are usually enough:
   "web_research": { "enabled": false },
   "project_design": {
     "title": "My new project",
-    "prompt": "Build a small browser game with tests and documentation."
+    "prompt": "Build a browser game with tests and documentation."
   }
 }
 ```
@@ -320,7 +320,7 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 | `implementation_model.base_url` | OpenAI-compatible endpoint used by the implementation agent. | `http://127.0.0.1:8161/v1` |
 | `implementation_model.model` | Model id sent to the endpoint. llama.cpp accepts `local-gguf`. | `local-gguf` |
 | `implementation_model.context_window` | Context budget used by compaction logic. The default server script starts llama.cpp with `CTX_SIZE=76800`. | `76800` |
-| `implementation_model.max_tokens` | Max response length per model call. This is an upper bound, not a target; prompts still ask for compact JSON. | `32768` |
+| `implementation_model.max_tokens` | Max response length per model call. This is an upper bound, not a target; prompts ask for structured JSON, not artificially short answers. | `32768` |
 | `implementation_model.temperature` | Generation randomness. Lower is usually better for coding. | `0.1` to `0.3` |
 | `implementation_model.request_timeout_seconds` | HTTP timeout for one model response. This is separate from terminal command timeouts. | `21600` |
 | `implementation_model.retry_attempts` | Model HTTP retry budget for temporary server/network failures. Retry progress is printed to stderr. | `20` |
@@ -342,7 +342,7 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 | `runtime.color_transcript` | Uses ANSI colors for live transcript roles when stdout is a terminal. Redirected logs stay plain text. | `true` |
 | `runtime.live_turn_max_chars` | Optional per-turn cap for live terminal printing only. Saved full transcripts remain append-only and untruncated. | `0` for unlimited, or `30000` |
 | `runtime.final_summary` | Final stdout summary mode after the live transcript. Full evidence is always written to `.agent_state/summary.json`. | `compact`, `full`, `none` |
-| `runtime.feedback_response_max_tokens` | Separate reviewer output cap. Keep this lower than implementation `max_tokens` because feedback should be compact JSON. Set `0` to use the model's full ceiling. | `4096` |
+| `runtime.feedback_response_max_tokens` | Separate reviewer output cap. Keep this lower than implementation `max_tokens` because feedback should be structured review JSON rather than generated project content. Set `0` to use the model's full ceiling. | `4096` |
 | `context_compaction.enabled` | Enables transcript compaction near context limits. | `true` |
 | `context_compaction.threshold_ratio` | Trigger compaction at this fraction of context. | `0.8` |
 | `context_compaction.keep_recent_turns` | Recent turns kept verbatim during compaction. | `6` to `12` |
@@ -370,10 +370,10 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 These configs are intended to run against a real local model endpoint. `config.real-palindrome.json` and `config.real-website.json` are the fresh simple/complex evidence runs documented below; the others are reusable starting points for larger tasks.
 
 - `config.example.json` - starter task tracker project.
-- `config.real-palindrome.json` - small verified CLI benchmark used as the current evidence run.
-- `config.real-arithmetic.json` - small verified arithmetic package task.
+- `config.real-palindrome.json` - verified CLI benchmark used as the current evidence run.
+- `config.real-arithmetic.json` - focused arithmetic package task.
 - `config.real-website.json` - static website plus browser interaction task.
-- `config.gemma4-palindrome.json` - same small CLI benchmark using Gemma4-26B-A4B.
+- `config.gemma4-palindrome.json` - same CLI benchmark using Gemma4-26B-A4B.
 - `config.gemma4-website.json` - same static website/browser benchmark using Gemma4-26B-A4B and a bounded live transcript.
 - `config.gemma4-existing-bugfix.json` - existing-project repair benchmark using separate agent-owned state files.
 - `config.gemma4-jsonl-stats.json` - fresh JSONL statistics CLI benchmark using Gemma4-26B-A4B.
@@ -396,7 +396,7 @@ These configs are intended to run against a real local model endpoint. `config.r
 
 ## Verified Real Runs
 
-The table below keeps the latest successful evidence for each real Docker-isolated workload. The Qwen palindrome and Gemma website rows were rerun after adding model HTTP retry handling and the separate feedback-response token cap; the other rows are the latest preserved successful evidence for those configs.
+The table below keeps the latest successful evidence for each real Docker-isolated workload. The Qwen palindrome, Gemma website, and Gemma existing-project rows were rerun after relaxing the prompts so the implementation model is not asked to be artificially brief. Those reruns kept the structured JSON contracts, but allowed the local model to use as much detail as the step needed.
 
 The Qwen server used the default script and port:
 
@@ -419,23 +419,23 @@ bash scripts/build_and_run.sh --config config.gemma4-palindrome.json
 bash scripts/build_and_run.sh --config config.gemma4-website.json
 ```
 
-The model server was configured for `CTX_SIZE=76800`, `PARALLEL=1`, and the configs used `max_tokens=32768` as a response ceiling. The local models usually returned much smaller compact JSON because the prompts ask for parseable structured output.
+The model server was configured for `CTX_SIZE=76800`, `PARALLEL=1`, and the configs used `max_tokens=32768` as a response ceiling. The local models usually returned shorter structured JSON than the ceiling because the task contracts are parseable JSON schemas, but the prompts do not ask the implementation agent to be brief when the work needs more detail.
 
 | Model | Workload | Config | Result | Time | Step attempts | Notes |
 |---|---|---|---|---:|---|---|
-| Qwen3.6-27B Q4_K_M | Palindrome CLI with unit tests and docs | `config.real-palindrome.json` | resolved | 1,621s | S1=1, S2=1, S3=2, S4=1 | Slower, but disciplined. The reviewer rejected a shallow documentation validator, requested stricter evidence, then accepted the corrected step. |
+| Qwen3.6-27B Q4_K_M | Palindrome CLI with unit tests and docs | `config.real-palindrome.json` | resolved | 3,615s | S1=2, S2=1, S3=2, S4=3 | Slower, but disciplined. The reviewer caught a case-sensitive validation mismatch, ambiguous empty-string CLI output, and a too-shallow documentation validator before accepting the corrected project. |
 | Qwen3.6-27B Q4_K_M | Three-page website with JS interaction and Playwright validation | `config.real-website.json` | resolved | 4,889s | S1=3, S2=3, S3=1, S4=2 | Most robust complex run. The reviewer rejected shallow validation and required browser/runtime evidence before final acceptance. |
 | Gemma4-26B-A4B Q4_K_M | Palindrome CLI with unit tests and docs | `config.gemma4-palindrome.json` | resolved | 195s | S1=1, S2=1, S3=1 | Much faster on the small task and completed without reviewer rework. |
-| Gemma4-26B-A4B Q4_K_M | Three-page website with JS interaction and Python Playwright validation | `config.gemma4-website.json` | resolved | 630s | S1=1, S2=1, S3=5, S4=2 | Fast overall, but more incremental. The reviewer caught missing website files, then caught a broken Playwright assertion before accepting the fixed browser validation. |
-| Gemma4-26B-A4B Q4_K_M | Existing invoice project bug fix | `config.gemma4-existing-bugfix.json` | resolved | 510s | S1=3, S2=2, S3=1 | Confirmed the harness can repair an existing project. The reviewer rejected vague investigation and caught the remaining tax-rate logic bug after the syntax fix. |
-| Gemma4-26B-A4B Q4_K_M | JSONL statistics CLI from scratch | `config.gemma4-jsonl-stats.json` | resolved | 950s | S1=1, S2=4, S3=3, S4=3 | Confirmed a fresh project run after the recent harness changes. The reviewer caught missing tests, syntax/runtime errors, missing sample data, and insufficient final evidence. |
+| Gemma4-26B-A4B Q4_K_M | Three-page website with JS interaction and Python Playwright validation | `config.gemma4-website.json` | resolved | 715s | S1=1, S2=3, S3=3 | Fast overall, but more incremental. The reviewer caught incomplete website files, then forced working Python Playwright validation with dynamic port handling before final acceptance. |
+| Gemma4-26B-A4B Q4_K_M | Existing invoice project bug fix | `config.gemma4-existing-bugfix.json` | resolved | 746s | S1=1, S2=4, S3=2, S4=1 | Confirmed the harness can repair an existing project. The reviewer caught malformed expected-failure evidence, kept the syntax and logic phases separate, and accepted only after the tax-rate bug was fixed and documented. |
+| Gemma4-26B-A4B Q4_K_M | JSONL statistics CLI from scratch | `config.gemma4-jsonl-stats.json` | resolved | 974s | S1=4, S2=4, S3=1, S4=1 | Confirmed a fresh project run after the recent harness changes. The reviewer caught missing tests, syntax/runtime errors, missing sample data, and insufficient final evidence. |
 
 Observed Qwen simple workload result:
 
 - The run entered Docker via `scripts/run_agent.sh` because `runtime.docker_isolation=true`.
 - The generated project was written to `workspaces/real-palindrome` through the `/workspace/project` mount.
 - Feedback-side validation independently ran the generated unit tests and CLI checks, including positive and negative examples.
-- The latest rerun passed 10 `unittest` cases plus CLI subprocess checks covering core palindrome behavior, case-insensitivity, punctuation handling, non-palindromes, empty strings, and command-line integration.
+- The latest rerun passed 18 generated `unittest` cases plus CLI subprocess checks covering core palindrome behavior, case-insensitivity, punctuation handling, non-palindromes, empty strings, Unicode, and command-line integration.
 - Workspace git recorded a baseline commit, one accepted commit per completed plan step, and a final review commit.
 
 Observed Qwen complex workload result:
@@ -450,8 +450,8 @@ Observed Gemma comparison result:
 
 - Gemma4 was dramatically faster on these two runs, especially the simple CLI task.
 - It handled the simple CLI workload cleanly.
-- On browser work it needed more explicit environmental guidance and more feedback. In the latest rerun, it first produced partial website files, then a failing Playwright test; the reviewer forced the missing files and assertion fix before final acceptance.
-- On the existing-project repair run, configurable state filenames kept the fixture's own files separate from the harness plan/requirements documents.
+- On browser work it needed more explicit environmental guidance and more feedback. In the latest rerun, it first produced incomplete website/browser validation, then the reviewer forced concrete Playwright evidence and a dynamic-port validation script before final acceptance.
+- On the existing-project repair run, configurable state filenames kept the fixture's own files separate from the harness plan/requirements documents. Gemma also emitted some chat-template noise under pressure; the JSON extraction and repair path recovered, which is why the final result still resolved.
 - On the JSONL CLI run, the feedback loop did useful work: it caught broken generated code and missing validation evidence before accepting the project.
 - This is not a universal model ranking. It only says that in this harness and with these prompts, Qwen behaved more conservatively on complex coding, while Gemma was much faster and good enough when the tool environment was described tightly.
 
@@ -472,7 +472,7 @@ workspaces/gemma4-jsonl-stats/.agent_state/summary.json
 workspaces/gemma4-jsonl-stats/.agent_state/conversation.full.md
 ```
 
-`config.real-arithmetic.json` is also kept as a compact reusable benchmark config; its local workspace can be regenerated the same way if needed.
+`config.real-arithmetic.json` is also kept as a reusable benchmark config; its local workspace can be regenerated the same way if needed.
 
 ## Tests
 

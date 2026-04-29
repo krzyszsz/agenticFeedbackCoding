@@ -45,7 +45,7 @@
   },
   "project_design": {
     "title": "Real arithmetic package benchmark",
-    "prompt": "Build a tiny Python module called arithmetic_box.py with add, multiply, and mean functions, plus unittest coverage. Keep it very small. Maintain PLAN.md during the work. For any expected exception or error-path validation, use a wrapper assertion that exits 0 when the expected exception occurs, or use expected_returncode explicitly; never use a raw crashing command as successful validation."
+    "prompt": "Build a focused Python module called arithmetic_box.py with add, multiply, and mean functions, plus unittest coverage. Maintain PLAN.md during the work. For any expected exception or error-path validation, use a wrapper assertion that exits 0 when the expected exception occurs, or use expected_returncode explicitly; never use a raw crashing command as successful validation."
   },
   "phases": {
     "requirements_refinement": {

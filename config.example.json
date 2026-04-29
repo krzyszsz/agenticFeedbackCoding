@@ -48,7 +48,7 @@
   },
   "project_design": {
     "title": "Starter task tracker project",
-    "prompt": "Build a small Python command-line task tracker. It should support adding tasks, marking tasks done, listing tasks, and saving state as JSON. Keep the implementation small, testable, and documented. Maintain PLAN.md during the work."
+    "prompt": "Build a Python command-line task tracker. It should support adding tasks, marking tasks done, listing tasks, and saving state as JSON. Keep the implementation well structured, testable, and documented. Maintain PLAN.md during the work."
   },
   "phases": {
     "requirements_refinement": {

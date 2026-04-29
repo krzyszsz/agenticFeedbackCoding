@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -77,8 +79,20 @@ def _json_object_candidates(text: str) -> list[str]:
     return candidates
 
 
-def extract_json_object(text: str) -> dict:
+def _strip_common_model_wrappers(text: str) -> str:
+    """Remove chat-template debris without changing the model's JSON content."""
     stripped = text.strip()
+    stripped = re.sub(r"^\s*<\|channel\>[^<]*<channel\|>\s*", "", stripped)
+    stripped = re.sub(r"^\s*<\|[^>]+?\|>\s*", "", stripped)
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`")
+        if stripped.startswith("json"):
+            stripped = stripped[4:].strip()
+    return stripped
+
+
+def extract_json_object(text: str) -> dict:
+    stripped = _strip_common_model_wrappers(text)
     if stripped.startswith("```"):
         stripped = stripped.strip("`")
         if stripped.startswith("json"):
@@ -86,14 +100,34 @@ def extract_json_object(text: str) -> dict:
     # Qwen-family models often prepend reasoning even when asked for JSON.
     # We do not treat that as success, but the parser can still recover the
     # first complete object so the orchestration loop can keep moving.
+    parsed: list[dict] = []
     for candidate in _json_object_candidates(stripped):
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
+        for variant in (candidate, _repair_common_model_json_escapes(candidate)):
+            try:
+                value = json.loads(variant)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                parsed.append(value)
+                break
+    if parsed:
+        # Local models sometimes emit an initial JSON object, then say "wait"
+        # and emit the corrected object. The last parseable object is usually
+        # the one the model intended us to use.
+        return parsed[-1]
     raise ValueError(f"No JSON object found in model output: {text[:200]}")
+
+
+def _repair_common_model_json_escapes(candidate: str) -> str:
+    r"""Repair common invalid escapes in otherwise JSON-looking model output.
+
+    Qwen/Gemma-style local models sometimes write strings like `</div\>` while
+    discussing HTML. JSON only permits a small escape alphabet, so that one
+    character can make a useful review impossible to parse. Removing the stray
+    backslash preserves the model's intended text without accepting arbitrary
+    non-JSON syntax.
+    """
+    return re.sub(r'\\([^"\\/bfnrtu])', r"\1", candidate)
 
 
 def _safe_relpath(path_text: str) -> Path:
@@ -121,7 +155,7 @@ def write_files(workspace: Path, files: list[dict]) -> list[str]:
 
 
 def _command_parts_and_timeout(
-    command: list[Any] | dict[str, Any],
+    command: list[Any] | str | dict[str, Any],
     default_timeout_seconds: int,
     max_timeout_seconds: int,
 ) -> tuple[list[str], int, int]:
@@ -130,7 +164,9 @@ def _command_parts_and_timeout(
     Most commands are simple argv lists. For long-running tools, a model may use
     {"cmd": [...], "timeout_seconds": 7200}; for expected negative-path tests,
     it may also use {"cmd": [...], "expected_returncode": 2}. The harness clamps
-    timeouts so a typo cannot create an accidental infinite process.
+    timeouts so a typo cannot create an accidental infinite process. If a local
+    model returns a plain string despite the schema, split it as a shell-like
+    command but still execute it without a shell.
     """
     if isinstance(command, dict):
         parts = command.get("cmd") or command.get("command") or []
@@ -140,6 +176,8 @@ def _command_parts_and_timeout(
         parts = command
         requested_timeout = default_timeout_seconds
         expected_returncode = 0
+    if isinstance(parts, str):
+        parts = shlex.split(parts)
     timeout = max(1, min(requested_timeout, max_timeout_seconds))
     return [str(part) for part in parts], timeout, expected_returncode
 

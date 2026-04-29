@@ -45,7 +45,7 @@
   },
   "project_design": {
     "title": "Real browser platformer benchmark",
-    "prompt": "Build a small browser platformer game with a 2D character, keyboard controls, externally stored level data, at least one scripted enemy or NPC, and a savepoint. Include Playwright validation that opens the page, presses controls, captures a screenshot, and writes a JSON report proving the game responds. Maintain PLAN.md during the work. Keep each implementation step independently verifiable."
+    "prompt": "Build a browser platformer game with a 2D character, keyboard controls, externally stored level data, at least one scripted enemy or NPC, and a savepoint. Include Playwright validation that opens the page, presses controls, captures a screenshot, and writes a JSON report proving the game responds. Maintain PLAN.md during the work. Keep each implementation step independently verifiable."
   },
   "phases": {
     "requirements_refinement": {
