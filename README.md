@@ -53,6 +53,7 @@ flowchart LR
 Clone the repo, start the local model server, then run a real benchmark through Docker:
 
 ```bash
+# Ubuntu first-time setup: after `cd agenticFeedbackCoding`, run `bash scripts/bootstrap_ubuntu.sh` for Docker/Python dependencies (curl gnupg git jq python3 docker and others) if needed.
 git clone https://github.com/krzyszsz/agenticFeedbackCoding.git
 cd agenticFeedbackCoding
 MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
