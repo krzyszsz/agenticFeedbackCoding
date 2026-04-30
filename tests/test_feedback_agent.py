@@ -5,6 +5,7 @@ import functools
 import http.server
 import io
 import json
+import os
 from pathlib import Path
 import socketserver
 import subprocess
@@ -16,11 +17,18 @@ import urllib.error
 from typing import Any
 
 from feedback_agent.agent import FeedbackLoopAgent
-from feedback_agent.compaction import _clean_compaction_memory, _compaction_memory_is_too_weak
+from feedback_agent.compaction import (
+    _clean_compaction_memory,
+    _compaction_memory_is_too_weak,
+    deterministic_compact,
+    latest_control_state,
+    maybe_compact,
+)
 from feedback_agent.config import load_config
-from feedback_agent.conversation import Conversation
-from feedback_agent.llm import ModelRequestRetrier
-from feedback_agent.workspace import extract_json_object, run_commands, write_plan_doc
+from feedback_agent.conversation import Conversation, Turn
+from feedback_agent.git_tools import meaningful_changed_paths
+from feedback_agent.llm import ModelRequestHeartbeat, ModelRequestRetrier
+from feedback_agent.workspace import collect_workspace_files, extract_json_object, run_commands, write_plan_doc
 
 
 class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -182,6 +190,71 @@ def base_requirements(summary: str = "Checked artifact") -> dict[str, Any]:
 
 
 class FeedbackLoopAgentTests(unittest.TestCase):
+    def test_workspace_collection_summarizes_binary_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "README.md").write_text("# Notes\n", encoding="utf-8")
+            (workspace / "screenshot.png").write_bytes(
+                b"\x89PNG\r\n\x1a\n" + bytes(range(32)) + b"\x00\x00IEND"
+            )
+
+            files = {item["path"]: item for item in collect_workspace_files(workspace)}
+
+            self.assertEqual(files["README.md"]["content"], "# Notes\n")
+            self.assertTrue(files["screenshot.png"]["binary"])
+            self.assertIn("binary artifact omitted", files["screenshot.png"]["content"])
+            self.assertNotIn("\x89PNG", files["screenshot.png"]["content"])
+
+    def test_workspace_collection_skips_dependency_install_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "README.md").write_text("# Project\n", encoding="utf-8")
+            sdk_dir = workspace / "$HOME" / ".dotnet" / "shared"
+            sdk_dir.mkdir(parents=True)
+            (sdk_dir / "System.Private.CoreLib.dll").write_bytes(b"\0" * 1024)
+            node_dir = workspace / "node_modules" / "package"
+            node_dir.mkdir(parents=True)
+            (node_dir / "index.js").write_text("console.log('skip me')\n", encoding="utf-8")
+
+            paths = {item["path"] for item in collect_workspace_files(workspace)}
+
+            self.assertEqual(paths, {"README.md"})
+
+    def test_git_meaningful_changes_ignore_dependency_install_dirs(self) -> None:
+        status = "\n".join([
+            "?? $HOME/",
+            "?? node_modules/",
+            "?? ARCHITECTURE.md",
+            " M PLAN.md",
+        ])
+
+        self.assertEqual(meaningful_changed_paths(status), ["ARCHITECTURE.md"])
+
+    def test_reviewer_prompt_keeps_small_docs_intact_and_skips_harness_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            readme = "# Demo\n" + ("a" * 1800) + "\npython -m http.server 8000\n" + ("b" * 1800)
+            evidence = {
+                "kind": "step_feedback_tools",
+                "workspace_files": [
+                    {"path": "PLAN.md", "content": "harness plan", "size": 12, "truncated": False},
+                    {"path": "README.md", "content": readme, "size": len(readme), "truncated": False},
+                ],
+                "validation_results": [],
+                "git": {},
+            }
+
+            compact = agent._compact_step_evidence_for_prompt(evidence)
+            files = {item["path"]: item for item in compact["workspace_files"]}
+
+            self.assertNotIn("PLAN.md", files)
+            self.assertIn("README.md", files)
+            self.assertFalse(files["README.md"]["prompt_truncated"])
+            self.assertIn("python -m http.server 8000", files["README.md"]["content"])
+
     def test_model_request_retrier_returns_without_retry_on_success(self) -> None:
         calls: list[int] = []
         output = io.StringIO()
@@ -212,6 +285,45 @@ class FeedbackLoopAgentTests(unittest.TestCase):
         self.assertEqual(sleeps, [30, 30])
         self.assertIn("attempt 1/3", output.getvalue())
         self.assertIn("1 attempts left", output.getvalue())
+
+    def test_model_request_heartbeat_reports_long_inflight_call(self) -> None:
+        output = io.StringIO()
+        heartbeat = ModelRequestHeartbeat(interval_seconds=0.05, stream=output, clock=time.monotonic)
+
+        result = heartbeat.run("test-model", lambda: time.sleep(0.12) or "ok")
+
+        self.assertEqual(result, "ok")
+        self.assertIn("still waiting for test-model", output.getvalue())
+
+    def test_latest_control_state_prefers_newer_feedback_over_stale_directive(self) -> None:
+        turns = [
+            Turn("user", "IMPLEMENTATION_AGENT_REQUEST:\nIMPLEMENT_PLAN_STEP_PHASE step_id=S6 attempt=2"),
+            Turn("assistant", "NEXT_IMPLEMENTATION_DIRECTIVE:\n{\"status\":\"needs_rework\",\"needs_rework\":true,\"summary\":\"old failure\"}"),
+            Turn("assistant", "FEEDBACK_AGENT_RESPONSE:\n{\"status\":\"resolved\",\"needs_rework\":false,\"summary\":\"new pass\"}"),
+        ]
+
+        state = latest_control_state(turns)
+
+        self.assertIn("step_id=S6 attempt=2", state)
+        self.assertIn("Last reviewer response: status=resolved, needs_rework=false", state)
+        self.assertNotIn("old failure", state)
+
+    def test_latest_control_state_final_review_overrides_implementation_request(self) -> None:
+        turns = [
+            Turn("user", "IMPLEMENTATION_AGENT_REQUEST:\nIMPLEMENT_PLAN_STEP_PHASE step_id=S6 attempt=2"),
+            Turn("user", "FEEDBACK_AGENT_REQUEST:\nFINAL_PROJECT_REVIEW_PHASE"),
+            Turn(
+                "assistant",
+                "FEEDBACK_AGENT_RESPONSE:\nSome prose first.\n```json\n"
+                "{\"status\":\"resolved\",\"needs_rework\":false,\"summary\":\"final pass\"}\n```",
+            ),
+        ]
+
+        state = latest_control_state(turns)
+
+        self.assertIn("Final project review: status=resolved, needs_rework=false", state)
+        self.assertIn("final pass", state)
+        self.assertNotIn("Current implementation request", state)
 
     def test_model_request_retrier_reports_exhaustion(self) -> None:
         output = io.StringIO()
@@ -284,6 +396,19 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(results[0]["returncode"], 0)
             self.assertIn("string command accepted", results[0]["stdout"])
 
+    def test_missing_command_becomes_failed_evidence_instead_of_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = run_commands(
+                root,
+                [["definitely-not-installed-local-tool-xyz", "--version"]],
+                timeout_seconds=30,
+                max_timeout_seconds=300,
+            )
+
+            self.assertEqual(results[0]["returncode"], 127)
+            self.assertIn("command not found", results[0]["stderr"])
+
     def test_command_output_is_bounded_at_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -351,6 +476,11 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
         self.assertEqual(cleaned, "Keep this decision.")
 
+    def test_compaction_memory_strips_unclosed_think_blocks(self) -> None:
+        cleaned = _clean_compaction_memory("<think>private reasoning without close")
+
+        self.assertIn("Compaction produced no usable memory", cleaned)
+
     def test_compaction_memory_strips_channel_wrappers(self) -> None:
         cleaned = _clean_compaction_memory("<|channel>thought<channel|>Keep this decision.")
 
@@ -365,6 +495,60 @@ class FeedbackLoopAgentTests(unittest.TestCase):
         self.assertTrue(_compaction_memory_is_too_weak("fallible_thought"))
         self.assertTrue(_compaction_memory_is_too_weak("ok"))
         self.assertFalse(_compaction_memory_is_too_weak("Requirement: keep the tested validation script and the accepted browser evidence."))
+
+    def test_compaction_rejects_raw_implementation_payload_memory(self) -> None:
+        raw_payload = json.dumps({
+            "plan_note": "S1 complete",
+            "files": [{"path": "README.md", "content": "x" * 2000}],
+            "commands": [["test", "-f", "README.md"]],
+            "test_evidence": ["README exists"],
+            "resolution_request": "none",
+        })
+
+        self.assertTrue(_compaction_memory_is_too_weak(raw_payload))
+
+    def test_deterministic_compaction_clips_long_lines(self) -> None:
+        compacted = deterministic_compact("short\n" + ("x" * 5000) + "\nend")
+
+        self.assertIn("truncated long compaction line", compacted)
+        self.assertLess(len(compacted), 3000)
+
+    def test_compaction_preserves_authoritative_rework_directive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "work"
+            workspace.mkdir()
+            cfg_path = write_config(root, workspace, "compact directive", "Build anything.")
+            config = load_config(cfg_path)
+            conversation = Conversation(root / "conversation.jsonl")
+            conversation.append("system", "durable system prompt")
+            conversation.append("user", "PROJECT DESIGN: build a platformer")
+            conversation.append(
+                "user",
+                'NEXT_IMPLEMENTATION_DIRECTIVE:\n{"status":"needs_rework","needs_rework":true,'
+                '"summary":"S1 still references missing files; fix those references."}',
+            )
+            conversation.append(
+                "user",
+                "IMPLEMENTATION_AGENT_REQUEST:\nIMPLEMENT_PLAN_STEP_PHASE step_id=S1 attempt=3\nRetry the step.",
+            )
+            bad_compactor = ScriptedClient(["S1 is complete. All validation passed."])
+
+            maybe_compact(
+                conversation,
+                config,
+                bad_compactor,
+                context_window=100,
+                incoming_tokens=1000,
+                force=True,
+            )
+
+            active_text = (root / "conversation.jsonl").read_text(encoding="utf-8")
+            self.assertIn("AUTHORITATIVE_RECENT_CONTROL_STATE", active_text)
+            self.assertIn("status=needs_rework", active_text)
+            self.assertIn("needs_rework=true", active_text)
+            self.assertIn("step_id=S1 attempt=3", active_text)
+            self.assertIn("overrides any older compacted prose", active_text)
 
     def test_live_echo_can_be_bounded_without_truncating_saved_transcripts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -389,6 +573,36 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             cfg = load_config(cfg_path)
 
             self.assertEqual(cfg.runtime.workspace, workspace.resolve())
+
+    def test_load_config_can_override_model_base_urls_from_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            config_path = write_config(root, workspace, "docker network", "Build anything.")
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            data["feedback_model"] = dict(data["implementation_model"])
+            data["feedback_model"]["base_url"] = "http://127.0.0.1:2/v1"
+            config_path.write_text(json.dumps(data), encoding="utf-8")
+
+            previous_impl = os.environ.get("AGENT_IMPLEMENTATION_BASE_URL")
+            previous_feedback = os.environ.get("AGENT_FEEDBACK_BASE_URL")
+            try:
+                os.environ["AGENT_IMPLEMENTATION_BASE_URL"] = "http://agentic-qwen36-server:8161/v1"
+                os.environ["AGENT_FEEDBACK_BASE_URL"] = "http://agentic-reviewer:9000/v1/"
+
+                cfg = load_config(config_path, repo_root=root)
+            finally:
+                if previous_impl is None:
+                    os.environ.pop("AGENT_IMPLEMENTATION_BASE_URL", None)
+                else:
+                    os.environ["AGENT_IMPLEMENTATION_BASE_URL"] = previous_impl
+                if previous_feedback is None:
+                    os.environ.pop("AGENT_FEEDBACK_BASE_URL", None)
+                else:
+                    os.environ["AGENT_FEEDBACK_BASE_URL"] = previous_feedback
+
+            self.assertEqual(cfg.implementation_model.base_url, "http://agentic-qwen36-server:8161/v1")
+            self.assertEqual(cfg.feedback_model.base_url, "http://agentic-reviewer:9000/v1")
 
     def test_existing_project_can_use_agent_owned_state_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -565,6 +779,241 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             findings = agent._plan_structural_findings()
 
             self.assertNotIn("at most 1", "\n".join(findings))
+
+    def test_plan_refinement_preserves_active_step_validation_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            active_step = {
+                "id": "S1",
+                "title": "Fix validation command",
+                "description": "Original step with stale validation.",
+                "depends_on": [],
+                "acceptance_criteria": ["validation command is current"],
+                "validation_commands": [["python", "-c", "raise SystemExit(1)"]],
+                "status": "pending",
+            }
+            agent.plan_steps = [
+                active_step,
+                {
+                    "id": "S2",
+                    "title": "Future step",
+                    "description": "Keep future work ordered.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["future validation"],
+                    "validation_commands": [["python", "-c", "print('future')"]],
+                    "status": "pending",
+                },
+            ]
+
+            refined = [
+                {
+                    **active_step,
+                    "validation_commands": [["python", "-c", "print('fresh reviewer evidence')"]],
+                },
+                agent.plan_steps[1],
+            ]
+
+            agent.plan_steps = agent._merge_refined_plan_steps(agent.plan_steps, refined)
+
+            self.assertIs(agent.plan_steps[0], active_step)
+            self.assertIs(agent._next_pending_step(), active_step)
+            self.assertEqual(
+                active_step["validation_commands"],
+                [["python", "-c", "print('fresh reviewer evidence')"]],
+            )
+
+    def test_research_structure_skeleton_step_satisfies_quality_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, title="platformer", prompt="Build a browser platformer.")
+            agent.initialize()
+            agent.requirements = base_requirements("Platformer")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Research, project structure, and skeleton creation",
+                    "description": (
+                        "Research HTML5 Canvas game patterns from available knowledge, document notes, "
+                        "and create the initial project skeleton."
+                    ),
+                    "depends_on": [],
+                    "acceptance_criteria": [
+                        "README.md exists with project description, structure overview, and research notes.",
+                        "The project structure is documented and follows a clean separation of concerns.",
+                    ],
+                    "validation_commands": [["python", "validate_s1.py"]],
+                    "status": "pending",
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("First plan step", "\n".join(findings))
+
+    def test_plan_validation_rejects_harness_state_file_as_project_deliverable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, title="platformer", prompt="Build a browser platformer.")
+            agent.initialize()
+            agent.requirements = base_requirements("Platformer")
+            agent.plan_steps = [
+                {
+                    "id": "S1a",
+                    "title": "Research and architecture notes",
+                    "description": "Create RESEARCH.md with platformer architecture notes and level schema.",
+                    "depends_on": [],
+                    "acceptance_criteria": [
+                        "RESEARCH.md exists with Canvas, physics, and Playwright notes.",
+                        "RESEARCH.md defines the level data schema.",
+                    ],
+                    "validation_commands": [["python", "tests/validate_research_md.py"]],
+                    "status": "pending",
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertIn("harness-owned state file RESEARCH.md", "\n".join(findings))
+            self.assertIn("PROJECT_RESEARCH.md", "\n".join(findings))
+
+    def test_implementation_payload_cannot_overwrite_harness_state_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            payload = {
+                "plan_note": "created project README without touching harness state",
+                "files": [
+                    {"path": "PLAN.md", "content": "model-owned plan should not replace harness state"},
+                    {"path": "REQUIREMENTS.md", "content": "model-owned requirements should not replace harness state"},
+                    {"path": "README.md", "content": "# Project README\n"},
+                ],
+                "commands": [["test", "-f", "README.md"]],
+                "test_evidence": ["README exists"],
+                "resolution_request": "none",
+            }
+            impl = ScriptedClient([json.dumps(payload)])
+            agent = FeedbackLoopAgent(
+                load_config(write_config(root, workspace, "state guard", "Build a tiny project."), repo_root=root),
+                implementation_client=impl,
+                feedback_client=ScriptedClient(),
+            )
+            agent.initialize()
+            agent._requirements_path().write_text("# Original requirements\n", encoding="utf-8")
+            original_plan = agent._plan_path().read_text(encoding="utf-8")
+            original_requirements = agent._requirements_path().read_text(encoding="utf-8")
+
+            result = agent._implementation_pass(
+                {
+                    "id": "S1",
+                    "title": "Create README",
+                    "description": "Create project README.",
+                    "acceptance_criteria": ["README exists"],
+                    "validation_commands": [["test", "-f", "README.md"]],
+                },
+                1,
+            )
+
+            self.assertEqual((workspace / "README.md").read_text(encoding="utf-8"), "# Project README\n")
+            self.assertEqual(agent._plan_path().read_text(encoding="utf-8"), original_plan + "\n- [S1 attempt 1] created project README without touching harness state\n")
+            self.assertEqual(agent._requirements_path().read_text(encoding="utf-8"), original_requirements)
+            self.assertEqual(result["skipped_harness_files"], ["PLAN.md", "REQUIREMENTS.md"])
+            findings = agent._evidence_findings(
+                {"id": "S1", "validation_commands": [["test", "-f", "README.md"]]},
+                result,
+                {"validation_results": result["commands"], "git": {"meaningful_changed_paths": ["README.md"]}},
+            )
+            self.assertIn("harness-owned state files", "\n".join(findings))
+
+    def test_implementation_prompt_tells_model_how_to_create_empty_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            implementation = ScriptedClient([
+                json.dumps({
+                    "plan_note": "No-op prompt inspection.",
+                    "files": [],
+                    "commands": [],
+                    "test_evidence": [],
+                    "resolution_request": "none",
+                })
+            ])
+            agent = FeedbackLoopAgent(
+                load_config(write_config(root, workspace, "directory scaffold", "Create empty directories."), repo_root=root),
+                implementation_client=implementation,
+                feedback_client=ScriptedClient(),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Directory scaffold")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create empty directories",
+                    "description": "Create game/js and tests directories.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["game/js exists", "tests exists"],
+                    "validation_commands": [["test", "-d", "game/js"], ["test", "-d", "tests"]],
+                    "status": "pending",
+                }
+            ]
+
+            agent._implementation_pass(agent.plan_steps[0], 1)
+
+            prompt = "\n".join(message["content"] for message in implementation.calls[0]["messages"])
+            self.assertIn("files` payload creates files, not empty directories", prompt)
+            self.assertIn(".gitkeep", prompt)
+            self.assertIn("game/js/.gitkeep", prompt)
+
+    def test_step_reference_check_ignores_harness_docs_and_planned_future_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, title="platformer", prompt="Build a browser platformer.")
+            agent.initialize()
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Structure",
+                    "description": "Create README.md and directories.",
+                    "acceptance_criteria": ["README exists"],
+                    "validation_commands": [["test", "-f", "README.md"]],
+                },
+                {
+                    "id": "S2",
+                    "title": "Validation suite",
+                    "description": "Create tests/run_validation.py and game/index.html.",
+                    "acceptance_criteria": ["tests/run_validation.py exists"],
+                    "validation_commands": [["python", "tests/run_validation.py"]],
+                },
+            ]
+            evidence = {
+                "workspace_files": [
+                    {"path": "PLAN.md", "content": "Future step will create game/index.html and tests/run_validation.py."},
+                    {
+                        "path": "README.md",
+                        "content": (
+                            "Run later with http://localhost:8080/game/index.html and "
+                            "python tests/run_validation.py once S2 is implemented. "
+                            "Installation notes may mention https://dot.net/v1/dotnet-install.sh "
+                            "and $HOME/.dotnet without creating local artifact references."
+                        ),
+                    },
+                ],
+            }
+
+            step_findings = agent._workspace_reference_findings(evidence, allow_planned_future_refs=True)
+            final_findings = agent._workspace_reference_findings(evidence, allow_planned_future_refs=False)
+
+            self.assertEqual(step_findings, [])
+            self.assertIn("tests/run_validation.py", "\n".join(final_findings))
+            self.assertNotIn("PLAN.md references", "\n".join(final_findings))
+            self.assertNotIn("8080/game/index.html", "\n".join(final_findings))
+            self.assertNotIn("dot.net/v1", "\n".join(final_findings))
+            self.assertNotIn("HOME/.dotnet", "\n".join(final_findings))
 
     def test_feedback_review_runs_reviewer_owned_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -765,6 +1214,55 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
             self.assertNotIn("expected failure path", "\n".join(findings))
 
+    def test_final_review_skips_accepted_transient_expected_failure_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            step = {
+                "id": "S2",
+                "title": "Fix syntax and import errors",
+                "description": "Tests can run but may still fail on logic assertions until a later step.",
+                "depends_on": [],
+                "acceptance_criteria": [
+                    "Syntax errors are fixed.",
+                    "The suite may still fail due to the known logic error.",
+                ],
+                "validation_commands": [
+                    ["python", "-m", "compileall", "."],
+                    {"cmd": ["python", "-m", "unittest", "discover", "-v"], "expected_returncode": 1},
+                ],
+                "status": "resolved",
+            }
+            agent.plan_steps = [step]
+            step_results = [{
+                "step_id": "S2",
+                "status": "resolved",
+                "attempts": [{
+                    "review": {"status": "resolved"},
+                    "implementation": {
+                        "commands": [
+                            {
+                                "command": ["python", "-m", "unittest", "discover", "-v"],
+                                "returncode": 1,
+                                "expected_returncode": 1,
+                                "returncode_matches_expected": True,
+                                "timed_out": False,
+                            }
+                        ],
+                    },
+                }],
+            }]
+
+            evidence = agent._final_feedback_tool_evidence(step_results)
+            validation = evidence["step_validations"][0]
+
+            self.assertEqual(validation["accepted_validation_commands_run"], [])
+            skipped = json.dumps(validation["accepted_validation_commands_skipped"])
+            self.assertIn("intermediate expected failure", skipped)
+            self.assertIn("unittest", json.dumps(validation["final_validation_commands_skipped"]))
+
     def test_error_identification_step_allows_observed_failing_tests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -828,6 +1326,164 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             findings = agent._validation_command_findings(step)
 
             self.assertIn("malformed Python flag", "\n".join(findings))
+
+    def test_plan_validation_rejects_py_compile_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S2",
+                "title": "Validate syntax",
+                "description": "Check package syntax before logic fixes.",
+                "depends_on": [],
+                "acceptance_criteria": ["All package files compile."],
+                "validation_commands": [["python", "-m", "py_compile", "."]],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertIn("py_compile", "\n".join(findings))
+            self.assertIn("directory", "\n".join(findings))
+
+    def test_plan_validation_rejects_one_line_try_except_python_c(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S5",
+                "title": "Validate error handling",
+                "description": "Check that mean raises ValueError for empty input.",
+                "depends_on": [],
+                "acceptance_criteria": ["Error handling is validated."],
+                "validation_commands": [[
+                    "python",
+                    "-c",
+                    "raised = False; try: mean([]); except ValueError: raised = True; assert raised",
+                ]],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertIn("try/except", "\n".join(findings))
+            self.assertIn("validation script", "\n".join(findings))
+
+    def test_partial_failure_step_allows_compileall_success_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S2",
+                "title": "Fix syntax and import errors",
+                "description": "Fix syntax while remaining failures are logic-related.",
+                "depends_on": [],
+                "acceptance_criteria": [
+                    "All syntax and import errors are resolved.",
+                    "Remaining failures are logic-related, not syntax/import-related.",
+                ],
+                "validation_commands": [
+                    {"cmd": ["python", "-m", "compileall", "."], "expected_returncode": 0},
+                    {"cmd": ["python", "-m", "unittest", "discover", "-v"], "expected_returncode": 1},
+                ],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertEqual(findings, [])
+
+    def test_plan_validation_rejects_node_playwright_assumption_in_default_container(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.requirements = base_requirements("Browser validation")
+            agent.requirements["assumptions"].append("Playwright will be installed via npm and used with its Node.js API.")
+            agent.plan_steps = [{
+                "id": "S1",
+                "title": "Browser validation",
+                "description": "Create a Playwright validation script.",
+                "depends_on": [],
+                "acceptance_criteria": [
+                    "No external dependencies are required beyond Node.js and Playwright.",
+                    "The browser validation produces a screenshot and JSON report.",
+                ],
+                "validation_commands": [["python", "validation/validate.py"]],
+                "status": "pending",
+            }]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertTrue(any("Python Playwright" in item and "Node/npm" in item for item in findings))
+
+    def test_environment_guard_allows_explicit_no_node_npm_npx_wording(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.requirements = base_requirements("Browser validation")
+            agent.requirements["assumptions"].append(
+                "All validation uses Python Playwright sync API with no Node.js/npm/npx tooling."
+            )
+            agent.plan_steps = [{
+                "id": "S1",
+                "title": "Browser validation",
+                "description": "Create a Python Playwright validation script without Node/npm/npx.",
+                "depends_on": [],
+                "acceptance_criteria": [
+                    "No Node.js, npm, npx, or @playwright/test dependencies are used.",
+                    "The browser validation produces a screenshot and JSON report.",
+                ],
+                "validation_commands": [["python", "validation/validate.py"]],
+                "status": "pending",
+            }]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertFalse(any("Node/npm" in item for item in findings))
+
+    def test_environment_guard_allows_explicit_dependency_setup_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                title="Node browser validation",
+                prompt="Build a Node.js browser test project and install required npm dependencies inside Docker.",
+            )
+            agent.requirements = base_requirements("Node browser validation")
+            agent.requirements["assumptions"].append(
+                "The plan includes a bounded dependency setup step because Node/npm are not assumed to exist."
+            )
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Dependency setup",
+                    "description": "Install Node.js/npm dependencies inside the Docker agent container.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["npm install completes and writes dependency evidence."],
+                    "validation_commands": [["test", "-f", "package.json"]],
+                    "status": "pending",
+                },
+                {
+                    "id": "S2",
+                    "title": "Node validation",
+                    "description": "Run the requested Node.js validation stack.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["npx playwright test writes a report."],
+                    "validation_commands": [["npm", "test"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertFalse(any("default agent Docker image provides" in item for item in findings))
 
     def test_feedback_review_rejects_expected_failure_from_malformed_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -966,6 +1622,36 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
             self.assertEqual(review["status"], "needs_plan_change")
             self.assertIn("Plan validation command appears malformed", "\n".join(review["required_changes"]))
+
+    def test_feedback_review_routes_py_compile_directory_to_plan_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Syntax validation")
+            step = {
+                "id": "T1",
+                "title": "Validate syntax",
+                "description": "Validate package syntax.",
+                "depends_on": [],
+                "acceptance_criteria": ["all files compile"],
+                "validation_commands": [["python", "-m", "py_compile", "."]],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            (workspace / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+            review = agent._step_review_pass(
+                step,
+                1,
+                {"written": ["module.py"], "commands": [], "raw": {"test_evidence": []}},
+                "hard_pushback",
+            )
+
+            self.assertEqual(review["status"], "needs_plan_change")
+            self.assertIn("py_compile", "\n".join(review["required_changes"]))
 
     def test_final_review_rejects_broken_local_doc_reference(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

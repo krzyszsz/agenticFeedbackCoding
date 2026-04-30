@@ -48,14 +48,41 @@ def run_bounded_process(
     byte_counts = {"stdout": 0, "stderr": 0}
     timed_out = False
 
-    proc = subprocess.Popen(
-        command,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        return {
+            "command": command,
+            "returncode": 127,
+            "stdout": "",
+            "stderr": f"command not found: {exc.filename or command[0]}",
+            "timed_out": False,
+            "timeout_seconds": timeout_seconds,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+        }
+    except PermissionError as exc:
+        return {
+            "command": command,
+            "returncode": 126,
+            "stdout": "",
+            "stderr": f"command not executable: {exc.filename or command[0]}",
+            "timed_out": False,
+            "timeout_seconds": timeout_seconds,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+        }
     selector = selectors.DefaultSelector()
     assert proc.stdout is not None
     assert proc.stderr is not None

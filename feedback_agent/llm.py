@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -66,6 +67,45 @@ class ModelRequestRetrier:
         )
 
 
+class ModelRequestHeartbeat:
+    """Print coarse progress while one model request is still in flight."""
+
+    def __init__(
+        self,
+        *,
+        interval_seconds: float,
+        stream: TextIO = sys.stderr,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.interval_seconds = max(0, interval_seconds)
+        self.stream = stream
+        self.clock = clock
+
+    def run(self, label: str, operation: Callable[[], str]) -> str:
+        if self.interval_seconds <= 0:
+            return operation()
+
+        stop = threading.Event()
+        start = self.clock()
+
+        def emit_progress() -> None:
+            while not stop.wait(self.interval_seconds):
+                elapsed = int(self.clock() - start)
+                print(
+                    f"[model-call] still waiting for {label}: {elapsed}s elapsed.",
+                    file=self.stream,
+                    flush=True,
+                )
+
+        thread = threading.Thread(target=emit_progress, daemon=True)
+        thread.start()
+        try:
+            return operation()
+        finally:
+            stop.set()
+            thread.join(timeout=0.2)
+
+
 class OpenAICompatClient:
     def __init__(self, cfg: ModelConfig):
         self.cfg = cfg
@@ -97,7 +137,12 @@ class OpenAICompatClient:
             msg = body["choices"][0]["message"]
             return str(msg.get("content") or msg.get("reasoning_content") or "")
 
+        def send_with_heartbeat() -> str:
+            return ModelRequestHeartbeat(
+                interval_seconds=self.cfg.request_heartbeat_seconds,
+            ).run(self.cfg.name, send_once)
+
         return ModelRequestRetrier(
             attempts=self.cfg.retry_attempts,
             sleep_seconds=self.cfg.retry_sleep_seconds,
-        ).run(send_once)
+        ).run(send_with_heartbeat)

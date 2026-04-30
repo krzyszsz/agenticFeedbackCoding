@@ -16,13 +16,13 @@
   "mcp_tools": {
     "terminal": true,
     "web_scraping": false,
-    "web_interaction": true
+    "web_interaction": false
   },
   "runtime": {
     "docker_isolation": true,
     "docker_image": "agentic-feedback-coding:local",
     "docker_user": "host",
-    "workspace": "workspaces/real-platformer",
+    "workspace": "workspaces/real-jsonl-stats",
     "command_timeout_seconds": 120,
     "print_transcript": true,
     "live_turn_max_chars": 0,
@@ -45,8 +45,8 @@
     "max_iterations": 3
   },
   "project_design": {
-    "title": "Real browser platformer benchmark",
-    "prompt": "Build a browser platformer game with a 2D character, keyboard controls, externally stored level data, at least one scripted enemy or NPC, and a savepoint. Include Playwright validation that opens the page, presses controls, captures a screenshot, and writes a JSON report proving the game responds. Maintain PLAN.md during the work. Keep each implementation step independently verifiable."
+    "title": "Real JSONL stats CLI benchmark",
+    "prompt": "Build a Python command line project from scratch. The tool should read a JSONL file containing objects with a numeric field named value, then print count, sum, min, max, and average. It must handle blank lines, invalid JSON, missing value fields, and non-numeric values with clear errors. Include a reusable module, CLI entry point, unittest tests, sample data, README documentation, and a design notes file. Maintain PLAN.md during the work. Choose independently verifiable steps that make the implementation and review clear."
   },
   "phases": {
     "requirements_refinement": {

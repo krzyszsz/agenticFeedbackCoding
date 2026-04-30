@@ -2,9 +2,51 @@
 
 `agenticFeedbackCoding` runs a Docker-isolated local AI coding workflow: edit one JSON prompt, start an OpenAI-compatible model server, and let one agent implement while a second agent reviews every step with tests, git diffs, command output, file evidence, and screenshots/reports when available.
 
-The main tested setup uses `Qwen3.6-27B Q4_K_M` GGUF served by llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395 / Strix Halo. A second comparison run used `Gemma4-26B-A4B Q4_K_M` through the same endpoint shape. Other OpenAI-compatible local or remote models can be configured, but the evidence in this README comes from those local GGUF runs. Normal work runs inside Docker for safety: only the generated project workspace is mounted out to the host, while the model server stays outside the agent container.
+The main tested setup uses `Qwen3.6-27B Q4_K_M` GGUF served by llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395 / Strix Halo. A second comparison run used `Gemma4-26B-A4B Q4_K_M` through the same endpoint shape. Other OpenAI-compatible local or remote models can be configured, but the evidence in this README comes from those local GGUF runs. Normal work uses two Docker containers for safety and reproducibility: one model-server container and one agent container on a shared Docker network. Only the generated project workspace is mounted out to the host.
 
 The project is intentionally config-driven. One JSON file defines the model endpoint, workspace, review strictness, allowed tools, web/offline mode, context-safety limits, and the project prompt.
+
+## Architecture
+
+The normal local setup keeps model serving and agent execution in separate
+containers. The CLI script starts the workflow from one JSON config, the agent
+container talks to the model container through an OpenAI-compatible REST API,
+and only the generated workspace is mounted back to the host.
+
+```mermaid
+flowchart LR
+    User["User terminal"]
+    Config["config.*.json<br/>project prompt + knobs"]
+    CLI["scripts/build_and_run.sh<br/>scripts/run_agent.sh"]
+
+    subgraph Host["Host filesystem"]
+        Workspace["Mounted output workspace<br/>workspaces/my-project"]
+    end
+
+    subgraph Net["Docker network: agentic-feedback-net"]
+        subgraph ModelContainer["Model server container"]
+            Model["GGUF model<br/>Qwen3.6 / Gemma4"]
+            API["llama.cpp server<br/>OpenAI-compatible REST API<br/>:8161/v1"]
+            Model --> API
+        end
+
+        subgraph AgentContainer["Agent container"]
+            Impl["Implementation agent"]
+            Review["Feedback/review agent"]
+            Tools["Tools<br/>terminal, git, Python Playwright,<br/>optional web research"]
+            Impl <--> Review
+            Impl --> Tools
+            Review --> Tools
+        end
+    end
+
+    User --> Config
+    Config --> CLI
+    CLI --> AgentContainer
+    CLI -. starts .-> ModelContainer
+    AgentContainer <-->|REST API| API
+    AgentContainer -->|writes files, transcripts, evidence| Workspace
+```
 
 ## Quick Start
 
@@ -17,7 +59,7 @@ MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
 bash scripts/build_and_run.sh --config config.real-palindrome.json
 ```
 
-That run builds the agent container, mounts only the configured workspace, asks the local model to build the project, and stores the full transcript plus review evidence under `workspaces/real-palindrome/.agent_state/`.
+That run starts the model server on the `agentic-feedback-net` Docker network, builds the agent container, mounts only the configured workspace, asks the local model to build the project, and stores the full transcript plus review evidence under `workspaces/real-palindrome/.agent_state/`.
 
 The live transcript is printed while the run is active, so a long job should visibly move through requirements, plan review, implementation attempts, and feedback. The final terminal output is compact by default; the full evidence is written under `.agent_state/`.
 
@@ -41,7 +83,8 @@ The important fields are usually enough:
     "temperature": 0.25,
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
-    "retry_sleep_seconds": 30
+    "retry_sleep_seconds": 30,
+    "request_heartbeat_seconds": 60
   },
   "feedback_model": null,
   "mcp_tools": {
@@ -91,11 +134,16 @@ That request is clamped by `runtime.max_command_timeout_seconds`. Model calls us
 
 Normal agentic work runs inside Docker. `scripts/run_agent.sh` refuses to run the workflow directly on the host unless `ALLOW_HOST_AGENT_RUN=1` is explicitly set for harness development.
 
-The container gets one writable mount: the configured `runtime.workspace`, mapped to `/workspace/project`. The config file is mounted read-only. The Docker socket is not mounted. Host networking is used only so the agent container can reach a local OpenAI-compatible model server such as `127.0.0.1:8161`.
+The standard setup uses two containers on one Docker network:
+
+- `scripts/start_default_model_server.sh` creates/uses `agentic-feedback-net`, starts the llama.cpp/Vulkan server as `agentic-qwen36-server`, and publishes `127.0.0.1:8161` for host-side checks.
+- `scripts/run_agent.sh` starts the agent container on the same network and overrides the in-container model URL to `http://agentic-qwen36-server:8161/v1`.
+
+The agent container gets one writable mount: the configured `runtime.workspace`, mapped to `/workspace/project`. The config file is mounted read-only. The Docker socket is not mounted. Host networking is no longer required for the normal two-container path; keep it only as an explicit compatibility mode with `DOCKER_NETWORK=host AGENT_DOCKER_NETWORK=host`.
 
 The agent container includes Python, Python Playwright with a preinstalled Chromium browser, system Chromium, `pytest`, `curl`, `git`, `jq`, `requests`, and `beautifulsoup4`, so generated projects can run tests, browser checks, and scraping-style tasks without installing those tools into the host project folder.
 
-Browser validation is intentionally Python-first. The container does not include Node, npm, npx, or `@playwright/test` by default, so prompts and generated validation scripts should use `from playwright.sync_api import sync_playwright` unless you deliberately extend the Dockerfile.
+Browser validation is intentionally Python-first by default. The container does not include Node, npm, npx, or `@playwright/test`, so generic browser/UI validation should use `from playwright.sync_api import sync_playwright`. That is a weak preference, not a technology lock: if a task explicitly requires another SDK/runtime, make dependency discovery and container-local installation an explicit plan step, usually with `runtime.docker_user=root`, bounded timeouts, and clear evidence of what was installed.
 
 `runtime.docker_user` defaults to `host`, so generated files are owned by the host user. Set it to `root` only for tasks that intentionally need package-manager access inside the disposable agent container, for example a workflow that checks disk space, installs a small diagnostic tool with `apt-get`, runs it, and writes a report into the mounted workspace. That still does not grant access to the host filesystem outside the configured workspace.
 
@@ -152,6 +200,9 @@ MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
 
 By default this starts llama.cpp with `CTX_SIZE=76800`, `PARALLEL=1`,
 `MEM_LIMIT=75g`, `MEMORY_SWAP=75g`, `GPU_LAYERS=999`, and port `8161`.
+It also creates/uses the `agentic-feedback-net` Docker network, names the
+server container `agentic-qwen36-server`, and publishes the API on the host at
+`127.0.0.1:8161` for quick checks.
 `PARALLEL=1` keeps one server slot instead of multiplying the long context
 across several idle slots. Override these values in the shell if you need a
 smaller context, more concurrent slots, or CPU fallback.
@@ -161,11 +212,31 @@ The agent runner similarly reuses `agentic-feedback-coding:local` after the
 first build; set `REBUILD_AGENT_IMAGE=1` after changing the harness Dockerfile
 or Python code copied into that image.
 
-The default configs expect:
+The checked-in configs keep a host-friendly endpoint:
 
 ```text
 http://127.0.0.1:8161/v1
 ```
+
+When the agent itself runs in Docker, `scripts/run_agent.sh` automatically
+overrides that URL inside the container to:
+
+```text
+http://agentic-qwen36-server:8161/v1
+```
+
+Useful networking overrides:
+
+```bash
+DOCKER_NETWORK=agentic-feedback-net          # model-server container network
+AGENT_DOCKER_NETWORK=agentic-feedback-net    # agent container network
+MODEL_SERVER_CONTAINER=agentic-qwen36-server # DNS name used inside the network
+MODEL_SERVER_PORT=8161
+AGENT_IMPLEMENTATION_BASE_URL=http://my-model:9000/v1
+```
+
+Use `DOCKER_NETWORK=host AGENT_DOCKER_NETWORK=host` only if you deliberately
+want the older host-network behavior.
 
 ## AMD And Driver Notes
 
@@ -225,7 +296,7 @@ The checked example seeds a small invoice calculator with a syntax error and a l
 
 ```bash
 bash scripts/seed_existing_bugfix_fixture.sh
-bash scripts/build_and_run.sh --config config.gemma4-existing-bugfix.json
+bash scripts/build_and_run.sh --config config.real-existing-bugfix.json
 ```
 
 In the verified run, the reviewer first pushed back on vague investigation evidence, then caught that the implementation had fixed only the syntax error while leaving the tax calculation bug. The accepted result fixed both issues, preserved the public API, added `BUGFIX_NOTES.md`, and passed `python -m unittest discover -v`.
@@ -317,7 +388,7 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 | Field | Purpose | Typical values |
 |---|---|---|
 | `implementation_model.name` | Human-readable model profile name. | `qwen3.6-27b-q4km` |
-| `implementation_model.base_url` | OpenAI-compatible endpoint used by the implementation agent. | `http://127.0.0.1:8161/v1` |
+| `implementation_model.base_url` | OpenAI-compatible endpoint used by the implementation agent. The Docker runner can override it with `AGENT_IMPLEMENTATION_BASE_URL`, which is how the agent container reaches the model-server container by DNS. | `http://127.0.0.1:8161/v1` |
 | `implementation_model.model` | Model id sent to the endpoint. llama.cpp accepts `local-gguf`. | `local-gguf` |
 | `implementation_model.context_window` | Context budget used by compaction logic. The default server script starts llama.cpp with `CTX_SIZE=76800`. | `76800` |
 | `implementation_model.max_tokens` | Max response length per model call. This is an upper bound, not a target; prompts ask for structured JSON, not artificially short answers. | `32768` |
@@ -325,6 +396,7 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 | `implementation_model.request_timeout_seconds` | HTTP timeout for one model response. This is separate from terminal command timeouts. | `21600` |
 | `implementation_model.retry_attempts` | Model HTTP retry budget for temporary server/network failures. Retry progress is printed to stderr. | `20` |
 | `implementation_model.retry_sleep_seconds` | Delay between model HTTP retries. Use `0` only for tests. | `30` |
+| `implementation_model.request_heartbeat_seconds` | Prints a coarse “still waiting” line while a model response is in flight. Set `0` to disable it. | `60` |
 | `feedback_model` | Optional separate reviewer model. `null` reuses the implementation model. | `null` or another model block |
 | `mcp_tools.terminal` | Allows command execution for implementation and reviewer validation. | `true` |
 | `mcp_tools.web_scraping` | Allows web research/scraping when a task asks for it. | `true` or `false` |
@@ -367,15 +439,17 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 
 ## Real Example Configs
 
-These configs are intended to run against a real local model endpoint. `config.real-palindrome.json` and `config.real-website.json` are the fresh simple/complex evidence runs documented below; the others are reusable starting points for larger tasks.
+These configs are intended to run against a real local model endpoint. The table below records the latest successful evidence runs and keeps a few reusable stress configs for future checks.
 
 - `config.example.json` - starter task tracker project.
 - `config.real-palindrome.json` - verified CLI benchmark used as the current evidence run.
-- `config.real-arithmetic.json` - focused arithmetic package task.
+- `config.real-arithmetic.json` - focused arithmetic package task, useful for quick prompt/regression checks.
 - `config.real-website.json` - static website plus browser interaction task.
 - `config.gemma4-palindrome.json` - same CLI benchmark using Gemma4-26B-A4B.
 - `config.gemma4-website.json` - same static website/browser benchmark using Gemma4-26B-A4B and a bounded live transcript.
-- `config.gemma4-existing-bugfix.json` - existing-project repair benchmark using separate agent-owned state files.
+- `config.real-existing-bugfix.json` - existing-project repair benchmark using separate agent-owned state files.
+- `config.real-dotnet-dependency.json` - dependency-discovery benchmark where the agent installs .NET inside the disposable container without changing this harness Dockerfile.
+- `config.real-jsonl-stats.json` - Qwen JSONL statistics stress benchmark; the latest long run timed out and is kept as a reusable hard case, not as successful evidence.
 - `config.gemma4-jsonl-stats.json` - fresh JSONL statistics CLI benchmark using Gemma4-26B-A4B.
 - `config.real-city-research.json` - web-research manifest task.
 - `config.real-platformer.json` - browser platformer task with Playwright validation requirements.
@@ -388,15 +462,15 @@ These configs are intended to run against a real local model endpoint. `config.r
 | `scripts/bootstrap_ubuntu.sh` | Main Ubuntu setup script for Docker, Python env, optional model download, optional llama.cpp/Vulkan image build. |
 | `scripts/install_ubuntu.sh` | Compatibility wrapper around `scripts/bootstrap_ubuntu.sh`. |
 | `scripts/download_default_model.sh` | Downloads and verifies the default Qwen3.6 GGUF model and mmproj files. |
-| `scripts/start_default_model_server.sh` | Builds if needed and starts the default llama.cpp/Vulkan model server on port `8161`. |
+| `scripts/start_default_model_server.sh` | Builds if needed and starts the default llama.cpp/Vulkan model server on `agentic-feedback-net`, with host port `8161` published for checks. |
 | `scripts/build_and_run.sh` | Convenience wrapper to build/run the agent harness from a config. |
-| `scripts/run_agent.sh` | Lower-level runner that re-enters Docker when `runtime.docker_isolation=true`. |
+| `scripts/run_agent.sh` | Lower-level runner that re-enters Docker when `runtime.docker_isolation=true` and joins the agent container to the model-server network. |
 | `scripts/seed_existing_bugfix_fixture.sh` | Creates the existing-project repair fixture with planted syntax and logic bugs. |
 | `scripts/env.sh` | Shared path/model defaults. Override values in the shell. |
 
 ## Verified Real Runs
 
-The table below keeps the latest successful evidence for each real Docker-isolated workload. The Qwen palindrome, Gemma website, and Gemma existing-project rows were rerun after relaxing the prompts so the implementation model is not asked to be artificially brief. Those reruns kept the structured JSON contracts, but allowed the local model to use as much detail as the step needed.
+The table below keeps successful real Docker-isolated workload evidence. The newer Qwen runs were deliberately varied so the harness does not become over-fitted to one task shape: a dependency-heavy .NET task, an existing-project bug fix, and a focused Python package task. The prompts keep browser work friendly to Python Playwright because that is preinstalled in the agent container, but dependency installation remains a normal plan step when the project asks for a different stack.
 
 The Qwen server used the default script and port:
 
@@ -425,10 +499,14 @@ The model server was configured for `CTX_SIZE=76800`, `PARALLEL=1`, and the conf
 |---|---|---|---|---:|---|---|
 | Qwen3.6-27B Q4_K_M | Palindrome CLI with unit tests and docs | `config.real-palindrome.json` | resolved | 3,615s | S1=2, S2=1, S3=2, S4=3 | Slower, but disciplined. The reviewer caught a case-sensitive validation mismatch, ambiguous empty-string CLI output, and a too-shallow documentation validator before accepting the corrected project. |
 | Qwen3.6-27B Q4_K_M | Three-page website with JS interaction and Playwright validation | `config.real-website.json` | resolved | 4,889s | S1=3, S2=3, S3=1, S4=2 | Most robust complex run. The reviewer rejected shallow validation and required browser/runtime evidence before final acceptance. |
+| Qwen3.6-27B Q4_K_M | .NET todo analyzer with container-local SDK install | `config.real-dotnet-dependency.json` | resolved | 6,321s | S1=2, S2=2, S3=4, S4=1, S5=1 | Confirmed the harness can follow a non-Python stack request without changing its Dockerfile. The agent installed .NET SDK 8.0.420 under `/tmp/.dotnet`, installed ICU in the disposable container, built the solution, ran 15 tests, and showed CLI output for overdue tasks. |
+| Qwen3.6-27B Q4_K_M | Existing invoice project bug fix | `config.real-existing-bugfix.json` | resolved | 1,998s | S1=2, S2=1, S3=1, S4=1 | Confirmed the harness can repair an existing project instead of starting from a blank directory. The reviewer forced concrete failure reproduction, separated syntax and tax-logic fixes, then accepted after `unittest` passed and `BUGFIX_NOTES.md` documented the repair. |
+| Qwen3.6-27B Q4_K_M | Focused arithmetic module with tests and docs | `config.real-arithmetic.json` | resolved | 3,840s | S1=1, S2=3, S3=1, S4=1, S5=2 | Good compact regression run. The reviewer rejected shallow import-only evidence, caught an invalid inline `python -c` validation shape, and accepted only after generated validation scripts and 20 unit tests passed. |
 | Gemma4-26B-A4B Q4_K_M | Palindrome CLI with unit tests and docs | `config.gemma4-palindrome.json` | resolved | 195s | S1=1, S2=1, S3=1 | Much faster on the small task and completed without reviewer rework. |
 | Gemma4-26B-A4B Q4_K_M | Three-page website with JS interaction and Python Playwright validation | `config.gemma4-website.json` | resolved | 715s | S1=1, S2=3, S3=3 | Fast overall, but more incremental. The reviewer caught incomplete website files, then forced working Python Playwright validation with dynamic port handling before final acceptance. |
-| Gemma4-26B-A4B Q4_K_M | Existing invoice project bug fix | `config.gemma4-existing-bugfix.json` | resolved | 746s | S1=1, S2=4, S3=2, S4=1 | Confirmed the harness can repair an existing project. The reviewer caught malformed expected-failure evidence, kept the syntax and logic phases separate, and accepted only after the tax-rate bug was fixed and documented. |
 | Gemma4-26B-A4B Q4_K_M | JSONL statistics CLI from scratch | `config.gemma4-jsonl-stats.json` | resolved | 974s | S1=4, S2=4, S3=1, S4=1 | Confirmed a fresh project run after the recent harness changes. The reviewer caught missing tests, syntax/runtime errors, missing sample data, and insufficient final evidence. |
+
+One Qwen JSONL statistics stress run using `config.real-jsonl-stats.json` was intentionally not counted above: it timed out after 7,200s while still in the feedback loop. That run was still useful because it exposed a generic issue with stale early artifacts and overly clever one-line Python validation commands; both are now covered by deterministic tests.
 
 Observed Qwen simple workload result:
 
@@ -446,13 +524,15 @@ Observed Qwen complex workload result:
 - Feedback required runtime proof that navigation and the JavaScript interaction worked, not only file-existence checks.
 - The accepted project produced browser evidence under the generated workspace, including `out/results.json` and screenshots.
 
-Observed Gemma comparison result:
+Observed model behavior from these runs:
 
 - Gemma4 was dramatically faster on these two runs, especially the simple CLI task.
 - It handled the simple CLI workload cleanly.
 - On browser work it needed more explicit environmental guidance and more feedback. In the latest rerun, it first produced incomplete website/browser validation, then the reviewer forced concrete Playwright evidence and a dynamic-port validation script before final acceptance.
-- On the existing-project repair run, configurable state filenames kept the fixture's own files separate from the harness plan/requirements documents. Gemma also emitted some chat-template noise under pressure; the JSON extraction and repair path recovered, which is why the final result still resolved.
-- On the JSONL CLI run, the feedback loop did useful work: it caught broken generated code and missing validation evidence before accepting the project.
+- On the existing-project repair run, configurable state filenames kept the fixture's own files separate from the harness plan/requirements documents. Qwen repaired syntax and logic bugs only after the reviewer forced concrete failure evidence.
+- On the Gemma JSONL CLI run, the feedback loop did useful work: it caught broken generated code and missing validation evidence before accepting the project.
+- On the .NET run, Qwen followed an explicit non-Python technology request and treated dependency setup as project work inside the disposable agent container. That is the intended behavior: Python Playwright is a convenience for browser validation, not a harness-wide technology requirement.
+- On the focused arithmetic run, Qwen was slower than Gemma but the feedback loop stayed useful: it pushed for behavioral evidence instead of superficial imports and recovered from invalid validation-command syntax.
 - This is not a universal model ranking. It only says that in this harness and with these prompts, Qwen behaved more conservatively on complex coding, while Gemma was much faster and good enough when the tool environment was described tightly.
 
 The evidence is stored locally in ignored generated workspaces:
@@ -468,11 +548,13 @@ workspaces/gemma4-website/.agent_state/summary.json
 workspaces/gemma4-website/.agent_state/conversation.full.md
 workspaces/existing-bugfix-demo/.agent_state/summary.json
 workspaces/existing-bugfix-demo/.agent_state/conversation.full.md
+workspaces/real-dotnet-dependency/.agent_state/summary.json
+workspaces/real-dotnet-dependency/.agent_state/conversation.full.md
+workspaces/real-arithmetic/.agent_state/summary.json
+workspaces/real-arithmetic/.agent_state/conversation.full.md
 workspaces/gemma4-jsonl-stats/.agent_state/summary.json
 workspaces/gemma4-jsonl-stats/.agent_state/conversation.full.md
 ```
-
-`config.real-arithmetic.json` is also kept as a reusable benchmark config; its local workspace can be regenerated the same way if needed.
 
 ## Tests
 
@@ -482,7 +564,9 @@ Run the harness unit tests without Docker:
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 -m unittest discover -s tests -v
 ```
 
-Run a real Docker-isolated benchmark:
+Run a real Docker-isolated benchmark. The first command starts the model server
+in its own container, and the second command starts the agent container on the
+same Docker network:
 
 ```bash
 MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh

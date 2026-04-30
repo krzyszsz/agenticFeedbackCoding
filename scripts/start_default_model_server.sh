@@ -10,6 +10,9 @@ CONTAINER="${CONTAINER:-agentic-qwen36-server}"
 MODEL_PATH="${MODEL_PATH:-$QWEN36_LOCAL_DIR/$QWEN36_MODEL_FILE}"
 MMPROJ_PATH="${MMPROJ_PATH:-$QWEN36_LOCAL_DIR/$QWEN36_MMPROJ_FILE}"
 PORT="${PORT:-8161}"
+PUBLISH_HOST="${PUBLISH_HOST:-127.0.0.1}"
+PUBLISH_PORT="${PUBLISH_PORT:-$PORT}"
+DOCKER_NETWORK="${DOCKER_NETWORK:-agentic-feedback-net}"
 CTX_SIZE="${CTX_SIZE:-76800}"
 GPU_LAYERS="${GPU_LAYERS:-999}"
 THREADS="${THREADS:-8}"
@@ -66,6 +69,15 @@ case "$MODEL_ROOT" in
   *) VOLUME_ARGS+=(-v "$MODEL_ROOT:$MODEL_ROOT:ro") ;;
 esac
 
+NETWORK_ARGS=()
+if [ "$DOCKER_NETWORK" = "host" ]; then
+  NETWORK_ARGS=(--network=host)
+else
+  "${DOCKER[@]}" network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 || \
+    "${DOCKER[@]}" network create "$DOCKER_NETWORK" >/dev/null
+  NETWORK_ARGS=(--network "$DOCKER_NETWORK" --network-alias "$CONTAINER" -p "$PUBLISH_HOST:$PUBLISH_PORT:$PORT")
+fi
+
 "${DOCKER[@]}" run -d --name "$CONTAINER" \
   --memory="$MEM_LIMIT" \
   --memory-swap="$MEMORY_SWAP" \
@@ -73,7 +85,8 @@ esac
   --oom-score-adj="$OOM_SCORE_ADJ" \
   "${DEVICE_ARGS[@]}" \
   --security-opt label=disable \
-  --ipc=host --network=host \
+  --ipc=host \
+  "${NETWORK_ARGS[@]}" \
   "${VOLUME_ARGS[@]}" \
   -e MODEL="$MODEL_PATH" \
   -e PORT="$PORT" \
@@ -85,14 +98,17 @@ esac
   "$SERVER_IMAGE" >/dev/null
 
 for _ in $(seq 1 "${READY_ATTEMPTS:-60}"); do
-  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/v1/models" || true)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PUBLISH_PORT/v1/models" || true)"
   if [ "$code" = "200" ]; then
-    echo "Model server ready: http://127.0.0.1:$PORT/v1"
+    echo "Model server ready on host: http://127.0.0.1:$PUBLISH_PORT/v1"
+    if [ "$DOCKER_NETWORK" != "host" ]; then
+      echo "Model server ready on Docker network '$DOCKER_NETWORK': http://$CONTAINER:$PORT/v1"
+    fi
     exit 0
   fi
   sleep "${READY_SLEEP_SECONDS:-2}"
 done
 
-echo "Model server did not become ready on port $PORT." >&2
+echo "Model server did not become ready on host port $PUBLISH_PORT." >&2
 "${DOCKER[@]}" logs --tail 200 "$CONTAINER" || true
 exit 1

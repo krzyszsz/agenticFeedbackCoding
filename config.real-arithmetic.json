@@ -9,7 +9,8 @@
     "temperature": 0.15,
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
-    "retry_sleep_seconds": 30
+    "retry_sleep_seconds": 30,
+    "request_heartbeat_seconds": 60
   },
   "feedback_model": null,
   "mcp_tools": {

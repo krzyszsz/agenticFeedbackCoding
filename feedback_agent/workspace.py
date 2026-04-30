@@ -33,6 +33,47 @@ PLAN_TEMPLATE = """# Agent Plan
 """
 
 
+BINARY_FILE_SUFFIXES = {
+    ".apng",
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".ico",
+    ".jpg",
+    ".jpeg",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".pdf",
+    ".png",
+    ".tar",
+    ".webm",
+    ".webp",
+    ".zip",
+}
+
+
+SKIPPED_WORKSPACE_DIRS = {
+    "$HOME",
+    ".agent_state",
+    ".dotnet",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "bin",
+    "build",
+    "dist",
+    "node_modules",
+    "obj",
+    "out",
+    "target",
+    "venv",
+}
+
+
 def ensure_plan(workspace: Path, plan_filename: str = "PLAN.md") -> Path:
     workspace.mkdir(parents=True, exist_ok=True)
     path = workspace / plan_filename
@@ -439,12 +480,22 @@ def write_plan_doc(
 
 def collect_workspace_files(workspace: Path, max_file_bytes: int = 20000) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
-    skipped_dirs = {".agent_state", ".git", "__pycache__", ".pytest_cache"}
     for path in sorted(workspace.rglob("*")):
-        if not path.is_file() or any(part in skipped_dirs for part in path.parts):
+        if not path.is_file() or any(part in SKIPPED_WORKSPACE_DIRS for part in path.relative_to(workspace).parts):
             continue
         rel = path.relative_to(workspace)
         size = path.stat().st_size
+        with path.open("rb") as f:
+            sample = f.read(min(size, 4096))
+        if _looks_like_binary_file(path, sample):
+            files.append({
+                "path": str(rel),
+                "content": f"[binary artifact omitted from prompt; size={size} bytes]",
+                "size": size,
+                "truncated": False,
+                "binary": True,
+            })
+            continue
         if size <= max_file_bytes:
             files.append({
                 "path": str(rel),
@@ -464,3 +515,25 @@ def collect_workspace_files(workspace: Path, max_file_bytes: int = 20000) -> lis
         )
         files.append({"path": str(rel), "content": content, "size": size, "truncated": True})
     return files
+
+
+def _looks_like_binary_file(path: Path, sample: bytes) -> bool:
+    """Return True when a workspace artifact should be summarized, not pasted.
+
+    Screenshots and other binary evidence are useful as files, but shoving raw
+    bytes into the reviewer prompt consumes context and can derail long local
+    model runs. Keep the path/size metadata so the feedback agent knows the
+    artifact exists, while leaving visual inspection to explicit tooling later.
+    """
+    if path.suffix.lower() in BINARY_FILE_SUFFIXES:
+        return True
+    if b"\0" in sample:
+        return True
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    if not sample:
+        return False
+    control_bytes = sum(1 for byte in sample if byte < 32 and byte not in (9, 10, 13))
+    return control_bytes > max(8, len(sample) // 4)

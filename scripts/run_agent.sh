@@ -79,6 +79,43 @@ PY
   else
     echo "Using existing agent image: $image (set REBUILD_AGENT_IMAGE=1 to rebuild)" >&2
   fi
+
+  agent_network="${AGENT_DOCKER_NETWORK:-${DOCKER_NETWORK:-agentic-feedback-net}}"
+  model_server_container="${MODEL_SERVER_CONTAINER:-agentic-qwen36-server}"
+  model_server_port="${MODEL_SERVER_PORT:-8161}"
+  network_args=()
+  env_args=(
+    -e AGENT_IN_CONTAINER=1
+    -e HOME=/tmp
+    -e DOTNET_ROOT=/tmp/.dotnet
+    -e PATH=/tmp/.dotnet:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    -e AGENT_WORKSPACE=/workspace/project
+    -e REPO_ROOT=/app
+  )
+
+  case "$agent_network" in
+    host)
+      network_args=(--network=host)
+      ;;
+    none|"")
+      ;;
+    *)
+      "${docker_cmd[@]}" network inspect "$agent_network" >/dev/null 2>&1 || \
+        "${docker_cmd[@]}" network create "$agent_network" >/dev/null
+      network_args=(--network "$agent_network")
+      if [ -z "${AGENT_IMPLEMENTATION_BASE_URL:-}" ]; then
+        AGENT_IMPLEMENTATION_BASE_URL="http://$model_server_container:$model_server_port/v1"
+      fi
+      ;;
+  esac
+
+  if [ -n "${AGENT_IMPLEMENTATION_BASE_URL:-}" ]; then
+    env_args+=(-e "AGENT_IMPLEMENTATION_BASE_URL=$AGENT_IMPLEMENTATION_BASE_URL")
+  fi
+  if [ -n "${AGENT_FEEDBACK_BASE_URL:-}" ]; then
+    env_args+=(-e "AGENT_FEEDBACK_BASE_URL=$AGENT_FEEDBACK_BASE_URL")
+  fi
+
   user_args=()
   case "$docker_user" in
     host)
@@ -94,12 +131,9 @@ PY
       user_args=(--user "$docker_user")
       ;;
   esac
-  "${docker_cmd[@]}" run --rm --network=host --security-opt label=disable \
+  "${docker_cmd[@]}" run --rm "${network_args[@]}" --security-opt label=disable \
     "${user_args[@]}" \
-    -e AGENT_IN_CONTAINER=1 \
-    -e HOME=/tmp \
-    -e AGENT_WORKSPACE=/workspace/project \
-    -e REPO_ROOT=/app \
+    "${env_args[@]}" \
     -v "$workspace:/workspace/project" \
     -v "$CONFIG_ABS:/app/config.json:ro" \
     "$image" --config /app/config.json

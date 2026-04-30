@@ -19,6 +19,7 @@ class ModelConfig:
     request_timeout_seconds: int
     retry_attempts: int
     retry_sleep_seconds: int
+    request_heartbeat_seconds: int
 
 
 @dataclass(frozen=True)
@@ -141,10 +142,10 @@ class AgentConfig:
     project_design: ProjectDesign
 
 
-def _model(data: dict[str, Any]) -> ModelConfig:
+def _model(data: dict[str, Any], *, base_url_override: str | None = None) -> ModelConfig:
     return ModelConfig(
         name=str(data["name"]),
-        base_url=str(data["base_url"]).rstrip("/"),
+        base_url=str(base_url_override or data["base_url"]).rstrip("/"),
         api_key=str(data.get("api_key") or "not-needed"),
         model=str(data.get("model") or "local-gguf"),
         context_window=int(data["context_window"]),
@@ -153,6 +154,7 @@ def _model(data: dict[str, Any]) -> ModelConfig:
         request_timeout_seconds=int(data.get("request_timeout_seconds", 21_600)),
         retry_attempts=max(1, int(data.get("retry_attempts", 20))),
         retry_sleep_seconds=max(0, int(data.get("retry_sleep_seconds", 30))),
+        request_heartbeat_seconds=max(0, int(data.get("request_heartbeat_seconds", 60))),
     )
 
 
@@ -239,8 +241,14 @@ def load_config(path: str | Path, repo_root: Path | None = None) -> AgentConfig:
     loop_data = data.get("loop", {})
 
     return AgentConfig(
-        implementation_model=_model(data["implementation_model"]),
-        feedback_model=_model(feedback) if feedback else None,
+        implementation_model=_model(
+            data["implementation_model"],
+            base_url_override=os.getenv("AGENT_IMPLEMENTATION_BASE_URL"),
+        ),
+        feedback_model=_model(
+            feedback,
+            base_url_override=os.getenv("AGENT_FEEDBACK_BASE_URL"),
+        ) if feedback else None,
         mcp_tools=ToolConfig(**data["mcp_tools"]),
         runtime=RuntimeConfig(
             docker_isolation=bool(runtime_data.get("docker_isolation", True)),

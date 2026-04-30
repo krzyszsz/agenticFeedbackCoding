@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import re
 from typing import Any
 
@@ -67,6 +68,9 @@ Avoid embedding Python source, f-strings, braces, list comprehensions, or other
 quote-heavy snippets inside JSON command strings during planning. Prefer simple
 argv checks such as ["test", "-f", "README.md"]. For complex validation, add a
 plan step that creates a validation script and then run ["python", "validate.py"].
+Do not use `python -m py_compile .` or point `py_compile` at a directory; use
+`python -m compileall <dir>` or a small validation script when validating a
+whole package.
 For expected failure-path tests, use {"cmd": ["python", "-m", "app"], "expected_returncode": 2}
 and assert the stderr/stdout message in a small wrapper command when possible.
 If a partial-fix step intentionally expects the full test suite to keep failing
@@ -107,6 +111,9 @@ performs checks and exits.
 Do not embed inline Python source in JSON command strings. Prefer simple argv
 checks such as ["test", "-f", "index.html"], or run a generated validation
 script such as ["python", "validate.py"].
+Do not use `python -m py_compile .` or any directory argument with
+`py_compile`; use `python -m compileall <dir>` or a generated validation script
+for package-wide syntax checks.
 If a step intentionally expects a non-zero result, including a partial bug-fix
 step where failure logs should now show only logic errors, use a command object
 with `expected_returncode` or a wrapper script that returns 0 only when that
@@ -134,6 +141,10 @@ test, or browser check needs longer. Write the files needed to complete the
 current plan step or a coherent vertical slice of it. For large steps, it is fine
 to split work across feedback attempts, but do not artificially withhold
 inseparable files or documentation that is needed for a high-quality result.
+The `files` payload creates files, not empty directories. When a step requires
+directory scaffolding but no real source file belongs there yet, create a small
+placeholder such as `game/js/.gitkeep`, `game/css/.gitkeep`, or
+`tests/.gitkeep` so the directory exists and validation commands can prove it.
 Avoid unrelated full-project rewrites.
 When feedback identifies malformed source, corrupted markup, duplicated tags,
 broken imports, or other structural damage, replace the affected file from a
@@ -147,6 +158,9 @@ them. Stable, boring, canonical source is better than a fresh rewrite that adds
 new mistakes.
 Commands may be argv lists or {"cmd": ["python", "script.py"], "timeout_seconds": 7200}
 when one specific tool call legitimately needs longer than the default timeout.
+Plain argv lists do not expand shell variables, pipes, redirects, globbing, or
+`&&`; use `["bash", "-lc", "export PATH=\"$HOME/.dotnet:$PATH\" && dotnet --version"]`
+when a command intentionally needs shell behavior.
 Avoid quote-heavy inline Python in JSON command strings, and avoid brittle grep
 commands when a check has multiple conditions or nested quotes. If validation
 needs logic, write a small validation file and run it as a command.
@@ -288,6 +302,36 @@ class FeedbackLoopAgent:
             "AGENT_RESEARCH.md",
         }
 
+    def _harness_state_file_guidance(self) -> str:
+        docs = ", ".join(sorted(self._harness_doc_names()))
+        return (
+            "HARNESS_STATE_FILES:\n"
+            f"The harness owns these root-level workflow/state files: {docs}. "
+            "They are readable context, but they are not project deliverables and implementation agents must not "
+            "create, overwrite, or validate them as proof of project work. If the project needs research, architecture, "
+            "or design notes, plan project-owned files such as ARCHITECTURE.md, DESIGN_NOTES.md, PROJECT_RESEARCH.md, "
+            "or docs/*.md instead."
+        )
+
+    def _split_model_writable_files(self, files: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+        """Keep implementation turns from overwriting harness-owned state.
+
+        PLAN/REQUIREMENTS/RESEARCH files are the workflow control plane. The
+        model may read them and the harness updates them, but implementation
+        payloads should not replace them with project-local guesses. Blocking
+        here is safer than hoping every local model obeys the prompt forever.
+        """
+        blocked = {Path(name).as_posix() for name in self._harness_doc_names()}
+        allowed: list[dict[str, Any]] = []
+        skipped: list[str] = []
+        for item in files:
+            rel = Path(str(item.get("path", ""))).as_posix()
+            if rel in blocked:
+                skipped.append(rel)
+                continue
+            allowed.append(item)
+        return allowed, skipped
+
     def _ensure_plan(self) -> None:
         ensure_plan(self.workspace, self.config.runtime.plan_file)
 
@@ -336,7 +380,8 @@ class FeedbackLoopAgent:
                     "This transcript is durable chat memory: IMPLEMENTATION_AGENT_REQUEST/RESPONSE and "
                     "FEEDBACK_AGENT_REQUEST/RESPONSE blocks are cumulative context, not isolated prompts. "
                     f"Harness-owned state files are {self.config.runtime.plan_file}, "
-                    f"{self.config.runtime.requirements_file}, and {self.config.runtime.research_file}."
+                    f"{self.config.runtime.requirements_file}, and {self.config.runtime.research_file}. "
+                    + self._execution_environment_guidance().replace("\n", " ")
                 ),
             )
             self.conversation.append(
@@ -598,7 +643,10 @@ class FeedbackLoopAgent:
         plan_result = self._plan_validation_phase()
         git_baseline = self._git_baseline_commit()
         step_results: list[dict[str, Any]] = []
-        for step in self.plan_steps:
+        while True:
+            step = self._next_pending_step()
+            if step is None:
+                break
             step_results.append(self._implementation_loop_for_step(step))
             self._write_plan_doc()
             if step_results[-1]["status"] == "cannot_resolve" and self.config.resolution_policy.stop_on_cannot_resolve:
@@ -678,6 +726,8 @@ class FeedbackLoopAgent:
                 "that conflict as an assumption and choose a practical feasible verifiable plan. "
                 "Do not reinterpret per-attempt file-count guidance as a one-file-per-plan-step rule.\n"
                 f"{self._default_quality_instruction()}\n"
+                f"{self._execution_environment_guidance()}\n"
+                f"{self._harness_state_file_guidance()}\n"
                 f"Web research evidence: {compact_research_for_prompt(self.web_research_result)}\n"
                 "If web research status is completed or partial, use those findings in the requirements and plan; "
                 "the first research/structure step must cite the source URLs in generated project notes. "
@@ -733,6 +783,7 @@ class FeedbackLoopAgent:
 
     def _requirements_review(self, index: int, requirements: dict[str, Any]) -> dict:
         """Ask the feedback agent whether requirements are actionable enough."""
+        environment_findings = self._environment_assumption_findings(requirements=requirements)
         prompt = {
             "phase": "REQUIREMENTS_REVIEW_PHASE",
             "iteration": index,
@@ -740,6 +791,8 @@ class FeedbackLoopAgent:
             "requirements": requirements,
             "web_research_evidence": self.web_research_result,
             "default_quality_policy": self._default_quality_policy_payload(),
+            "execution_environment": self._execution_environment_payload(),
+            "deterministic_environment_findings": environment_findings,
             "expected_json": {
                 "status": "resolved|needs_rework|needs_requirements_change|cannot_resolve|skipped_with_note",
                 "needs_rework": True,
@@ -756,6 +809,8 @@ class FeedbackLoopAgent:
             "of an impossible constraint. Per-attempt output-size guidance is not a plan-step limit.\n"
             "If default quality policy applies, reject requirements that omit project structure, tests, documentation, "
             "or the initial research/structure planning step.\n"
+            "Apply execution_environment strictly. If deterministic_environment_findings is non-empty, request a "
+            "requirements or plan correction instead of accepting incompatible assumptions.\n"
             "If WEB_RESEARCH_TOOL_RESULT has completed or partial sources, reject requirements that ignore those sources. "
             "If web research is skipped or disabled, do not require cited source URLs; request available-knowledge notes instead.\n"
             + json.dumps(prompt),
@@ -767,7 +822,15 @@ class FeedbackLoopAgent:
             contract='{"status":"resolved|needs_rework|needs_requirements_change|cannot_resolve|skipped_with_note","needs_rework":true,"summary":"review summary","required_changes":["specific change"]}',
             feedback=True,
         )
-        return self._normalize_review(review)
+        review = self._normalize_review(review)
+        if environment_findings:
+            existing = [str(item) for item in review.get("required_changes", [])]
+            review["required_changes"] = existing + [item for item in environment_findings if item not in existing]
+            if self._status(review) == "resolved":
+                review["status"] = "needs_requirements_change"
+                review["needs_rework"] = True
+                review["summary"] = "Deterministic environment checks found incompatible browser/tooling assumptions."
+        return review
 
     def _plan_validation_phase(self) -> dict:
         """Block implementation until the ordered plan is executable and checkable."""
@@ -795,6 +858,7 @@ class FeedbackLoopAgent:
             "iteration": index,
             "requirements": self.requirements,
             "web_research_evidence": self.web_research_result,
+            "execution_environment": self._execution_environment_payload(),
             "plan": self.plan_steps,
             "deterministic_structural_findings": structural_findings,
             "checks": [
@@ -804,6 +868,8 @@ class FeedbackLoopAgent:
                 "each step has validation commands or an explicit non-command validation method",
                 "validation commands terminate and assert behavior instead of starting a server forever",
                 "browser/UI steps have executable browser evidence such as Playwright, screenshots, or a validation report when web interaction tools are enabled",
+                "browser/UI plans match the agent container tools; Python Playwright is available, but Node/npm/npx/@playwright/test are not available unless explicitly configured",
+                "project deliverables must not be harness-owned state files such as PLAN.md, REQUIREMENTS.md, or RESEARCH.md",
                 "the sequence can be executed one step at a time",
                 "planning_confirmation says the plan is feasible, clear, and verifiable",
                 "the reviewer can name exactly how each step will be verified later",
@@ -830,6 +896,8 @@ class FeedbackLoopAgent:
             "A command that only starts an HTTP server is not validation. Treat step-count limits as "
             "hard only when the user explicitly says hard/strict/exactly/must; otherwise prefer a "
             "practical feasible verifiable plan. Per-attempt file-count guidance is not a plan-step limit.\n"
+            f"{self._execution_environment_guidance()}\n"
+            f"{self._harness_state_file_guidance()}\n"
             + json.dumps(prompt),
             temperature=0.1,
         )
@@ -857,6 +925,8 @@ class FeedbackLoopAgent:
             "Return the plan/refined planning confirmation contract below; do not repeat "
             "the full requirements list unless those details are needed for clarity. Validation commands must be scripts/commands that exit and "
             "assert behavior. Do not use python -m http.server by itself.\n"
+            f"{self._execution_environment_guidance()}\n"
+            f"{self._harness_state_file_guidance()}\n"
             f"Requirements summary: {self._requirements_summary_for_prompt()}\n"
             f"Current plan: {json.dumps(self.plan_steps)}\n"
             f"Web research evidence: {compact_research_for_prompt(self.web_research_result)}\n"
@@ -882,10 +952,50 @@ class FeedbackLoopAgent:
             self.requirements = payload
         elif isinstance(payload.get("planning_confirmation"), dict):
             self.requirements["planning_confirmation"] = payload["planning_confirmation"]
-        self.plan_steps = normalize_plan_steps(payload.get("plan", self.plan_steps))
+        previous_steps = self.plan_steps
+        self.plan_steps = self._merge_refined_plan_steps(
+            previous_steps,
+            normalize_plan_steps(payload.get("plan", self.plan_steps)),
+        )
+        # Keep the embedded requirements copy consistent with the authoritative
+        # top-level plan so later reviews do not see both old and new commands.
+        self.requirements["plan"] = self.plan_steps
         self.plan_notes.append(f"Plan refined after review iteration {index}.")
         self._write_plan_doc()
         return payload
+
+    def _merge_refined_plan_steps(
+        self,
+        previous_steps: list[dict[str, Any]],
+        refined_steps: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Replace plan content while preserving dict identity for active loops.
+
+        A feedback review may request a plan change in the middle of a step.
+        The implementation loop already holds a reference to that step dict, so
+        simply assigning ``self.plan_steps = new_steps`` leaves reviewer-owned
+        validation stuck on stale commands. Updating matching step dictionaries
+        in place keeps the active loop, plan document, and final review aligned.
+        """
+        previous_by_id = {str(step.get("id")): step for step in previous_steps if step.get("id") is not None}
+        merged: list[dict[str, Any]] = []
+        for refined in refined_steps:
+            step_id = str(refined.get("id")) if refined.get("id") is not None else ""
+            existing = previous_by_id.get(step_id)
+            if existing is None:
+                merged.append(refined)
+                continue
+            existing.clear()
+            existing.update(refined)
+            merged.append(existing)
+        return merged
+
+    def _next_pending_step(self) -> dict[str, Any] | None:
+        """Return the next unresolved step from the current, possibly refined plan."""
+        for step in self.plan_steps:
+            if str(step.get("status", "pending")).lower() not in {"resolved", "cannot_resolve", "skipped"}:
+                return step
+        return None
 
     def _implementation_loop_for_step(self, step: dict[str, Any]) -> dict:
         """Run bounded implement/review attempts for one validated plan step."""
@@ -913,8 +1023,10 @@ class FeedbackLoopAgent:
                 return {"step_id": step["id"], "status": "resolved", "attempts": attempts}
             if status == "needs_plan_change":
                 self._plan_refinement_pass(attempt, review)
+                step = self._current_step_by_id(step["id"]) or step
             elif status == "needs_requirements_change":
                 self._requirements_refinement_phase(extra_context=json.dumps(self._compact_review_for_transcript(review)))
+                step = self._current_step_by_id(step["id"]) or step
             elif status == "cannot_resolve":
                 step["status"] = "cannot_resolve"
                 self._append_plan_note(f"[{step['id']}] cannot resolve: {summary}")
@@ -933,6 +1045,13 @@ class FeedbackLoopAgent:
         step["status"] = resolution["status"]
         return {"step_id": step["id"], "status": resolution["status"], "attempts": attempts, "resolution": resolution}
 
+    def _current_step_by_id(self, step_id: Any) -> dict[str, Any] | None:
+        """Find the latest plan step by id after requirements or plan refinement."""
+        for candidate in self.plan_steps:
+            if str(candidate.get("id")) == str(step_id):
+                return candidate
+        return None
+
     def _implementation_pass(self, step: dict[str, Any], attempt: int) -> dict:
         """Ask for complete-file edits and run the model-requested validations."""
         prompt = (
@@ -945,6 +1064,12 @@ class FeedbackLoopAgent:
             f"Do not rewrite {self.config.runtime.plan_file} just to mark the current step complete; put progress in plan_note. "
             f"The harness appends notes and marks resolved after feedback accepts the step. Only edit {self.config.runtime.plan_file} "
             "when the feedback request specifically requires substantive plan content changes.\n"
+            f"Do not include harness-owned state files in the files payload: "
+            f"{', '.join(sorted(self._harness_doc_names()))}. The harness creates and updates those files.\n"
+            "If the current plan step asks for one of those harness-owned files as a project deliverable, request "
+            "needs_plan_change instead of trying to satisfy that conflicting instruction.\n"
+            "Do not implement future plan steps early. If the current step is setup, structure, or research, create "
+            "minimal scaffolding and accurate placeholders only; leave feature mechanics for their own accepted steps.\n"
             "Keep this attempt parseable and focused on the current plan step. Write the files needed to complete "
             "the step or a coherent vertical slice. If feedback requested several unrelated changes, choose a "
             "sensible subset, note what remains, and let the next feedback iteration request the rest. Do not rewrite "
@@ -984,7 +1109,8 @@ class FeedbackLoopAgent:
                 "parse_error": str(exc),
                 "raw_tail": raw[-2000:],
             }
-        written = write_files(self.workspace, payload.get("files", []))
+        allowed_files, skipped_harness_files = self._split_model_writable_files(payload.get("files", []))
+        written = write_files(self.workspace, allowed_files)
         command_results = []
         if self.config.mcp_tools.terminal:
             command_results = run_commands(
@@ -996,7 +1122,12 @@ class FeedbackLoopAgent:
             )
         note = payload.get("plan_note") or f"{step['id']} attempt {attempt} implementation pass completed."
         self._append_plan_note(f"[{step['id']} attempt {attempt}] {note}")
-        return {"written": written, "commands": command_results, "raw": payload}
+        return {
+            "written": written,
+            "commands": command_results,
+            "raw": payload,
+            "skipped_harness_files": skipped_harness_files,
+        }
 
     def _step_review_pass(
         self,
@@ -1043,7 +1174,7 @@ class FeedbackLoopAgent:
                 "If test evidence is absent in hard_pushback mode, return needs_rework.",
                 "If evidence remains imperfect in compromise mode, either return needs_rework with a focused bounded fix or resolved_with_compromise/skipped_with_note with an explicit diluted requirement note.",
                 "For browser/game work, prefer Playwright-style interaction evidence and screenshot/report artifacts when configured.",
-                "Do not request package/browser installation inside generated validation scripts; request bounded browser launch timeouts and graceful fallback instead.",
+                "Do not request incidental package/browser installation inside generated validation scripts for default browser checks; if a task requires another stack, request an explicit dependency/setup step with bounded commands.",
                 "In compromise mode, accept a clearly labelled non-browser fallback only when browser launch cannot be made reliable and the fallback still gives concrete evidence.",
                 "Return needs_plan_change if this step cannot be independently verified as written.",
                 "Return needs_requirements_change if the requirements are contradictory or impossible.",
@@ -1215,6 +1346,7 @@ class FeedbackLoopAgent:
         raw = implementation.get("raw") or {}
         return {
             "written": implementation.get("written", []),
+            "skipped_harness_files": implementation.get("skipped_harness_files", []),
             "commands": self._compact_command_results_for_prompt(implementation.get("commands", [])),
             "plan_note": raw.get("plan_note"),
             "test_evidence": raw.get("test_evidence", []),
@@ -1225,7 +1357,7 @@ class FeedbackLoopAgent:
     def _compact_step_evidence_for_prompt(self, evidence: dict[str, Any]) -> dict[str, Any]:
         """Summarize reviewer-owned step evidence for local-model context limits."""
         files = []
-        for item in evidence.get("workspace_files", []):
+        for item in self._reviewer_prompt_files(evidence.get("workspace_files", [])):
             files.append(self._compact_file_for_prompt(item, default_limit=1800))
         git = evidence.get("git") or {}
         return {
@@ -1247,7 +1379,7 @@ class FeedbackLoopAgent:
     def _compact_final_evidence_for_prompt(self, evidence: dict[str, Any]) -> dict[str, Any]:
         """Summarize final tool evidence without dumping full file contents."""
         files = []
-        for item in evidence.get("workspace_files", []):
+        for item in self._reviewer_prompt_files(evidence.get("workspace_files", [])):
             files.append(self._compact_file_for_prompt(item, default_limit=1200))
         validations = []
         for validation in evidence.get("step_validations", []):
@@ -1293,13 +1425,22 @@ class FeedbackLoopAgent:
         """
         content = str(item.get("content", ""))
         path = str(item.get("path", ""))
+        suffix = Path(path).suffix.lower()
         important = path.endswith((
             "validation_evidence.log",
             "results.json",
             "report.json",
             "playwright-report.json",
         ))
-        limit = 12000 if important else default_limit
+        if important:
+            limit = 12000
+        elif suffix in {".md", ".html", ".css", ".js", ".json", ".py"} and len(content) <= 8000:
+            # Small project files are often where the reviewer finds precise
+            # inconsistencies. Keep them intact; truncating a 2-3 KB README is
+            # more misleading than helpful and can cause false pushbacks.
+            limit = 8000
+        else:
+            limit = default_limit
         prompt_truncated = len(content) > limit
         return {
             "path": path,
@@ -1308,6 +1449,23 @@ class FeedbackLoopAgent:
             "prompt_truncated": prompt_truncated,
             "content": self._prompt_excerpt(content, limit),
         }
+
+    def _reviewer_prompt_files(self, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop harness control-plane documents from reviewer prompt snapshots.
+
+        The reviewer receives the current plan, requirements, and research
+        evidence explicitly in structured request fields. Re-sending PLAN.md
+        and friends as workspace files wastes context and crowds out the real
+        project artifacts the reviewer must inspect.
+        """
+        harness_names = self._harness_doc_names()
+        prompt_files: list[dict[str, Any]] = []
+        for item in files:
+            path = str(item.get("path", ""))
+            if path in harness_names:
+                continue
+            prompt_files.append(item)
+        return prompt_files
 
     def _prompt_excerpt(self, text: str, limit: int) -> str:
         """Return text for a model prompt with an explicit middle truncation marker."""
@@ -1377,6 +1535,8 @@ class FeedbackLoopAgent:
             f"FINAL_PROJECT_CORRECTION_PHASE attempt={attempt}\n"
             "Apply only the final review changes needed to make the whole project consistent with requirements. "
             "Include validation commands and test evidence.\n"
+            f"Do not include harness-owned state files in the files payload: "
+            f"{', '.join(sorted(self._harness_doc_names()))}. The harness creates and updates those files.\n"
             f"Review: {json.dumps(self._compact_review_for_transcript(review))}\n\n{IMPLEMENTATION_CONTRACT}"
         )
         if any(self._looks_like_browser_step(step) for step in self.plan_steps):
@@ -1387,7 +1547,8 @@ class FeedbackLoopAgent:
             phase="FINAL_PROJECT_CORRECTION_PHASE",
             contract=IMPLEMENTATION_CONTRACT,
         )
-        written = write_files(self.workspace, payload.get("files", []))
+        allowed_files, skipped_harness_files = self._split_model_writable_files(payload.get("files", []))
+        written = write_files(self.workspace, allowed_files)
         command_results = []
         if self.config.mcp_tools.terminal:
             command_results = run_commands(
@@ -1398,7 +1559,12 @@ class FeedbackLoopAgent:
                 output_limit_chars=self.config.context_compaction.tool_output_max_chars,
             )
         self._append_plan_note(f"[final correction attempt {attempt}] {payload.get('plan_note', 'completed')}")
-        return {"written": written, "commands": command_results, "raw": payload}
+        return {
+            "written": written,
+            "commands": command_results,
+            "raw": payload,
+            "skipped_harness_files": skipped_harness_files,
+        }
 
     def _plan_structural_findings(self) -> list[str]:
         """Cheap deterministic guardrails before the model-based plan review.
@@ -1426,6 +1592,7 @@ class FeedbackLoopAgent:
             if not step.get("validation_commands"):
                 findings.append(f"{step_id} has no validation commands or explicit validation method.")
             findings.extend(self._validation_command_findings(step))
+            findings.extend(self._harness_state_file_plan_findings(step))
             for dep in step.get("depends_on", []):
                 if dep not in seen_ids:
                     findings.append(f"{step_id} depends on {dep}, which has not appeared earlier in the ordered plan.")
@@ -1446,6 +1613,22 @@ class FeedbackLoopAgent:
                 marker in first_text
                 for marker in ("plan", "order", "mapping", "map", "architecture", "dependencies", "assessment", "assess")
             )
+            if not planning_present and structure_present:
+                # Greenfield plans often express the planning action as
+                # "create/document the project structure" rather than using
+                # the literal word "plan". Treat those phrases as satisfying
+                # the same quality gate so we do not force useless rewording.
+                planning_present = any(
+                    marker in first_text
+                    for marker in (
+                        "structure overview",
+                        "project structure",
+                        "skeleton",
+                        "separation of concerns",
+                        "documented",
+                        "document notes",
+                    )
+                )
             if not (research_present and structure_present and planning_present):
                 findings.append(
                     "First plan step must research needed patterns/knowledge, plan project structure/architecture, "
@@ -1455,6 +1638,7 @@ class FeedbackLoopAgent:
                 findings.append(
                     "Web research evidence exists, so the first research/structure step must require citing and applying source URLs."
                 )
+        findings.extend(self._environment_assumption_findings(requirements=self.requirements, plan=self.plan_steps))
         confirmation = self.requirements.get("planning_confirmation") if isinstance(self.requirements, dict) else None
         if not isinstance(confirmation, dict):
             findings.append("Requirements are missing planning_confirmation.")
@@ -1486,6 +1670,38 @@ class FeedbackLoopAgent:
         items = [str(item) for item in self.requirements.get("refined_requirements", [])[:8]]
         return json.dumps({"summary": summary, "key_requirements": items})
 
+    def _harness_state_file_plan_findings(self, step: dict[str, Any]) -> list[str]:
+        """Reject plans that turn workflow-control files into project artifacts.
+
+        The harness writes PLAN/REQUIREMENTS/RESEARCH style files before the
+        implementation agent runs. If a generated plan asks the model to create
+        those same root-level filenames, the step is impossible: the write guard
+        will correctly block it later. Catching that mismatch during plan review
+        makes the feedback loop repair the plan instead of wasting attempts.
+        """
+        text = json.dumps(
+            {
+                "title": step.get("title", ""),
+                "description": step.get("description", ""),
+                "acceptance_criteria": step.get("acceptance_criteria", []),
+                "validation_commands": step.get("validation_commands", []),
+            },
+            sort_keys=True,
+        )
+        findings: list[str] = []
+        step_id = str(step.get("id") or "step")
+        for name in sorted(self._harness_doc_names()):
+            normalized = Path(name).as_posix()
+            # Flag `RESEARCH.md` and `./RESEARCH.md`, but allow project-owned
+            # subpaths such as `docs/RESEARCH.md`.
+            pattern = rf"(?<![/\\\w.-])(?:\./)?{re.escape(normalized)}(?![\w.-])"
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                findings.append(
+                    f"{step_id} names harness-owned state file {normalized} as a project deliverable or validation target; "
+                    "use ARCHITECTURE.md, DESIGN_NOTES.md, PROJECT_RESEARCH.md, or docs/*.md instead."
+                )
+        return findings
+
     def _validation_command_findings(self, step: dict[str, Any]) -> list[str]:
         findings: list[str] = []
         commands = step.get("validation_commands") or []
@@ -1511,18 +1727,71 @@ class FeedbackLoopAgent:
                 findings.append(
                     f"{step_id} validation command uses malformed Python flag '-mm'; use '-m' or replace it with a validation script."
                 )
+            if self._looks_like_py_compile_directory_command(parts):
+                findings.append(
+                    f"{step_id} validation uses `python -m py_compile` on a directory. "
+                    "Use `python -m compileall <dir>` or a generated validation script for package-wide syntax checks."
+                )
+            if self._looks_like_invalid_inline_python_compound_command(parts):
+                findings.append(
+                    f"{step_id} validation uses a one-line `python -c` try/except block, which Python cannot parse. "
+                    "Replace it with a generated validation script or a multiline command."
+                )
             if self._looks_like_unwrapped_expected_failure_validation(step, command, parts):
                 findings.append(
                     f"{step_id} validation appears to test an expected failure path without declaring expected_returncode "
                     "or wrapping the exception assertion. Replace it with a command object using expected_returncode, "
                     "or a small wrapper command/script that exits 0 only when the expected error occurs."
                 )
+            if self.config.mcp_tools.web_interaction:
+                step_text = (self.config.project_design.prompt + " " + json.dumps(step, sort_keys=True)).lower()
+                if any(part in ("npm", "npx", "node") for part in parts) and not self._explicit_dependency_setup_is_present(step_text):
+                    findings.append(
+                        f"{step_id} validation uses Node/npm tooling, but the default agent container provides Python "
+                        "Playwright and Chromium instead. Use Python Playwright for generic browser validation, or add "
+                        "an explicit bounded dependency/setup step for the requested stack."
+                    )
         return findings
 
     def _command_expected_returncode(self, command: list[Any] | dict[str, Any]) -> int:
         if isinstance(command, dict):
             return int(command.get("expected_returncode", 0))
         return 0
+
+    def _looks_like_py_compile_directory_command(self, parts: list[str]) -> bool:
+        """Reject a common impossible validation command during plan review.
+
+        `py_compile` compiles files, not directories. Local models often suggest
+        `python -m py_compile .` as a package-wide syntax check, which later
+        fails before it exercises the project and can trap the feedback loop.
+        Catch it at plan-validation time and ask for `compileall` or a script.
+        """
+        if len(parts) < 4:
+            return False
+        if not (parts[0].endswith("python") and parts[1] == "-m" and parts[2] == "py_compile"):
+            return False
+        for arg in parts[3:]:
+            normalized = arg.rstrip("/")
+            if normalized in {".", "./"}:
+                return True
+            # Heuristic: common package/workspace directory checks. File paths
+            # normally have a suffix; directory names do not.
+            if normalized and not Path(normalized).suffix and normalized not in {"-q", "-qq"}:
+                return True
+        return False
+
+    def _looks_like_invalid_inline_python_compound_command(self, parts: list[str]) -> bool:
+        """Catch `python -c "try: ...; except ..."` before a real run wastes time.
+
+        Python accepts some one-line compound statements, but `try/except`
+        needs a real block layout. Local models often propose it as a compact
+        negative-path assertion; asking for a generated validation script is
+        clearer and portable across shells.
+        """
+        if len(parts) < 3 or not (parts[0].endswith("python") and parts[1] == "-c"):
+            return False
+        code = parts[2]
+        return "try:" in code and "except" in code and "\n" not in code
 
     def _looks_like_unwrapped_expected_failure_validation(
         self,
@@ -1559,7 +1828,7 @@ class FeedbackLoopAgent:
             if any(marker in code for marker in wrapper_markers):
                 return False
         if self._step_expects_nonzero_validation(step):
-            return True
+            return self._looks_like_plain_test_or_app_command(parts)
         if not is_python_inline:
             return False
         step_text = " ".join([
@@ -1570,6 +1839,27 @@ class FeedbackLoopAgent:
         if not any(marker in step_text for marker in ("raise", "raises", "exception", "error", "empty", "invalid")):
             return False
         return "[]" in code or "raise " in code or "sys.exit" in code
+
+    def _looks_like_plain_test_or_app_command(self, parts: list[str]) -> bool:
+        """Return True for commands likely meant to observe a residual failure.
+
+        Partial bug-fix steps sometimes need one command that must still fail
+        for a known reason, usually `unittest` or `pytest`. Syntax/build checks
+        in the same step, such as `compileall`, should remain ordinary success
+        validations. This distinction keeps the plan checker strict without
+        falsely rejecting valid setup/syntax commands.
+        """
+        if not parts:
+            return False
+        lowered = [str(part).lower() for part in parts]
+        joined = " ".join(lowered)
+        if "unittest" in lowered or "pytest" in lowered or "pytest" in joined:
+            return True
+        if any(part.startswith("test_") or part.startswith("tests/") for part in lowered):
+            return True
+        if lowered[0].endswith("python") and len(lowered) >= 3 and lowered[1] == "-m":
+            return lowered[2] not in {"compileall", "py_compile"}
+        return False
 
     def _step_expects_nonzero_validation(self, step: dict[str, Any]) -> bool:
         """Return True when a step deliberately expects a failing command.
@@ -1647,10 +1937,125 @@ class FeedbackLoopAgent:
         # accidentally match the UI marker and trigger browser-only guidance.
         return bool(
             re.search(
-                r"\b(browser|ui|web|map|click|drag|zoom|pan|render|screenshot|html|css|javascript)\b",
+                r"\b(browser|ui|web|map|click|drag|zoom|pan|render|screenshot|html|css|javascript|playwright|chromium|canvas|game)\b",
                 text,
             )
         )
+
+    def _execution_environment_payload(self) -> dict[str, Any]:
+        """Compact machine-readable environment facts for planning/review prompts."""
+        payload = {
+            "agent_runs_in_docker": self.config.runtime.docker_isolation,
+            "terminal_tools": self.config.mcp_tools.terminal,
+            "web_research": self.config.mcp_tools.web_scraping and self.config.web_research.enabled,
+            "web_interaction": self.config.mcp_tools.web_interaction,
+        }
+        if self.config.mcp_tools.web_interaction:
+            payload.update({
+                "browser_validation_stack": "Python Playwright with preinstalled Chromium",
+                "node_js_available_by_default": False,
+                "preferred_browser_validation": "Python script importing from playwright.sync_api import sync_playwright",
+                "dependency_install_policy": (
+                    "Python Playwright is only the default browser-validation path. If the user prompt or plan "
+                    "explicitly requires another stack, add a named dependency/setup step with bounded commands "
+                    "inside the Docker agent container instead of assuming the tools are already installed."
+                ),
+            })
+        return payload
+
+    def _execution_environment_guidance(self) -> str:
+        """Human-readable environment constraints injected before planning starts."""
+        if not self.config.mcp_tools.web_interaction:
+            return (
+                "EXECUTION_ENVIRONMENT:\n"
+                "Web/browser interaction is disabled. Do not promise browser or Playwright evidence unless a later "
+                "config enables it; use terminating command-line checks instead."
+            )
+        return (
+            "EXECUTION_ENVIRONMENT:\n"
+            "The agent runs inside a Docker container with Python, Python Playwright, and Chromium already installed. "
+            "The default container does not include Node.js, npm, npx, or @playwright/test. Requirements, assumptions, "
+            "plans, and validation commands should therefore prefer Python Playwright scripts using "
+            "`from playwright.sync_api import sync_playwright` for generic browser/UI validation. This is a default "
+            "preference, not a restriction on the user's technology choice: if the task explicitly requires another "
+            "runtime or SDK, add a separate dependency discovery/setup step with bounded commands inside the Docker "
+            "agent container, document what was installed, and validate the requested stack directly."
+        )
+
+    def _environment_assumption_findings(
+        self,
+        *,
+        requirements: dict[str, Any] | None = None,
+        plan: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
+        """Detect generated plans that contradict the known container toolchain."""
+        if not self.config.mcp_tools.web_interaction:
+            return []
+        findings: list[str] = []
+        text_parts: list[str] = [self.config.project_design.prompt.lower()]
+        if requirements:
+            text_parts.append(json.dumps(requirements, sort_keys=True).lower())
+        if plan:
+            text_parts.append(json.dumps(plan, sort_keys=True).lower())
+        text = "\n".join(text_parts)
+        explicit_setup = self._explicit_dependency_setup_is_present(text)
+        unsupported_patterns = [
+            (r"\bnpx\b", "npx"),
+            (r"\b@playwright/test\b", "@playwright/test"),
+            (r"\bnode(?:\.js)?\s+api\b", "Node.js Playwright API"),
+            (r"\bplaywright\b[^.\n]{0,80}\binstalled\s+via\s+npm\b", "Playwright installed via npm"),
+            (r"\bdependencies?\b[^.\n]{0,80}\bnode(?:\.js)?\b[^.\n]{0,80}\bplaywright\b", "Node.js as a browser-validation dependency"),
+        ]
+        for pattern, label in unsupported_patterns:
+            for match in re.finditer(pattern, text):
+                if self._unsupported_tooling_mention_is_negated(text, match.start(), match.end()):
+                    continue
+                if explicit_setup:
+                    continue
+                findings.append(
+                    f"Generated requirements/plan assume {label}, but the default agent Docker image provides "
+                    "Python Playwright with Chromium and no Node/npm/npx/@playwright/test. Either use Python "
+                    "Playwright for generic browser validation, or add an explicit bounded dependency/setup step "
+                    "inside the Docker agent container for the requested stack."
+                )
+                break
+        return list(dict.fromkeys(findings))
+
+    def _explicit_dependency_setup_is_present(self, text: str) -> bool:
+        """Return True when the task or plan explicitly accounts for missing tools."""
+        setup_markers = (
+            r"\bdependency\s+setup\b",
+            r"\bdependencies\s+setup\b",
+            r"\bsetup\s+step\b",
+            r"\btoolchain\s+setup\b",
+            r"\bruntime\s+setup\b",
+            r"\bsdk\s+setup\b",
+            r"\binstall(?:ing)?\b[^.\n]{0,120}\binside\s+(?:the\s+)?(?:docker|container|agent\s+container)\b",
+            r"\b(?:docker|container|agent\s+container)\b[^.\n]{0,120}\binstall(?:ing)?\b",
+            r"\bapt(?:-get)?\s+install\b",
+            r"\bdotnet-install\b",
+            r"\bcheck(?:s|ing)?\b[^.\n]{0,80}\b(?:if\s+)?(?:missing|available|installed)\b[^.\n]{0,120}\binstall\b",
+            r"\bbounded\b[^.\n]{0,120}\b(?:install|setup|toolchain|runtime|sdk)\b",
+        )
+        return any(re.search(pattern, text) for pattern in setup_markers)
+
+    def _unsupported_tooling_mention_is_negated(self, text: str, start: int, end: int) -> bool:
+        """Return True for phrases such as "no Node/npm/npx".
+
+        The environment guard should catch accidental Node tooling plans, not
+        punish the model for explicitly saying those tools are unavailable.
+        """
+        context = text[max(0, start - 100):min(len(text), end + 60)]
+        negated_patterns = (
+            r"\bno\b[^.\n]{0,90}\b(node|npm|npx|@playwright/test)\b",
+            r"\bwithout\b[^.\n]{0,90}\b(node|npm|npx|@playwright/test)\b",
+            r"\bavoid\b[^.\n]{0,90}\b(node|npm|npx|@playwright/test)\b",
+            r"\bdo not\b[^.\n]{0,90}\b(node|npm|npx|@playwright/test)\b",
+            r"\bmust not\b[^.\n]{0,90}\b(node|npm|npx|@playwright/test)\b",
+            r"\bnot\b[^.\n]{0,60}\bavailable\b[^.\n]{0,60}\b(node|npm|npx|@playwright/test)\b",
+            r"\b(node|npm|npx|@playwright/test)\b[^.\n]{0,60}\bnot\b[^.\n]{0,40}\bavailable\b",
+        )
+        return any(re.search(pattern, context) for pattern in negated_patterns)
 
     def _browser_validation_guidance(self) -> str:
         """Guidance for generated projects that need browser/UI validation."""
@@ -1662,15 +2067,17 @@ class FeedbackLoopAgent:
             )
         return (
             "BROWSER_VALIDATION_GUIDANCE:\n"
-            "The agent Docker image already includes Python Playwright and Chromium. Generated validation scripts "
-            "must not run `playwright install`, `apt install`, `npm install`, or `pip install`; those can hang and "
-            "pollute reproducibility. Unless the config explicitly says Node.js is available, assume there is no "
-            "`node`, `npm`, `npx`, or `@playwright/test` runner. Prefer a Python validation script that imports "
+            "The agent Docker image already includes Python Playwright and Chromium. Unless the config or project "
+            "requirements explicitly provide another stack, assume there is no `node`, `npm`, `npx`, or "
+            "`@playwright/test` runner. Prefer a Python validation script that imports "
             "`from playwright.sync_api import sync_playwright` and drives Chromium directly. Set bounded browser/page "
             "timeouts appropriate to the expected action (for example 10-15 seconds for simple page loads), always "
             "close browser contexts and local servers in finally blocks, "
             "and write clear evidence to a log/JSON file. If browser launch fails under those bounded timeouts, fall "
             "back to the most direct non-browser verification available and explicitly label that evidence as a fallback. "
+            "If the user prompt genuinely requires a different runtime, package manager, SDK, or browser stack, plan "
+            "that as a separate dependency/setup step with bounded commands inside the isolated Docker agent container; "
+            "do not hide package installation inside an unrelated validation script. "
             "For static HTML/CSS/JS, prefer simple canonical HTML5 files over clever patching; if markup is malformed, "
             "rewrite the complete affected file from one clean template and then stop changing it unless feedback "
             "points to a specific defect. Do not add custom tags, duplicate meta tags, or alternate attribute "
@@ -1980,19 +2387,30 @@ class FeedbackLoopAgent:
             accepted_commands = self._accepted_validation_commands_for_step(
                 step_result_by_id.get(str(step.get("id")), {})
             )
-            accepted_commands = [
-                command
-                for command in accepted_commands
-                if self._command_signature(command) not in {
-                    self._command_signature(existing)
-                    for existing in runnable_commands
-                }
-            ]
+            accepted_commands_run: list[Any] = []
+            accepted_commands_skipped: list[dict[str, Any]] = []
+            runnable_signatures = {
+                self._command_signature(existing)
+                for existing in runnable_commands
+            }
+            for command in accepted_commands:
+                if self._command_signature(command) in runnable_signatures:
+                    continue
+                if self._is_transient_expected_failure_validation(step, command):
+                    accepted_commands_skipped.append({
+                        "command": command,
+                        "reason": (
+                            "Skipped during final review because this accepted step command "
+                            "proved an intermediate expected failure that later steps should resolve."
+                        ),
+                    })
+                    continue
+                accepted_commands_run.append(command)
             accepted_results: list[dict[str, Any]] = []
-            if self.config.mcp_tools.terminal and accepted_commands:
+            if self.config.mcp_tools.terminal and accepted_commands_run:
                 accepted_results = run_commands(
                     self.workspace,
-                    accepted_commands,
+                    accepted_commands_run,
                     self.config.runtime.command_timeout_seconds,
                     self.config.runtime.max_command_timeout_seconds,
                     output_limit_chars=self.config.context_compaction.tool_output_max_chars,
@@ -2003,7 +2421,8 @@ class FeedbackLoopAgent:
                 "final_validation_commands_run": runnable_commands,
                 "final_validation_commands_skipped": skipped_commands,
                 "validation_results": results,
-                "accepted_validation_commands_run": accepted_commands,
+                "accepted_validation_commands_run": accepted_commands_run,
+                "accepted_validation_commands_skipped": accepted_commands_skipped,
                 "accepted_validation_results": accepted_results,
             })
         return {
@@ -2099,6 +2518,13 @@ class FeedbackLoopAgent:
         findings: list[str] = []
         implementation_commands = implementation.get("commands", [])
         feedback_results = (feedback_tool_evidence or {}).get("validation_results", [])
+        skipped_harness_files = implementation.get("skipped_harness_files", [])
+        if skipped_harness_files:
+            findings.append(
+                "Implementation attempted to overwrite harness-owned state files; these writes were blocked: "
+                + ", ".join(str(path) for path in skipped_harness_files)
+                + ". Please keep project deliverables in project files and use plan_note for progress."
+            )
         expected_validation = bool(step.get("validation_commands"))
         if expected_validation and not feedback_results:
             findings.append(f"{step.get('id', 'step')} has validation criteria but feedback tools produced no validation evidence.")
@@ -2131,7 +2557,12 @@ class FeedbackLoopAgent:
                     f"{result.get('expected_returncode', 0)}: {result.get('command')}"
                 )
         findings.extend(self._git_diff_findings(step, implementation, feedback_tool_evidence or {}))
-        findings.extend(self._workspace_reference_findings(feedback_tool_evidence or {}))
+        findings.extend(
+            self._workspace_reference_findings(
+                feedback_tool_evidence or {},
+                allow_planned_future_refs=True,
+            )
+        )
         return findings
 
     def _command_returncode_matches_expected(self, result: dict[str, Any]) -> bool:
@@ -2162,6 +2593,9 @@ class FeedbackLoopAgent:
             "python -c" in command_text
             and 'File "<string>"' in stderr
             and "SyntaxError" in stderr
+        ) or (
+            "python -m py_compile" in command_text
+            and "is a directory" in stderr.lower()
         )
 
     def _validation_result_integrity_findings(
@@ -2184,6 +2618,17 @@ class FeedbackLoopAgent:
             findings.append(
                 f"{evidence_label} command appears malformed (`python -mm`); request a plan change or corrected command "
                 f"before accepting {step.get('id', 'this step')}."
+            )
+        if (
+            len(command) >= 4
+            and command[0].endswith("python")
+            and command[1] == "-m"
+            and command[2] == "py_compile"
+            and "is a directory" in stderr.lower()
+        ):
+            findings.append(
+                f"{evidence_label} command uses `python -m py_compile` on a directory; request a plan change "
+                "to use `python -m compileall <dir>` or a generated validation script."
             )
         if "No module named m" in stderr and any(part == "-mm" for part in command):
             findings.append(
@@ -2271,7 +2716,12 @@ class FeedbackLoopAgent:
                 if result.get("timed_out") or not self._command_returncode_matches_expected(result):
                     findings.append(f"Step {step_id} final attempt has failing evidence: {result.get('command')}")
                 findings.extend(self._validation_result_integrity_findings({}, result, f"Step {step_id} final attempt"))
-        findings.extend(self._workspace_reference_findings(feedback_tool_evidence or {}))
+        findings.extend(
+            self._workspace_reference_findings(
+                feedback_tool_evidence or {},
+                allow_planned_future_refs=False,
+            )
+        )
         return findings
 
     def _skipped_step_is_superseded_by_final_evidence(
@@ -2330,13 +2780,23 @@ class FeedbackLoopAgent:
         )
         return any(marker in text for marker in stale_markers)
 
-    def _workspace_reference_findings(self, feedback_tool_evidence: dict[str, Any]) -> list[str]:
+    def _workspace_reference_findings(
+        self,
+        feedback_tool_evidence: dict[str, Any],
+        *,
+        allow_planned_future_refs: bool = True,
+    ) -> list[str]:
         """Find obvious broken local file references in generated Markdown docs.
 
         The feedback model sees file snapshots, but local models sometimes miss
         one-character path typos in documentation. This check is intentionally
         narrow: it only scans Markdown-like project files for slash-containing
         local paths and verifies those paths exist in the reviewer snapshot.
+
+        During per-step review, generated README/research notes often mention
+        artifacts scheduled for later steps. That is healthy planning, not a
+        broken link. The stricter final review disables the planned-reference
+        exception once all accepted steps should have produced their artifacts.
         """
         workspace_files = feedback_tool_evidence.get("workspace_files") or []
         existing_files = {str(item.get("path", "")) for item in workspace_files}
@@ -2350,9 +2810,13 @@ class FeedbackLoopAgent:
             "http://",
             "https://",
         )
+        harness_docs = {Path(name).as_posix() for name in self._harness_doc_names()}
+        planned_refs = self._planned_local_path_references() if allow_planned_future_refs else set()
         findings: list[str] = []
         for item in workspace_files:
             path = str(item.get("path") or "")
+            if path in harness_docs:
+                continue
             if not path.endswith((".md", ".markdown", ".txt")):
                 continue
             content = str(item.get("content") or "")
@@ -2360,6 +2824,22 @@ class FeedbackLoopAgent:
             for match in re.finditer(r"(?<![A-Za-z0-9+.-]://)(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+", content):
                 ref = match.group(0).strip("`'\"),.;:]}")
                 if not ref or ref.startswith(ignore_prefixes):
+                    continue
+                if match.start() > 0 and content[match.start() - 1] in {"$", "~"}:
+                    # Environment/home references such as $HOME/.dotnet are
+                    # explanatory text, not workspace artifact links.
+                    continue
+                if "://" in content[max(0, match.start() - 12):match.start() + 3]:
+                    # Avoid matching a suffix of an external URL, e.g. the
+                    # `ot.net/v1/...` tail inside `https://dot.net/v1/...`.
+                    continue
+                if ref.split("/", 1)[0].isdigit():
+                    # Avoid treating `localhost:8080/game/index.html` as a
+                    # local path beginning with the port number.
+                    continue
+                if "." in ref.split("/", 1)[0] and ref.split("/", 1)[0] not in existing_dirs:
+                    # Domain-looking references such as example.com/file are
+                    # external, not generated workspace paths.
                     continue
                 # Avoid treating prose pairs such as "syntax/import" or
                 # "line/logic" as paths. Most real artifact references here
@@ -2370,6 +2850,8 @@ class FeedbackLoopAgent:
                     continue
                 if ref in existing_files or ref in existing_dirs:
                     continue
+                if ref in planned_refs:
+                    continue
                 # Skip paths that are clearly external/package-ish rather than
                 # generated workspace artifacts.
                 if ref.startswith(("usr/", "var/", "tmp/", "workspace/")):
@@ -2378,6 +2860,25 @@ class FeedbackLoopAgent:
                     f"{path} references missing local path `{ref}`; correct the documentation or create the referenced artifact."
                 )
         return sorted(set(findings))
+
+    def _planned_local_path_references(self) -> set[str]:
+        """Return local path-looking references already present in the validated plan."""
+        text = json.dumps(self.plan_steps, sort_keys=True)
+        refs: set[str] = set()
+        for match in re.finditer(r"(?<![A-Za-z0-9+.-]://)(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+", text):
+            ref = match.group(0).strip("`'\"),.;:]}")
+            if not ref or ref.split("/", 1)[0].isdigit():
+                continue
+            if match.start() > 0 and text[match.start() - 1] in {"$", "~"}:
+                continue
+            if "://" in text[max(0, match.start() - 12):match.start() + 3]:
+                continue
+            if "." in ref.split("/", 1)[0]:
+                continue
+            if ref.startswith((".agent_state/", "http://", "https://", "usr/", "var/", "tmp/", "workspace/")):
+                continue
+            refs.add(ref)
+        return refs
 
     def _enforce_evidence_policy(
         self,
@@ -2388,7 +2889,12 @@ class FeedbackLoopAgent:
         if not evidence_findings:
             return review
         review = dict(review)
-        if any("Plan validation command appears" in item or "command appears malformed" in item for item in evidence_findings):
+        if any(
+            "Plan validation command appears" in item
+            or "command appears malformed" in item
+            or "request a plan change" in item
+            for item in evidence_findings
+        ):
             existing = [str(item) for item in review.get("required_changes", [])]
             review["status"] = "needs_plan_change"
             review["needs_rework"] = True

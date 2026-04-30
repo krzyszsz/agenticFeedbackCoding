@@ -12,6 +12,17 @@ __pycache__/
 *.pyc
 .pytest_cache/
 out/
+
+# Tool/dependency installs that may be created inside the disposable container
+$HOME/
+.dotnet/
+node_modules/
+.venv/
+venv/
+bin/
+obj/
+dist/
+build/
 """
 
 
@@ -23,6 +34,19 @@ HARNESS_ONLY_PATHS = {
     "RESEARCH.md",
     "AGENT_PLAN.md",
     "AGENT_REQUIREMENTS.md",
+}
+
+
+GENERATED_TOOL_PATHS = {
+    "$HOME",
+    ".dotnet",
+    "node_modules",
+    ".venv",
+    "venv",
+    "bin",
+    "obj",
+    "dist",
+    "build",
 }
 
 
@@ -50,6 +74,10 @@ def ensure_git_repo(workspace: Path, *, user_name: str, user_email: str) -> dict
         gitignore.write_text(DEFAULT_GITIGNORE, encoding="utf-8")
     results = [
         run_git(workspace, ["init"]),
+        # `safe.directory` is only honored from protected config scopes. The
+        # root-in-container path can have a host-owned mount point with a
+        # root-owned `.git` directory, so local repo config is not enough.
+        run_git(workspace, ["config", "--global", "--add", "safe.directory", str(workspace)]),
         run_git(workspace, ["config", "user.name", user_name]),
         run_git(workspace, ["config", "user.email", user_email]),
         run_git(workspace, ["config", "core.autocrlf", "false"]),
@@ -86,7 +114,7 @@ def meaningful_changed_paths(status_short: str) -> list[str]:
         if not path:
             continue
         root = path.split("/", 1)[0]
-        if path in HARNESS_ONLY_PATHS or root in HARNESS_ONLY_PATHS:
+        if path in HARNESS_ONLY_PATHS or root in HARNESS_ONLY_PATHS or root in GENERATED_TOOL_PATHS:
             continue
         changed.append(path)
     return changed
