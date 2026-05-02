@@ -20,6 +20,7 @@ class ModelConfig:
     retry_attempts: int
     retry_sleep_seconds: int
     request_heartbeat_seconds: int
+    preserve_reasoning: bool
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,7 @@ def _model(data: dict[str, Any], *, base_url_override: str | None = None) -> Mod
         retry_attempts=max(1, int(data.get("retry_attempts", 20))),
         retry_sleep_seconds=max(0, int(data.get("retry_sleep_seconds", 30))),
         request_heartbeat_seconds=max(0, int(data.get("request_heartbeat_seconds", 60))),
+        preserve_reasoning=bool(data.get("preserve_reasoning", True)),
     )
 
 

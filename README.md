@@ -85,7 +85,8 @@ The important fields are usually enough:
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
     "retry_sleep_seconds": 30,
-    "request_heartbeat_seconds": 60
+    "request_heartbeat_seconds": 60,
+    "preserve_reasoning": true
   },
   "feedback_model": null,
   "mcp_tools": {
@@ -200,10 +201,14 @@ MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
 ```
 
 By default this starts llama.cpp with `CTX_SIZE=76800`, `PARALLEL=1`,
-`MEM_LIMIT=75g`, `MEMORY_SWAP=75g`, `GPU_LAYERS=999`, and port `8161`.
+`MEM_LIMIT=75g`, `MEMORY_SWAP=75g`, `GPU_LAYERS=999`, reasoning enabled,
+`REASONING_BUDGET=512`, `REASONING_FORMAT=deepseek`, and port `8161`.
 It also creates/uses the `agentic-feedback-net` Docker network, names the
 server container `agentic-qwen36-server`, and publishes the API on the host at
 `127.0.0.1:8161` for quick checks.
+Override `REASONING_MODE=off`, `REASONING_BUDGET=...`, or
+`REASONING_FORMAT=none|deepseek|deepseek-legacy` if a model needs different
+thinking behavior.
 `PARALLEL=1` keeps one server slot instead of multiplying the long context
 across several idle slots. Override these values in the shell if you need a
 smaller context, more concurrent slots, or CPU fallback.
@@ -382,6 +387,11 @@ Each run creates or updates the configured workspace, usually under `workspaces/
 - `.agent_state/conversation.md` with the active model context in readable Markdown
 - `.agent_state/summary.json` with step results, review statuses, and feedback evidence
 
+When llama.cpp exposes thinking as `reasoning_content`, the client preserves it
+in those transcripts by default. Recent thinking stays in active chat context;
+older raw thinking is summarized during compaction so long runs keep useful
+decisions without filling the context window with every internal token.
+
 Generated workspaces, logs, reports, transcripts, and test evidence are ignored by git. They are useful locally, but they should not be published by accident.
 
 ## Configuration Knobs
@@ -398,6 +408,7 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 | `implementation_model.retry_attempts` | Model HTTP retry budget for temporary server/network failures. Retry progress is printed to stderr. | `20` |
 | `implementation_model.retry_sleep_seconds` | Delay between model HTTP retries. Use `0` only for tests. | `30` |
 | `implementation_model.request_heartbeat_seconds` | Prints a coarse “still waiting” line while a model response is in flight. Set `0` to disable it. | `60` |
+| `implementation_model.preserve_reasoning` | Preserves server-provided thinking/reasoning in the chat transcript as a `<think>...</think>` block before final content. Disable only if the extra context makes a model less stable. | `true` |
 | `feedback_model` | Optional separate reviewer model. `null` reuses the implementation model. | `null` or another model block |
 | `mcp_tools.terminal` | Allows command execution for implementation and reviewer validation. | `true` |
 | `mcp_tools.web_scraping` | Allows web research/scraping when a task asks for it. | `true` or `false` |

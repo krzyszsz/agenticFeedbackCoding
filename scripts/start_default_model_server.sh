@@ -23,8 +23,9 @@ MEM_RESERVATION="${MEM_RESERVATION:-67g}"
 OOM_SCORE_ADJ="${OOM_SCORE_ADJ:-500}"
 USE_DRI="${USE_DRI:-1}"
 LLAMA_DEVICE="${LLAMA_DEVICE:-Vulkan0}"
-REASONING_BUDGET="${REASONING_BUDGET:-0}"
-REASONING_FORMAT="${REASONING_FORMAT:-none}"
+REASONING_MODE="${REASONING_MODE:-on}"
+REASONING_BUDGET="${REASONING_BUDGET:-512}"
+REASONING_FORMAT="${REASONING_FORMAT:-deepseek}"
 
 if [ ! -f "$MODEL_PATH" ]; then
   echo "Missing model: $MODEL_PATH" >&2
@@ -32,7 +33,7 @@ if [ ! -f "$MODEL_PATH" ]; then
   exit 1
 fi
 
-EXTRA_ARGS="--jinja --reasoning-budget $REASONING_BUDGET --reasoning-format $REASONING_FORMAT --no-context-shift"
+EXTRA_ARGS="--jinja --reasoning $REASONING_MODE --reasoning-budget $REASONING_BUDGET --reasoning-format $REASONING_FORMAT --no-context-shift"
 if [ -f "$MMPROJ_PATH" ]; then
   EXTRA_ARGS="--mmproj $MMPROJ_PATH $EXTRA_ARGS"
 fi

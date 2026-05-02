@@ -135,7 +135,7 @@ class OpenAICompatClient:
             if body.get("error"):
                 raise RuntimeError(f"model returned error: {body['error']}")
             msg = body["choices"][0]["message"]
-            return str(msg.get("content") or msg.get("reasoning_content") or "")
+            return format_assistant_message(msg, preserve_reasoning=self.cfg.preserve_reasoning)
 
         def send_with_heartbeat() -> str:
             return ModelRequestHeartbeat(
@@ -146,3 +146,37 @@ class OpenAICompatClient:
             attempts=self.cfg.retry_attempts,
             sleep_seconds=self.cfg.retry_sleep_seconds,
         ).run(send_with_heartbeat)
+
+
+def format_assistant_message(msg: dict, *, preserve_reasoning: bool) -> str:
+    """Return assistant text while optionally preserving separate thinking.
+
+    llama.cpp can expose reasoning as `message.reasoning_content` when started
+    with `--reasoning-format deepseek`. The orchestration code still expects a
+    single text transcript, so thinking is represented as a normal `<think>`
+    block before the final content. This keeps later local-model turns aware of
+    the reasoning while leaving JSON extraction able to recover the final JSON
+    object from the same text.
+    """
+    content = str(msg.get("content") or "")
+    reasoning = _message_reasoning_content(msg)
+    if not preserve_reasoning:
+        return content or reasoning
+    if not reasoning:
+        return content
+    if content and "<think" in content.lower():
+        return content
+    reasoning_block = f"<think>\n{reasoning.strip()}\n</think>"
+    if content:
+        return f"{reasoning_block}\n{content}"
+    return reasoning_block
+
+
+def _message_reasoning_content(msg: dict) -> str:
+    """Handle the small field-name differences used by OpenAI-compatible servers."""
+    reasoning = msg.get("reasoning_content")
+    if reasoning is None:
+        reasoning = msg.get("reasoning")
+    if isinstance(reasoning, dict):
+        reasoning = reasoning.get("content") or reasoning.get("text")
+    return str(reasoning or "")

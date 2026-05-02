@@ -27,7 +27,7 @@ from feedback_agent.compaction import (
 from feedback_agent.config import load_config
 from feedback_agent.conversation import Conversation, Turn
 from feedback_agent.git_tools import meaningful_changed_paths
-from feedback_agent.llm import ModelRequestHeartbeat, ModelRequestRetrier
+from feedback_agent.llm import ModelRequestHeartbeat, ModelRequestRetrier, format_assistant_message
 from feedback_agent.workspace import collect_workspace_files, extract_json_object, run_commands, write_plan_doc
 
 
@@ -333,6 +333,43 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             retrier.run(lambda: (_ for _ in ()).throw(TimeoutError("slow model server")))
 
         self.assertIn("attempt 1/2", output.getvalue())
+
+    def test_reasoning_content_is_preserved_before_final_content(self) -> None:
+        text = format_assistant_message(
+            {
+                "reasoning_content": "Check requirements, then produce JSON.",
+                "content": "{\"status\":\"resolved\"}",
+            },
+            preserve_reasoning=True,
+        )
+
+        self.assertIn("<think>", text)
+        self.assertIn("Check requirements", text)
+        self.assertTrue(text.rstrip().endswith("{\"status\":\"resolved\"}"))
+        self.assertEqual(extract_json_object(text)["status"], "resolved")
+
+    def test_reasoning_content_can_be_suppressed(self) -> None:
+        text = format_assistant_message(
+            {
+                "reasoning_content": "private reasoning",
+                "content": "{\"status\":\"resolved\"}",
+            },
+            preserve_reasoning=False,
+        )
+
+        self.assertEqual(text, "{\"status\":\"resolved\"}")
+
+    def test_reasoning_content_is_not_duplicated_for_legacy_content(self) -> None:
+        text = format_assistant_message(
+            {
+                "reasoning_content": "already present",
+                "content": "<think>\nalready present\n</think>\n{\"status\":\"resolved\"}",
+            },
+            preserve_reasoning=True,
+        )
+
+        self.assertEqual(text.count("<think>"), 1)
+        self.assertEqual(extract_json_object(text)["status"], "resolved")
 
     def test_json_extractor_recovers_first_balanced_object_from_noisy_output(self) -> None:
         payload = extract_json_object(
