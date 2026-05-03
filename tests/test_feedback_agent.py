@@ -295,6 +295,30 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
         self.assertEqual(result, "ok")
         self.assertIn("still waiting for test-model", output.getvalue())
+        self.assertIn("health=not-configured", output.getvalue())
+
+    def test_model_request_heartbeat_reports_health_without_touching_transcript(self) -> None:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "conversation.jsonl"
+            conversation = Conversation(transcript)
+            conversation.append("user", "real model-facing prompt")
+
+            heartbeat = ModelRequestHeartbeat(
+                interval_seconds=0.05,
+                stream=output,
+                clock=time.monotonic,
+                health_check=lambda: "health=ok http=200",
+            )
+
+            result = heartbeat.run("test-model", lambda: time.sleep(0.12) or "ok")
+
+            self.assertEqual(result, "ok")
+            self.assertIn("health=ok http=200", output.getvalue())
+            saved = transcript.read_text(encoding="utf-8")
+            self.assertIn("real model-facing prompt", saved)
+            self.assertNotIn("model-call", saved)
+            self.assertNotIn("health=ok", saved)
 
     def test_latest_control_state_prefers_newer_feedback_over_stale_directive(self) -> None:
         turns = [

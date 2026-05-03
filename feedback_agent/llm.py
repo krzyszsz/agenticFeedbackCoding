@@ -68,7 +68,12 @@ class ModelRequestRetrier:
 
 
 class ModelRequestHeartbeat:
-    """Print coarse progress while one model request is still in flight."""
+    """Print terminal-only progress while one model request is still in flight.
+
+    These messages deliberately go to the human-facing stream only. They are
+    not appended to the shared conversation transcript, because heartbeat noise
+    would make later model turns worse rather than wiser.
+    """
 
     def __init__(
         self,
@@ -76,10 +81,12 @@ class ModelRequestHeartbeat:
         interval_seconds: float,
         stream: TextIO = sys.stderr,
         clock: Callable[[], float] = time.monotonic,
+        health_check: Callable[[], str] | None = None,
     ):
         self.interval_seconds = max(0, interval_seconds)
         self.stream = stream
         self.clock = clock
+        self.health_check = health_check
 
     def run(self, label: str, operation: Callable[[], str]) -> str:
         if self.interval_seconds <= 0:
@@ -91,8 +98,9 @@ class ModelRequestHeartbeat:
         def emit_progress() -> None:
             while not stop.wait(self.interval_seconds):
                 elapsed = int(self.clock() - start)
+                health = self._health_status()
                 print(
-                    f"[model-call] still waiting for {label}: {elapsed}s elapsed.",
+                    f"[model-call] still waiting for {label}: {elapsed}s elapsed; {health}.",
                     file=self.stream,
                     flush=True,
                 )
@@ -104,6 +112,14 @@ class ModelRequestHeartbeat:
         finally:
             stop.set()
             thread.join(timeout=0.2)
+
+    def _health_status(self) -> str:
+        if not self.health_check:
+            return "health=not-configured"
+        try:
+            return self.health_check()
+        except Exception as exc:  # pragma: no cover - defensive guard for user-facing progress only.
+            return f"health-check-error={_short_error(exc)}"
 
 
 class OpenAICompatClient:
@@ -140,12 +156,40 @@ class OpenAICompatClient:
         def send_with_heartbeat() -> str:
             return ModelRequestHeartbeat(
                 interval_seconds=self.cfg.request_heartbeat_seconds,
+                health_check=self.health_status,
             ).run(self.cfg.name, send_once)
 
         return ModelRequestRetrier(
             attempts=self.cfg.retry_attempts,
             sleep_seconds=self.cfg.retry_sleep_seconds,
         ).run(send_with_heartbeat)
+
+    def health_status(self) -> str:
+        """Probe the OpenAI-compatible REST endpoint for terminal progress.
+
+        The agent uses `/chat/completions` for real work. The heartbeat probes
+        `/models` because it is cheap, standard for OpenAI-compatible servers,
+        and does not disturb the in-flight generation request.
+        """
+        probe_timeout = 5
+        if self.cfg.request_timeout_seconds > 0:
+            probe_timeout = max(1, min(5, self.cfg.request_timeout_seconds))
+        req = urllib.request.Request(
+            f"{self.cfg.base_url}/models",
+            headers={"Authorization": f"Bearer {self.cfg.api_key}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=probe_timeout) as resp:
+                return f"health=ok http={getattr(resp, 'status', 'unknown')}"
+        except urllib.error.HTTPError as exc:
+            return f"health=http-{exc.code}"
+        except urllib.error.URLError as exc:
+            return f"health=unreachable {_short_error(exc.reason)}"
+        except TimeoutError as exc:
+            return f"health=timeout {_short_error(exc)}"
+        except OSError as exc:
+            return f"health=unreachable {_short_error(exc)}"
 
 
 def format_assistant_message(msg: dict, *, preserve_reasoning: bool) -> str:
@@ -180,3 +224,10 @@ def _message_reasoning_content(msg: dict) -> str:
     if isinstance(reasoning, dict):
         reasoning = reasoning.get("content") or reasoning.get("text")
     return str(reasoning or "")
+
+
+def _short_error(exc: object, *, limit: int = 120) -> str:
+    text = str(exc).replace("\n", " ").strip() or exc.__class__.__name__
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."

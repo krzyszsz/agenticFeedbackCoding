@@ -156,7 +156,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "request_timeout_seconds": 21_600,
         "retry_attempts": 20,
         "retry_sleep_seconds": 30,
-        "request_heartbeat_seconds": 60,
+        "request_heartbeat_seconds": 30,
         "preserve_reasoning": True,
     },
     "feedback_model": None,
@@ -261,7 +261,7 @@ def _model(data: dict[str, Any], *, base_url_override: str | None = None) -> Mod
         request_timeout_seconds=int(data.get("request_timeout_seconds", 21_600)),
         retry_attempts=max(1, int(data.get("retry_attempts", 20))),
         retry_sleep_seconds=max(0, int(data.get("retry_sleep_seconds", 30))),
-        request_heartbeat_seconds=max(0, int(data.get("request_heartbeat_seconds", 60))),
+        request_heartbeat_seconds=max(0, int(data.get("request_heartbeat_seconds", 30))),
         preserve_reasoning=bool(data.get("preserve_reasoning", True)),
     )
 

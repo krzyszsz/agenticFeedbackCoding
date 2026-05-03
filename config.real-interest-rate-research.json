@@ -10,7 +10,7 @@
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
     "retry_sleep_seconds": 30,
-    "request_heartbeat_seconds": 60,
+    "request_heartbeat_seconds": 30,
     "preserve_reasoning": true
   },
   "feedback_model": null,

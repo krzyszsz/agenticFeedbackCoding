@@ -63,7 +63,7 @@ bash scripts/build_and_run.sh --config config.real-palindrome.json
 
 That run starts the model server on the `agentic-feedback-net` Docker network, builds the agent container, mounts only the configured workspace, asks the local model to build the project, and stores the full transcript plus review evidence under `workspaces/real-palindrome/.agent_state/`.
 
-The live transcript is printed while the run is active, so a long job should visibly move through requirements, plan review, implementation attempts, and feedback. The final terminal output is compact by default; the full evidence is written under `.agent_state/`.
+The live transcript is printed while the run is active, so a long job should visibly move through requirements, plan review, implementation attempts, and feedback. While a model call is in flight, the terminal also prints a heartbeat with elapsed time and a lightweight REST health check. Those heartbeat lines are human-facing only; they are not written into the reusable agent transcripts under `.agent_state/`. The final terminal output is compact by default; the full evidence is written under `.agent_state/`.
 
 ## One Config File
 
@@ -86,7 +86,7 @@ The important fields are usually enough:
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
     "retry_sleep_seconds": 30,
-    "request_heartbeat_seconds": 60,
+    "request_heartbeat_seconds": 30,
     "preserve_reasoning": true
   },
   "feedback_model": null,
@@ -380,7 +380,15 @@ In the verified run, the reviewer first pushed back on vague investigation evide
 
 ## Terminal View
 
-When `runtime.print_transcript=true`, the implementation and feedback turns stream live so a long run shows progress instead of going silent. If stdout is a TTY and `runtime.color_transcript=true`, implementation turns use one color and feedback turns another; redirected logs stay plain text.
+When `runtime.print_transcript=true`, the implementation and feedback turns print live so a long run shows progress instead of going silent. If stdout is a TTY and `runtime.color_transcript=true`, implementation turns use one color and feedback turns another; redirected logs stay plain text.
+
+Long model calls also emit terminal-only heartbeat lines controlled by `implementation_model.request_heartbeat_seconds`, for example:
+
+```text
+[model-call] still waiting for qwen3.6-27b-q4km: 30s elapsed; health=ok http=200.
+```
+
+The heartbeat probes the model server's OpenAI-compatible `/models` endpoint. It is intentionally not appended to `conversation.jsonl` or `conversation.full.jsonl`, so it cannot pollute later context when a run is resumed or inspected by a model.
 
 ## Feedback Review Tools
 
@@ -480,7 +488,7 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 | `implementation_model.request_timeout_seconds` | HTTP timeout for one model response. This is separate from terminal command timeouts. | `21600` |
 | `implementation_model.retry_attempts` | Model HTTP retry budget for temporary server/network failures. Retry progress is printed to stderr. | `20` |
 | `implementation_model.retry_sleep_seconds` | Delay between model HTTP retries. Use `0` only for tests. | `30` |
-| `implementation_model.request_heartbeat_seconds` | Prints a coarse “still waiting” line while a model response is in flight. Set `0` to disable it. | `60` |
+| `implementation_model.request_heartbeat_seconds` | Prints terminal-only elapsed-time and model REST health lines while a model response is in flight. Set `0` to disable it. | `30` |
 | `implementation_model.preserve_reasoning` | Preserves server-provided thinking/reasoning in the chat transcript as a `<think>...</think>` block before final content. Disable only if the extra context makes a model less stable. | `true` |
 | `feedback_model` | Optional separate reviewer model. `null` reuses the implementation model. | `null` or another model block |
 | `mcp_tools.terminal` | Allows command execution for implementation and reviewer validation. | `true` |
