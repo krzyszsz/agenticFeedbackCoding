@@ -6,12 +6,45 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$PROJECT_DIR"
 
 CONFIG_PATH="$PROJECT_DIR/config.example.json"
+WORKSPACE_OVERRIDE=""
+CONTAINER_CLI_ARGS=()
+HOST_CLI_ARGS=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --config)
       CONFIG_PATH="$2"
+      CONTAINER_CLI_ARGS+=(--config /app/config.json)
       shift 2
+      ;;
+    --workspace)
+      WORKSPACE_OVERRIDE="$2"
+      # The host uses this path for the bind mount. Inside Docker the mounted
+      # workspace is always /workspace/project via AGENT_WORKSPACE, so forwarding
+      # the host-relative path would send the agent back into /app/workspaces.
+      HOST_CLI_ARGS+=(--workspace "$2")
+      shift 2
+      ;;
+    --title)
+      CONTAINER_CLI_ARGS+=(--title "$2")
+      HOST_CLI_ARGS+=(--title "$2")
+      shift 2
+      ;;
+    --prompt)
+      CONTAINER_CLI_ARGS+=(--prompt "$2")
+      HOST_CLI_ARGS+=(--prompt "$2")
+      shift 2
+      ;;
+    --prompt-file)
+      prompt_content="$(cat "$2")"
+      CONTAINER_CLI_ARGS+=(--prompt "$prompt_content")
+      HOST_CLI_ARGS+=(--prompt "$prompt_content")
+      shift 2
+      ;;
+    --offline)
+      CONTAINER_CLI_ARGS+=(--offline)
+      HOST_CLI_ARGS+=(--offline)
+      shift
       ;;
     -*)
       echo "Unknown argument: $1" >&2
@@ -29,51 +62,55 @@ while [ "$#" -gt 0 ]; do
 done
 
 CONFIG_ABS="$(realpath "$CONFIG_PATH")"
+if [ "${#CONTAINER_CLI_ARGS[@]}" -eq 0 ]; then
+  CONTAINER_CLI_ARGS=(--config /app/config.json)
+fi
 
-docker_enabled="$(python3 - "$CONFIG_ABS" "$REPO_ROOT" <<'PY'
-import json
-import pathlib
+config_field() {
+  local field="$1"
+  PYTHONPATH="$PROJECT_DIR" python3 - "$CONFIG_ABS" "$REPO_ROOT" "$WORKSPACE_OVERRIDE" "$field" <<'PY'
 import sys
-cfg = json.loads(pathlib.Path(sys.argv[1]).read_text())
-print("1" if cfg.get("runtime", {}).get("docker_isolation", True) else "0")
+from pathlib import Path
+from dataclasses import replace
+from feedback_agent.config import load_config
+
+cfg = load_config(sys.argv[1], repo_root=Path(sys.argv[2]))
+workspace_override = sys.argv[3]
+if workspace_override:
+    workspace = Path(workspace_override)
+    if not workspace.is_absolute():
+        workspace = (Path(sys.argv[2]) / workspace).resolve()
+    cfg = replace(cfg, runtime=replace(cfg.runtime, workspace=workspace))
+field = sys.argv[4]
+if field == "docker_enabled":
+    print("1" if cfg.runtime.docker_isolation else "0")
+elif field == "image":
+    print(cfg.runtime.docker_image)
+elif field == "workspace":
+    print(cfg.runtime.workspace)
+elif field == "docker_user":
+    print(cfg.runtime.docker_user)
+else:
+    raise SystemExit(f"unknown field: {field}")
 PY
-)"
+}
+
+docker_enabled="$(config_field docker_enabled)"
 
 if [ "$docker_enabled" = "1" ] && [ "${AGENT_IN_CONTAINER:-0}" != "1" ]; then
-  image="$(python3 - "$CONFIG_ABS" <<'PY'
-import json
-import pathlib
-import sys
-cfg = json.loads(pathlib.Path(sys.argv[1]).read_text())
-print(cfg.get("runtime", {}).get("docker_image", "agentic-feedback-coding:local"))
-PY
-)"
-  workspace="$(python3 - "$CONFIG_ABS" "$REPO_ROOT" <<'PY'
-import json
-import pathlib
-import sys
-cfg = json.loads(pathlib.Path(sys.argv[1]).read_text())
-repo = pathlib.Path(sys.argv[2])
-workspace = pathlib.Path(cfg["runtime"]["workspace"])
-if not workspace.is_absolute():
-    workspace = repo / workspace
-print(workspace.resolve())
-PY
-)"
-  docker_user="$(python3 - "$CONFIG_ABS" <<'PY'
-import json
-import pathlib
-import sys
-cfg = json.loads(pathlib.Path(sys.argv[1]).read_text())
-print(cfg.get("runtime", {}).get("docker_user", "host"))
-PY
-)"
+  image="${AGENT_IMAGE:-$(config_field image)}"
+  workspace="$(config_field workspace)"
+  docker_user="$(config_field docker_user)"
   mkdir -p "$workspace"
   docker_cmd=(docker)
   if ! docker info >/dev/null 2>&1; then
     docker_cmd=(sudo docker)
   fi
   if [ "${REBUILD_AGENT_IMAGE:-0}" = "1" ] || ! "${docker_cmd[@]}" image inspect "$image" >/dev/null 2>&1; then
+    if [ "${SKIP_AGENT_IMAGE_BUILD:-0}" = "1" ]; then
+      echo "Agent image not found locally and SKIP_AGENT_IMAGE_BUILD=1: $image" >&2
+      exit 2
+    fi
     echo "Building agent image: $image" >&2
     "${docker_cmd[@]}" build -t "$image" "$PROJECT_DIR"
   else
@@ -136,7 +173,7 @@ PY
     "${env_args[@]}" \
     -v "$workspace:/workspace/project" \
     -v "$CONFIG_ABS:/app/config.json:ro" \
-    "$image" --config /app/config.json
+    "$image" "${CONTAINER_CLI_ARGS[@]}"
   exit 0
 fi
 
@@ -152,4 +189,4 @@ ERROR
 fi
 
 cd "$REPO_ROOT"
-PYTHONPATH="$PROJECT_DIR" python3 -m feedback_agent.cli --config "$CONFIG_ABS"
+PYTHONPATH="$PROJECT_DIR" python3 -m feedback_agent.cli --config "$CONFIG_ABS" "${HOST_CLI_ARGS[@]}"

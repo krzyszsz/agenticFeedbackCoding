@@ -355,6 +355,65 @@ class FeedbackLoopAgent:
             self.config.runtime.requirements_file,
         )
 
+    def _workflow_state_for_prompt(self, current_step: dict[str, Any] | None = None) -> str:
+        """Return the small state bundle every later turn should remember.
+
+        The chat transcript is the main memory, but long runs compact older
+        turns. These workspace-owned state files are the durable control plane,
+        so implementation and feedback turns get a concise current snapshot
+        instead of relying on the summarizer to remember every plan detail.
+        """
+        status_lines = []
+        for step in self.plan_steps:
+            marker = "current" if current_step and step.get("id") == current_step.get("id") else "step"
+            status_lines.append(
+                f"- {marker} {step.get('id')}: {step.get('status', 'pending')} | {step.get('title', '')}"
+            )
+        if not status_lines:
+            status_lines.append("- no validated plan steps yet")
+        note_tail = self.plan_notes[-8:]
+        parts = [
+            f"Plan file: {self.config.runtime.plan_file}",
+            f"Requirements file: {self.config.runtime.requirements_file}",
+            f"Research file: {self.config.runtime.research_file}",
+            "Step status:",
+            *status_lines,
+            "Recent plan notes:",
+            *(f"- {note}" for note in note_tail),
+            "Requirements summary:",
+            self._requirements_summary_for_prompt(),
+            f"Web research status: {self.web_research_result.get('status', 'not_run')}",
+            "Plan file tail:",
+            self._safe_file_excerpt(self._plan_path(), 6000, tail=True),
+            "Requirements file tail:",
+            self._safe_file_excerpt(self._requirements_path(), 3000, tail=True),
+            "Research file tail:",
+            self._safe_file_excerpt(self._research_path(), 3000, tail=True),
+        ]
+        return "\n".join(parts)
+
+    def _workflow_memory_snapshot(self) -> str:
+        """Pinned memory appended to compaction output.
+
+        This is intentionally deterministic and generic: it carries current
+        requirements, ordered plan state, recent notes, and research status
+        without embedding any benchmark-specific solution.
+        """
+        return self._prompt_excerpt(self._workflow_state_for_prompt(), 18000)
+
+    def _safe_file_excerpt(self, path: Path, limit: int, *, tail: bool = False) -> str:
+        if not path.exists():
+            return "[missing]"
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"[unreadable: {exc}]"
+        if len(text) <= limit:
+            return text
+        if tail:
+            return f"[file head omitted: showing last {limit} chars]\n{text[-limit:]}"
+        return self._prompt_excerpt(text, limit)
+
     def initialize(self) -> None:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -404,6 +463,7 @@ class FeedbackLoopAgent:
             self.impl_client,
             context_window=self.config.implementation_model.context_window,
             incoming_tokens=estimate_tokens(content) + expected_response_tokens,
+            pinned_context=self._workflow_memory_snapshot(),
         )
         self.conversation.append("user", content)
         raw = self.impl_client.chat(self.conversation.messages(), max_tokens=max_tokens)
@@ -413,6 +473,7 @@ class FeedbackLoopAgent:
             self.config,
             self.impl_client,
             context_window=self.config.implementation_model.context_window,
+            pinned_context=self._workflow_memory_snapshot(),
         )
         return raw
 
@@ -433,6 +494,7 @@ class FeedbackLoopAgent:
             self.feedback_client,
             context_window=feedback_cfg.context_window,
             incoming_tokens=estimate_tokens(content) + response_tokens,
+            pinned_context=self._workflow_memory_snapshot(),
         )
         self.conversation.append("user", content)
         raw = self.feedback_client.chat(
@@ -449,6 +511,7 @@ class FeedbackLoopAgent:
             self.config,
             self.feedback_client,
             context_window=feedback_cfg.context_window,
+            pinned_context=self._workflow_memory_snapshot(),
         )
         return raw
 
@@ -476,6 +539,7 @@ class FeedbackLoopAgent:
             self.feedback_client,
             context_window=feedback_cfg.context_window,
             incoming_tokens=estimate_tokens(content) + response_tokens,
+            pinned_context=self._workflow_memory_snapshot(),
         )
         self.conversation.append("user", content)
         raw = self.feedback_client.chat(
@@ -493,6 +557,7 @@ class FeedbackLoopAgent:
             self.config,
             self.feedback_client,
             context_window=feedback_cfg.context_window,
+            pinned_context=self._workflow_memory_snapshot(),
         )
         return raw
 
@@ -528,7 +593,7 @@ class FeedbackLoopAgent:
         try:
             return extract_json_object(raw)
         except Exception as exc:
-            tail = raw[-3000:]
+            tail = self._repair_tail_for_prompt(raw)
             step_limit, limit_is_hard = self._configured_plan_step_limit()
             if step_limit and limit_is_hard:
                 step_limit_text = f" Keep plans to the hard limit of at most {step_limit} steps."
@@ -562,7 +627,7 @@ class FeedbackLoopAgent:
             else:
                 repaired = self._implementation_chat(
                     repair_prompt,
-                    max_tokens=max(self.config.implementation_model.max_tokens, 6144),
+                    max_tokens=max(2048, min(self.config.implementation_model.max_tokens, 6144)),
                 )
             try:
                 return extract_json_object(repaired)
@@ -584,6 +649,25 @@ class FeedbackLoopAgent:
                 )
                 repaired_minimal = self._implementation_chat(last_chance_prompt, max_tokens=4096)
                 return extract_json_object(repaired_minimal)
+
+    def _repair_tail_for_prompt(self, raw: str, limit: int = 1200) -> str:
+        """Return bounded recovery context for malformed model output.
+
+        Repair turns should help the model recover the intended JSON shape, not
+        replay a pathological response. Some local models occasionally end a
+        malformed turn with thousands of repeated tokens, so this keeps only a
+        small tail and collapses obvious word-level loops before adding it to
+        the next prompt.
+        """
+        tail = raw[-limit:]
+        tail = re.sub(r"(\b[\w.-]{4,}\b)(?:[\s_]+\1){5,}", r"\1 [repeated]", tail)
+        words: list[str] = []
+        for word in tail.split():
+            if len(word) > 260:
+                word = word[:160] + "[long-token-truncated]" + word[-60:]
+            words.append(word)
+        tail = " ".join(words)
+        return tail
 
     def _malformed_feedback_fallback(
         self,
@@ -1079,6 +1163,7 @@ class FeedbackLoopAgent:
             "should reduce risk, not generate new syntax variants.\n"
             f"Requirements summary: {self._requirements_summary_for_prompt()}\n"
             f"Validated plan step ids: {[step.get('id') for step in self.plan_steps]}\n"
+            f"Workflow state context:\n{self._workflow_state_for_prompt(step)}\n"
             f"Current step: {json.dumps(step)}\n\n{IMPLEMENTATION_CONTRACT}"
         )
         if self._looks_like_browser_step(step):
@@ -1522,6 +1607,30 @@ class FeedbackLoopAgent:
             "review_truncation_note": clamp_text(as_json, limit, marker="review transcript payload truncated"),
         }
 
+    def _compact_review_for_correction(self, review: dict[str, Any]) -> dict[str, Any]:
+        """Return only the review decision needed by the next correction turn.
+
+        Step/final review objects can contain large file snapshots, rerun output,
+        and git diffs. That evidence belongs in `summary.json` and the full
+        transcript, but feeding it back into the implementation model can turn a
+        simple final correction into a tens-of-thousands-token prompt. The
+        implementation side needs the verdict, concrete requested changes, and
+        deterministic guardrail findings; it does not need the full reviewer
+        evidence bundle again.
+        """
+        return {
+            key: self._clip_list_for_transcript(value) if isinstance(value, list) else value
+            for key, value in {
+                "status": review.get("status"),
+                "needs_rework": review.get("needs_rework"),
+                "summary": review.get("summary"),
+                "required_changes": review.get("required_changes", []),
+                "deterministic_evidence_findings": review.get("deterministic_evidence_findings", []),
+                "compromise_note": review.get("compromise_note"),
+            }.items()
+            if value not in (None, [], "")
+        }
+
     def _clip_list_for_transcript(self, values: Any) -> list[str]:
         if not isinstance(values, list):
             values = [values]
@@ -1537,7 +1646,7 @@ class FeedbackLoopAgent:
             "Include validation commands and test evidence.\n"
             f"Do not include harness-owned state files in the files payload: "
             f"{', '.join(sorted(self._harness_doc_names()))}. The harness creates and updates those files.\n"
-            f"Review: {json.dumps(self._compact_review_for_transcript(review))}\n\n{IMPLEMENTATION_CONTRACT}"
+            f"Review: {json.dumps(self._compact_review_for_correction(review))}\n\n{IMPLEMENTATION_CONTRACT}"
         )
         if any(self._looks_like_browser_step(step) for step in self.plan_steps):
             prompt += "\n" + self._browser_validation_guidance()
@@ -1713,9 +1822,10 @@ class FeedbackLoopAgent:
                     findings.append(
                         f"{step_id} uses manual_test metadata in validation_commands; replace it with an executable script/report command."
                     )
-                parts = [str(part).lower() for part in (command.get("cmd") or command.get("command") or [])]
+                raw_parts = [str(part) for part in (command.get("cmd") or command.get("command") or [])]
             else:
-                parts = [str(part).lower() for part in command]
+                raw_parts = [str(part) for part in command]
+            parts = [part.lower() for part in raw_parts]
             joined = " ".join(parts)
             if "python -m http.server" in joined or (
                 len(parts) >= 3 and parts[0].endswith("python") and parts[1] == "-m" and parts[2] == "http.server"
@@ -1726,6 +1836,15 @@ class FeedbackLoopAgent:
             if len(parts) >= 2 and parts[0].endswith("python") and parts[1] == "-mm":
                 findings.append(
                     f"{step_id} validation command uses malformed Python flag '-mm'; use '-m' or replace it with a validation script."
+                )
+            if len(raw_parts) >= 2 and raw_parts[0] == "test" and raw_parts[1] == "-F":
+                findings.append(
+                    f"{step_id} validation command uses malformed shell test flag '-F'; use '-f' for file existence."
+                )
+            if self._looks_like_malformed_grep_max_count(raw_parts):
+                findings.append(
+                    f"{step_id} validation command uses a malformed grep max-count flag; use `grep -q pattern file`, "
+                    "a numeric `grep -m <count> ...`, or replace it with a validation script."
                 )
             if self._looks_like_py_compile_directory_command(parts):
                 findings.append(
@@ -2619,6 +2738,16 @@ class FeedbackLoopAgent:
                 f"{evidence_label} command appears malformed (`python -mm`); request a plan change or corrected command "
                 f"before accepting {step.get('id', 'this step')}."
             )
+        if len(command) >= 2 and command[0] == "test" and command[1] == "-F":
+            findings.append(
+                f"{evidence_label} command appears malformed (`test -F`); request a plan change to use `test -f` "
+                f"before accepting {step.get('id', 'this step')}."
+            )
+        if self._looks_like_malformed_grep_max_count(command) or "grep: invalid max count" in stderr.lower():
+            findings.append(
+                f"{evidence_label} command appears malformed (`grep` max-count flag); request a plan change "
+                "to use `grep -q`, a numeric `grep -m <count>`, or a generated validation script."
+            )
         if (
             len(command) >= 4
             and command[0].endswith("python")
@@ -2636,6 +2765,29 @@ class FeedbackLoopAgent:
                 "do not treat this as valid expected-failure evidence."
             )
         return findings
+
+    def _looks_like_malformed_grep_max_count(self, command: list[str]) -> bool:
+        """Detect grep invocations where `-m` is accidentally glued to text.
+
+        `grep -m` requires a numeric count. Local models sometimes mutate a
+        simple `grep -q` check into values such as `grep -md`, which fails
+        before validating the workspace and therefore needs plan repair rather
+        than another implementation attempt.
+        """
+        if not command:
+            return False
+        executable = Path(str(command[0])).name
+        if executable != "grep":
+            return False
+        for index, part in enumerate(str(item) for item in command[1:]):
+            if part == "-m":
+                next_index = index + 2
+                return next_index >= len(command) or not str(command[next_index]).isdigit()
+            if part.startswith("--max-count="):
+                return not part.removeprefix("--max-count=").isdigit()
+            if part.startswith("-m") and part != "-m":
+                return not part[2:].isdigit()
+        return False
 
     def _looks_like_unwrapped_expected_failure_result(self, step: dict[str, Any], result: dict[str, Any]) -> bool:
         """Identify reviewer failures caused by a bad plan, not bad code."""

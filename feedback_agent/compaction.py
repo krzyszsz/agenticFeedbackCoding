@@ -13,6 +13,7 @@ def maybe_compact(
     *,
     context_window: int | None = None,
     incoming_tokens: int = 0,
+    pinned_context: str | None = None,
     force: bool = False,
 ) -> bool:
     cfg = config.context_compaction
@@ -46,6 +47,8 @@ def maybe_compact(
     control_state = latest_control_state(conversation.turns)
     if control_state:
         cleaned = f"{cleaned}\n\n{control_state}"
+    if pinned_context:
+        cleaned = f"{cleaned}\n\nPINNED_WORKFLOW_STATE:\n{pinned_context}"
     conversation.replace_with_memory(cleaned, cfg.keep_recent_turns)
     return True
 

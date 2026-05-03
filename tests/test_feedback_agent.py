@@ -28,7 +28,8 @@ from feedback_agent.config import load_config
 from feedback_agent.conversation import Conversation, Turn
 from feedback_agent.git_tools import meaningful_changed_paths
 from feedback_agent.llm import ModelRequestHeartbeat, ModelRequestRetrier, format_assistant_message
-from feedback_agent.workspace import collect_workspace_files, extract_json_object, run_commands, write_plan_doc
+from feedback_agent.web_research import compact_research_for_prompt, fetch_page, search_queries_for_prompt
+from feedback_agent.workspace import collect_workspace_files, extract_json_object, run_commands, write_files, write_plan_doc
 
 
 class QuietHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
@@ -381,6 +382,17 @@ class FeedbackLoopAgentTests(unittest.TestCase):
         self.assertEqual(payload["status"], "resolved")
         self.assertFalse(payload["needs_rework"])
 
+    def test_json_extractor_ignores_incomplete_json_inside_think_block(self) -> None:
+        payload = extract_json_object(
+            "<think>\n"
+            "I should return {\"status\":\"resolved\", \"needs\n"
+            "</think>\n"
+            "{\"status\":\"resolved\",\"needs_rework\":false}"
+        )
+
+        self.assertEqual(payload["status"], "resolved")
+        self.assertFalse(payload["needs_rework"])
+
     def test_json_extractor_uses_last_corrected_object(self) -> None:
         payload = extract_json_object(
             "```json\n{\"status\":\"needs_rework\",\"summary\":\"first\"}\n```\n"
@@ -577,6 +589,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                 bad_compactor,
                 context_window=100,
                 incoming_tokens=1000,
+                pinned_context="Pinned plan: S1 still pending; requirements and research remain authoritative.",
                 force=True,
             )
 
@@ -586,6 +599,8 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("needs_rework=true", active_text)
             self.assertIn("step_id=S1 attempt=3", active_text)
             self.assertIn("overrides any older compacted prose", active_text)
+            self.assertIn("PINNED_WORKFLOW_STATE", active_text)
+            self.assertIn("S1 still pending", active_text)
 
     def test_live_echo_can_be_bounded_without_truncating_saved_transcripts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -610,6 +625,25 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             cfg = load_config(cfg_path)
 
             self.assertEqual(cfg.runtime.workspace, workspace.resolve())
+
+    def test_load_config_accepts_minimal_project_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_path = root / "minimal.json"
+            cfg_path.write_text(json.dumps({
+                "runtime": {"workspace": "out/minimal"},
+                "project_design": {
+                    "title": "Minimal",
+                    "prompt": "Build a tiny checked project.",
+                },
+            }), encoding="utf-8")
+
+            cfg = load_config(cfg_path, repo_root=root)
+
+            self.assertEqual(cfg.runtime.workspace, (root / "out/minimal").resolve())
+            self.assertEqual(cfg.project_design.title, "Minimal")
+            self.assertEqual(cfg.implementation_model.max_tokens, 32768)
+            self.assertTrue(cfg.runtime.docker_isolation)
 
     def test_load_config_can_override_model_base_urls_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1630,6 +1664,44 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertLess(len(encoded), agent.config.context_compaction.transcript_review_max_chars)
             self.assertNotIn("x" * 5000, encoded)
 
+    def test_correction_payload_omits_large_review_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            review = {
+                "status": "needs_rework",
+                "needs_rework": True,
+                "summary": "Final review found two concrete issues.",
+                "required_changes": ["Fix A", "Fix B"],
+                "deterministic_evidence_findings": ["Guardrail C"],
+                "feedback_tool_evidence": {
+                    "kind": "final_feedback_tools",
+                    "workspace_files": [{"path": "huge.txt", "content": "x" * 100000, "size": 100000}],
+                    "step_validations": [{
+                        "step_id": "S1",
+                        "validation_results": [{
+                            "command": ["python", "check.py"],
+                            "stdout": "y" * 100000,
+                            "stderr": "z" * 100000,
+                        }],
+                    }],
+                    "git": {"diff": "d" * 100000},
+                },
+            }
+
+            compact = agent._compact_review_for_correction(review)
+            encoded = json.dumps(compact)
+
+            self.assertEqual(compact["required_changes"], ["Fix A", "Fix B"])
+            self.assertEqual(compact["deterministic_evidence_findings"], ["Guardrail C"])
+            self.assertNotIn("feedback_tool_evidence", compact)
+            self.assertNotIn("feedback_tool_evidence_summary", compact)
+            self.assertNotIn("review_truncation_note", compact)
+            self.assertNotIn("x" * 5000, encoded)
+            self.assertLess(len(encoded), 3000)
+
     def test_feedback_review_routes_malformed_validation_command_to_plan_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1797,6 +1869,122 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(payload["files"], [])
             self.assertEqual(payload["commands"], [])
             self.assertIn("parse_error", payload)
+
+    def test_malformed_implementation_repair_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                implementation_responses=[
+                    json.dumps({"files": [], "commands": [], "resolution_request": "none"})
+                ],
+            )
+            agent.initialize()
+
+            raw = "not json " + ("as_noted_in_the_enoughs_" * 2000)
+            payload = agent._extract_json_or_retry(
+                raw,
+                phase="IMPLEMENTATION_PHASE",
+                contract='{"files":[],"commands":[]}',
+            )
+
+            self.assertEqual(payload["files"], [])
+            self.assertLessEqual(agent.impl_client.calls[-1]["max_tokens"], 6144)
+            repair_prompt = agent.impl_client.calls[-1]["messages"][-1]["content"]
+            self.assertLess(len(repair_prompt), 5000)
+            self.assertIn("[long-token-truncated]", repair_prompt)
+
+    def test_plan_review_rejects_malformed_shell_test_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create file",
+                    "description": "Create output.txt.",
+                    "acceptance_criteria": ["output.txt exists"],
+                    "validation_commands": [["test", "-F", "output.txt"]],
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertIn("malformed shell test flag '-F'", "\n".join(findings))
+
+    def test_plan_review_rejects_malformed_grep_max_count_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Check heading",
+                    "description": "Check a markdown heading exists.",
+                    "acceptance_criteria": ["README.md has the heading"],
+                    "validation_commands": [["grep", "-md", "# Heading", "README.md"]],
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertIn("malformed grep max-count flag", "\n".join(findings))
+
+    def test_feedback_review_routes_malformed_grep_validation_to_plan_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Malformed grep validation")
+            step = {
+                "id": "S1",
+                "title": "Write analysis",
+                "description": "Write a markdown analysis file.",
+                "depends_on": [],
+                "acceptance_criteria": ["ANALYSIS.md contains a Long-term section"],
+                "validation_commands": [["grep", "-md", "# Long-term", "ANALYSIS.md"]],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            (workspace / "ANALYSIS.md").write_text("# Long-term\n", encoding="utf-8")
+
+            review = agent._step_review_pass(
+                step,
+                1,
+                {"written": ["ANALYSIS.md"], "commands": [], "raw": {"test_evidence": ["analysis exists"]}},
+                "hard_pushback",
+            )
+
+            self.assertEqual(review["status"], "needs_plan_change")
+            required = "\n".join(review["required_changes"])
+            self.assertIn("grep", required)
+            self.assertIn("max-count", required)
+
+    def test_write_files_serializes_structured_json_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+
+            written = write_files(
+                workspace,
+                [
+                    {
+                        "path": "SOURCES.json",
+                        "content": [{"url": "https://example.com", "title": "Example"}],
+                    }
+                ],
+            )
+
+            self.assertEqual(written, ["SOURCES.json"])
+            payload = json.loads((workspace / "SOURCES.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload[0]["url"], "https://example.com")
 
     def test_git_diff_gate_rejects_no_change_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2198,6 +2386,42 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn(url, research_doc)
             self.assertIn("CITATION_MARKER_ALPHA", research_doc)
             self.assertIn("WEB_RESEARCH_TOOL_RESULT", transcript)
+
+    def test_web_research_builds_focused_queries_from_long_prompt(self) -> None:
+        prompt = (
+            "Use web research to review current economic and central-bank news as of 2026-05-02, "
+            "then write a concise but deep analysis of how the news may affect interest rates. "
+            "The output project must include ANALYSIS.md, SOURCES.json, a validation script, "
+            "README instructions, and strict source citation checks."
+        )
+
+        queries = search_queries_for_prompt(prompt)
+
+        self.assertGreaterEqual(len(queries), 2)
+        self.assertLessEqual(max(len(query) for query in queries), 240)
+        combined = " ".join(queries).lower()
+        self.assertIn("central-bank", combined)
+        self.assertIn("interest", combined)
+        self.assertNotIn("validation script", queries[0].lower())
+        self.assertNotIn("federal reserve interest rates may 2026 news inflation jobs", combined)
+
+    def test_web_research_does_not_put_pdf_binary_in_prompt_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            site = root / "site"
+            site.mkdir()
+            (site / "report.pdf").write_bytes(b"%PDF-1.7\n" + bytes(range(32)) * 200)
+            cfg = load_config(write_config(root, root / "workspace", "pdf research", "Research a PDF."), repo_root=root).web_research
+
+            with local_http_server(site) as base_url:
+                result = fetch_page(f"{base_url}/report.pdf", cfg)
+
+            self.assertEqual(result["status"], "error")
+            self.assertIn("Unsupported non-text content type", result["error"])
+            self.assertEqual(result["excerpt"], "")
+            compact = compact_research_for_prompt({"status": "failed", "requested": True, "targets": [result]})
+            self.assertNotIn("%PDF", compact)
+            self.assertNotIn("\\ufffd", compact)
 
     def test_research_usage_gate_rejects_ignored_source_url(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

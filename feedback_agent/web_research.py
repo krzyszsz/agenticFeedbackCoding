@@ -12,6 +12,8 @@ import urllib.request
 from .config import WebResearchConfig
 
 URL_RE = re.compile(r"https?://[^\s)\]}>\"']+")
+WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'./+-]{1,}")
+FILENAME_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(?:md|txt|json|csv|tsv|py|js|html|css|xml|yaml|yml)$", re.I)
 EXPLICIT_RESEARCH_MARKERS = [
     "search the web",
     "research the web",
@@ -27,6 +29,59 @@ EXPLICIT_RESEARCH_MARKERS = [
     "official docs",
     "docs for",
 ]
+SEARCH_STOPWORDS = {
+    "about",
+    "after",
+    "analysis",
+    "available",
+    "benchmark",
+    "build",
+    "capture",
+    "checks",
+    "cite",
+    "clear",
+    "code",
+    "concise",
+    "current",
+    "deliverable",
+    "deliverables",
+    "documented",
+    "documentation",
+    "explaining",
+    "facts",
+    "fetched",
+    "file",
+    "files",
+    "focus",
+    "include",
+    "includes",
+    "instructions",
+    "invent",
+    "long",
+    "maintain",
+    "medium",
+    "must",
+    "output",
+    "project",
+    "report",
+    "research",
+    "review",
+    "script",
+    "separate",
+    "sourced",
+    "short",
+    "source",
+    "sources",
+    "summary",
+    "term",
+    "validation",
+    "with",
+    "write",
+    "all",
+    "not",
+    "use",
+    "web",
+}
 
 
 class TextExtractor(HTMLParser):
@@ -93,9 +148,53 @@ def _request(url: str, cfg: WebResearchConfig) -> bytes:
         return response.read(cfg.max_page_bytes)
 
 
+def _request_with_content_type(url: str, cfg: WebResearchConfig) -> tuple[bytes, str]:
+    req = urllib.request.Request(url, headers={"User-Agent": cfg.user_agent})
+    with urllib.request.urlopen(req, timeout=cfg.timeout_seconds) as response:
+        content_type = response.headers.get_content_type() if response.headers else ""
+        return response.read(cfg.max_page_bytes), content_type
+
+
+def _looks_like_text_content(raw: bytes, content_type: str) -> bool:
+    """Return whether a fetched response is safe to decode into prompt text."""
+    normalized = content_type.lower()
+    if normalized.startswith("text/") or normalized in {
+        "application/json",
+        "application/ld+json",
+        "application/xml",
+        "application/xhtml+xml",
+        "application/rss+xml",
+        "application/atom+xml",
+    }:
+        return True
+    if normalized and normalized not in {"application/octet-stream", "binary/octet-stream"}:
+        return False
+    if raw.startswith(b"%PDF"):
+        return False
+    sample = raw[:4096]
+    if not sample:
+        return True
+    control_bytes = sum(1 for byte in sample if byte < 32 and byte not in (9, 10, 13))
+    replacement_chars = raw[:4096].decode("utf-8", errors="replace").count("\ufffd")
+    return control_bytes / max(len(sample), 1) < 0.08 and replacement_chars < 20
+
+
 def fetch_page(url: str, cfg: WebResearchConfig) -> dict[str, Any]:
     try:
-        raw = _request(url, cfg)
+        raw, content_type = _request_with_content_type(url, cfg)
+        if not _looks_like_text_content(raw, content_type):
+            return {
+                "url": url,
+                "status": "error",
+                "title": url,
+                "excerpt": "",
+                "error": (
+                    f"Unsupported non-text content type {content_type or 'unknown'}; "
+                    "URL was fetched but no prompt-safe text excerpt was extracted."
+                ),
+                "content_type": content_type,
+                "bytes_read": len(raw),
+            }
         parser = TextExtractor()
         parser.feed(raw.decode("utf-8", errors="replace"))
         text = parser.text
@@ -104,6 +203,7 @@ def fetch_page(url: str, cfg: WebResearchConfig) -> dict[str, Any]:
             "status": "ok",
             "title": parser.title or url,
             "excerpt": text[: cfg.excerpt_chars],
+            "content_type": content_type,
             "bytes_read": len(raw),
         }
     except (urllib.error.URLError, TimeoutError, OSError, UnicodeError) as exc:
@@ -143,6 +243,78 @@ def search_web(query: str, cfg: WebResearchConfig) -> list[str]:
     return links
 
 
+def search_queries_for_prompt(prompt: str) -> list[str]:
+    """Create focused search queries from a project prompt.
+
+    Project prompts often mix the topic with deliverable instructions. Sending
+    the first few hundred characters verbatim to a search engine can produce no
+    useful results, so this function keeps topic-bearing words and phrase-like
+    fragments without adding any workload-specific recipes. Example benchmarks
+    must not leak into this generic search helper.
+    """
+    compact_prompt = " ".join(prompt.split())
+    queries: list[str] = []
+
+    def filename_token_count(text: str) -> int:
+        return sum(1 for token in WORD_RE.findall(text) if FILENAME_TOKEN_RE.match(token.strip(".,:;()[]{}\"'")))
+
+    if len(compact_prompt) <= 240 and filename_token_count(compact_prompt) < 2:
+        queries.append(compact_prompt)
+
+    sentences = [
+        sentence.strip(" -:;,.")
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", compact_prompt)
+        if sentence.strip()
+    ]
+    scored_sentences: list[tuple[int, str]] = []
+    for sentence in sentences:
+        # Sentences that mostly list desired artifacts (README.md,
+        # SOURCES.json, validate.py, etc.) describe the output contract, not
+        # the external topic to research. Skipping them keeps the helper
+        # generic without baking in any benchmark-specific query text.
+        if filename_token_count(sentence) >= 2:
+            continue
+        words = [
+            word.strip(".,:;()[]{}\"'").lower()
+            for word in WORD_RE.findall(sentence)
+        ]
+        topical = [
+            word for word in words
+            if len(word) >= 3 and word not in SEARCH_STOPWORDS
+        ]
+        if topical:
+            scored_sentences.append((len(topical), sentence))
+    for _, sentence in sorted(scored_sentences, key=lambda item: item[0], reverse=True)[:2]:
+        if len(sentence) <= 240:
+            queries.append(sentence)
+
+    terms: list[str] = []
+    for word in WORD_RE.findall(compact_prompt):
+        stripped = word.strip(".,:;()[]{}\"'")
+        normalized = stripped.lower()
+        if FILENAME_TOKEN_RE.match(stripped):
+            continue
+        if len(normalized) < 3 or normalized in SEARCH_STOPWORDS:
+            continue
+        # Preserve recognisable acronyms/proper nouns in the query text while
+        # deduplicating case-insensitively.
+        if normalized not in {item.lower() for item in terms}:
+            terms.append(stripped)
+        if len(terms) >= 24:
+            break
+    if terms:
+        queries.append(" ".join(terms[:12]))
+        if len(terms) > 12:
+            queries.append(" ".join(terms))
+
+    deduped: list[str] = []
+    for query in queries:
+        query = query[:240].strip()
+        if query and query not in deduped:
+            deduped.append(query)
+    return deduped or [compact_prompt[:240]]
+
+
 def run_web_research(prompt: str, cfg: WebResearchConfig) -> dict[str, Any]:
     if not cfg.enabled:
         return {
@@ -164,11 +336,21 @@ def run_web_research(prompt: str, cfg: WebResearchConfig) -> dict[str, Any]:
     urls = extract_urls(prompt)
     search_errors: list[str] = []
     if not urls:
-        for item in search_web(prompt[:500], cfg):
-            if item.startswith("ERROR:"):
-                search_errors.append(item[6:])
-                continue
-            urls.append(item)
+        queries = search_queries_for_prompt(prompt)
+        max_per_query = max(1, (cfg.max_pages + max(len(queries), 1) - 1) // max(len(queries), 1))
+        for query in queries:
+            added_for_query = 0
+            for item in search_web(query, cfg):
+                if item.startswith("ERROR:"):
+                    search_errors.append(item[6:])
+                    continue
+                if item not in urls:
+                    urls.append(item)
+                    added_for_query += 1
+                if len(urls) >= cfg.max_pages:
+                    break
+                if added_for_query >= max_per_query:
+                    break
             if len(urls) >= cfg.max_pages:
                 break
 

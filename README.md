@@ -53,7 +53,8 @@ flowchart LR
 Clone the repo, start the local model server, then run a real benchmark through Docker:
 
 ```bash
-# Ubuntu first-time setup: after `cd agenticFeedbackCoding`, run `bash scripts/bootstrap_ubuntu.sh` for Docker/Python dependencies (curl gnupg git jq python3 docker and others) if needed.
+# Ubuntu host prerequisites if you do not already have them:
+# sudo apt-get update && sudo apt-get install -y git docker.io python3 curl ca-certificates
 git clone https://github.com/krzyszsz/agenticFeedbackCoding.git
 cd agenticFeedbackCoding
 MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
@@ -116,6 +117,19 @@ The important fields are usually enough:
 }
 ```
 
+For a very small config, start from `config.minimal.json` or override the prompt
+and workspace from the command line:
+
+```bash
+bash scripts/build_and_run.sh \
+  --config config.minimal.json \
+  --workspace workspaces/my-project \
+  --prompt "Build a small Python CLI with tests and a README."
+```
+
+For longer prompts, keep the prompt in the JSON file. The command-line override
+is a convenience, not a replacement for versioned task configs.
+
 `command_timeout_seconds` is only the default timeout for one terminal command. It is not the model response timeout. If a generated test or build step needs longer, the agent can request it per command:
 
 ```json
@@ -166,17 +180,29 @@ git clone https://github.com/krzyszsz/agenticFeedbackCoding.git
 cd agenticFeedbackCoding
 ```
 
-Install host dependencies, Docker, Python requirements, Ubuntu/Mesa Vulkan packages, and build the agent container image:
+The normal Docker-isolated path needs only a small host toolchain: git to clone
+the repo, Docker to run the model/agent containers, Python 3 for the wrapper
+scripts, and curl for model-server readiness checks.
 
 ```bash
-bash scripts/bootstrap_ubuntu.sh
+sudo apt-get update
+sudo apt-get install -y git docker.io python3 curl ca-certificates
+sudo usermod -aG docker "$USER"   # log out/in afterwards, or use sudo docker
 ```
 
-For the tested Qwen3.6 profile, download/build the default model tooling:
+The agent runtime dependencies live inside the agent Docker image. You do not
+need to install Playwright, pytest, Python packages, or project-specific SDKs on
+the host for normal use.
+
+For the tested Qwen3.6 profile, download the model if needed and build/start
+the llama.cpp/Vulkan model-server image:
 
 ```bash
 HF_TOKEN_FILE=$HOME/hf.key MODEL_ROOT=$HOME/hf/models \
-  bash scripts/bootstrap_ubuntu.sh --download-model --build-llama-vulkan
+bash scripts/download_default_model.sh
+
+MODEL_ROOT=$HOME/hf/models REBUILD_SERVER_IMAGE=1 \
+bash scripts/start_default_model_server.sh
 ```
 
 `hf.key` is a plain text Hugging Face token outside this repo. Create it only if you need authenticated Hugging Face access:
@@ -202,7 +228,7 @@ MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
 
 By default this starts llama.cpp with `CTX_SIZE=76800`, `PARALLEL=1`,
 `MEM_LIMIT=75g`, `MEMORY_SWAP=75g`, `GPU_LAYERS=999`, reasoning enabled,
-`REASONING_BUDGET=512`, `REASONING_FORMAT=deepseek`, and port `8161`.
+`REASONING_BUDGET=1024`, `REASONING_FORMAT=deepseek`, and port `8161`.
 It also creates/uses the `agentic-feedback-net` Docker network, names the
 server container `agentic-qwen36-server`, and publishes the API on the host at
 `127.0.0.1:8161` for quick checks.
@@ -217,6 +243,47 @@ server image build after changing `docker/llama-cpp-run.sh` or its Dockerfile.
 The agent runner similarly reuses `agentic-feedback-coding:local` after the
 first build; set `REBUILD_AGENT_IMAGE=1` after changing the harness Dockerfile
 or Python code copied into that image.
+
+If you already have a prebuilt agent image, run without rebuilding it:
+
+```bash
+docker pull ghcr.io/krzyszsz/agentic-feedback-coding:latest
+AGENT_IMAGE=ghcr.io/krzyszsz/agentic-feedback-coding:latest \
+SKIP_AGENT_IMAGE_BUILD=1 \
+bash scripts/build_and_run.sh --config config.minimal.json --prompt "Build a tiny checked project."
+```
+
+Model serving is intentionally separate from the agent image. You can use the
+provided llama.cpp/Vulkan container, another machine on your LAN, or any
+OpenAI-compatible cloud/local endpoint by setting `implementation_model.base_url`
+or `AGENT_IMPLEMENTATION_BASE_URL`.
+
+If you do not want to clone the repo at all, the prebuilt-agent path only needs
+a config file and an output directory. The config may be minimal because the
+harness has defaults for all other knobs:
+
+```bash
+mkdir -p agent-output
+cat > config.json <<'JSON'
+{
+  "runtime": {"workspace": "/workspace/project"},
+  "project_design": {
+    "title": "Tiny checked project",
+    "prompt": "Build a tiny Python CLI with tests and a README."
+  }
+}
+JSON
+
+docker run --rm --network agentic-feedback-net \
+  -e AGENT_IMPLEMENTATION_BASE_URL=http://agentic-qwen36-server:8161/v1 \
+  -e AGENT_WORKSPACE=/workspace/project \
+  -v "$PWD/agent-output:/workspace/project" \
+  -v "$PWD/config.json:/app/config.json:ro" \
+  ghcr.io/krzyszsz/agentic-feedback-coding:latest --config /app/config.json
+```
+
+That simplified path assumes the model endpoint already exists. Setting up the
+model server remains hardware-specific, especially for GPU/Vulkan/driver paths.
 
 The checked-in configs keep a host-friendly endpoint:
 
@@ -248,7 +315,7 @@ want the older host-network behavior.
 
 The validated local path for this project is Vulkan, not ROCm. On the AMD Ryzen AI Max+ 395 / Strix Halo machine used during development, llama.cpp with Vulkan was more reliable than ROCm for GGUF serving.
 
-The Ubuntu bootstrap installs these AMD-relevant packages:
+Optional AMD/Vulkan host diagnostics use these packages:
 
 ```bash
 libvulkan1 mesa-vulkan-drivers vulkan-tools clinfo
@@ -283,6 +350,10 @@ The workflow is deliberately more structured than one-pass code generation:
 7. Context compaction preserves durable memory when the transcript approaches the configured context window.
 
 Both agents share one durable chat history. New feedback is appended at the end; previous requirements, implementation attempts, reviews, and correction requests stay visible until compaction is needed.
+When compaction does run, the harness pins the current requirements, plan,
+research notes, step status, and recent plan notes into the compacted active
+context so the agents do not have to rediscover what they are supposed to be
+doing.
 
 ## Existing Projects
 
@@ -373,6 +444,8 @@ Web research is optional. The project can run fully locally/offline if you disab
 
 When enabled, web research only runs if the prompt explicitly asks to search/research/browse, look up current/latest information, or includes source URLs. The harness then fetches pages, writes the configured research file, appends the research result to the transcript, injects compact research notes into later prompts, and asks the generated project to cite/apply source URLs when sources were actually fetched.
 
+Fetched non-text responses, such as PDFs or binary downloads, are recorded as unsupported text sources instead of being decoded into the model prompt. That keeps web research generic and avoids flooding the context window with binary noise.
+
 ## Output Files
 
 Each run creates or updates the configured workspace, usually under `workspaces/`, and writes:
@@ -454,6 +527,7 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 These configs are intended to run against a real local model endpoint. The table below records the latest successful evidence runs and keeps a few reusable stress configs for future checks.
 
 - `config.example.json` - starter task tracker project.
+- `config.minimal.json` - tiny override-only config showing that defaults fill in the rest.
 - `config.real-palindrome.json` - verified CLI benchmark used as the current evidence run.
 - `config.real-arithmetic.json` - focused arithmetic package task, useful for quick prompt/regression checks.
 - `config.real-website.json` - static website plus browser interaction task.
@@ -463,6 +537,7 @@ These configs are intended to run against a real local model endpoint. The table
 - `config.real-dotnet-dependency.json` - dependency-discovery benchmark where the agent installs .NET inside the disposable container without changing this harness Dockerfile.
 - `config.real-jsonl-stats.json` - Qwen JSONL statistics stress benchmark; the latest long run timed out and is kept as a reusable hard case, not as successful evidence.
 - `config.gemma4-jsonl-stats.json` - fresh JSONL statistics CLI benchmark using Gemma4-26B-A4B.
+- `config.real-interest-rate-research.json` - web-research analysis benchmark using Gemma4-26B-A4B.
 - `config.real-city-research.json` - web-research manifest task.
 - `config.real-platformer.json` - browser platformer task with Playwright validation requirements.
 - `config.gpx-editor.json` - GPX editor task with browser/map-style interaction requirements.
@@ -471,7 +546,7 @@ These configs are intended to run against a real local model endpoint. The table
 
 | Script | Purpose |
 |---|---|
-| `scripts/bootstrap_ubuntu.sh` | Main Ubuntu setup script for Docker, Python env, optional model download, optional llama.cpp/Vulkan image build. |
+| `scripts/bootstrap_ubuntu.sh` | Optional convenience bootstrap for local development. The Quick Start shows the minimal host packages explicitly so users can see what is installed. |
 | `scripts/install_ubuntu.sh` | Compatibility wrapper around `scripts/bootstrap_ubuntu.sh`. |
 | `scripts/download_default_model.sh` | Downloads and verifies the default Qwen3.6 GGUF model and mmproj files. |
 | `scripts/start_default_model_server.sh` | Builds if needed and starts the default llama.cpp/Vulkan model server on `agentic-feedback-net`, with host port `8161` published for checks. |
@@ -520,6 +595,16 @@ The model server was configured for `CTX_SIZE=76800`, `PARALLEL=1`, and the conf
 
 One Qwen JSONL statistics stress run using `config.real-jsonl-stats.json` was intentionally not counted above: it timed out after 7,200s while still in the feedback loop. That run was still useful because it exposed a generic issue with stale early artifacts and overly clever one-line Python validation commands; both are now covered by deterministic tests.
 
+Latest generic-regression retest:
+
+| Model | Workload | Config | Result | Time | Step attempts | Notes |
+|---|---|---|---|---:|---|---|
+| Qwen3.6-27B Q4_K_M | Minimal Python CLI from prompt override | `config.minimal.json` + CLI prompt/workspace override | resolved | 5,445s | S1=1, S2=1, S3=1, S4=2 | Confirmed the minimal config/default merge path still works. Final review ended with a labelled compromise note rather than hidden evidence gaps. |
+| Qwen3.6-27B Q4_K_M | Existing invoice project bug fix | `config.real-existing-bugfix.json` | resolved | 3,539s | S1=2, S2=2, S3=1, S4=1 | Confirmed existing-project repair still works with agent-owned state files separated from project files. |
+| Gemma4-26B-A4B Q4_K_M | Palindrome CLI with unit tests and docs | `config.gemma4-palindrome.json` | resolved | 889s | S1=3, S2=1, S3=2, S4=1 | Slower than the earlier Gemma run after relaxed prompts and thinking preservation, but the reviewer forced clearer plan and CLI evidence. |
+| Gemma4-26B-A4B Q4_K_M | Three-page website with Python Playwright validation | `config.gemma4-website.json` | resolved | 837s | S1=1, S2=1, S3=2, S4=1 | Confirmed complex browser validation still works inside the agent container. |
+| Gemma4-26B-A4B Q4_K_M | Web-researched interest-rate impact package | `config.real-interest-rate-research.json` | resolved | 672s | S1=1, S2=1, S3=2, S4=1 | Confirmed the web-research path stays generic. This run exposed and then verified fixes for malformed `grep -m` validation commands and binary/PDF research payload handling. |
+
 Observed Qwen simple workload result:
 
 - The run entered Docker via `scripts/run_agent.sh` because `runtime.docker_isolation=true`.
@@ -566,6 +651,8 @@ workspaces/real-arithmetic/.agent_state/summary.json
 workspaces/real-arithmetic/.agent_state/conversation.full.md
 workspaces/gemma4-jsonl-stats/.agent_state/summary.json
 workspaces/gemma4-jsonl-stats/.agent_state/conversation.full.md
+workspaces/real-interest-rate-research/.agent_state/summary.json
+workspaces/real-interest-rate-research/.agent_state/conversation.full.md
 ```
 
 ## Tests

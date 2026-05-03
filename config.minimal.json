@@ -1,0 +1,9 @@
+{
+  "runtime": {
+    "workspace": "workspaces/my-project"
+  },
+  "project_design": {
+    "title": "My project",
+    "prompt": "Build a small, well-tested command-line tool and document how to run it."
+  }
+}

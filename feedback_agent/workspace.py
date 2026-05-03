@@ -125,11 +125,22 @@ def _strip_common_model_wrappers(text: str) -> str:
     stripped = text.strip()
     stripped = re.sub(r"^\s*<\|channel\>[^<]*<channel\|>\s*", "", stripped)
     stripped = re.sub(r"^\s*<\|[^>]+?\|>\s*", "", stripped)
+    stripped = _strip_complete_think_blocks(stripped)
     if stripped.startswith("```"):
         stripped = stripped.strip("`")
         if stripped.startswith("json"):
             stripped = stripped[4:].strip()
     return stripped
+
+
+def _strip_complete_think_blocks(text: str) -> str:
+    """Remove completed thinking blocks before structured-output parsing.
+
+    Thinking is intentionally preserved in transcripts for later model context,
+    but JSON extraction should not let an unfinished `{` inside `<think>` poison
+    the parse of the final structured response.
+    """
+    return re.sub(r"<think\b[^>]*>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
 
 
 def extract_json_object(text: str) -> dict:
@@ -190,7 +201,15 @@ def write_files(workspace: Path, files: list[dict]) -> list[str]:
         rel = _safe_relpath(str(item["path"]))
         target = workspace / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(str(item.get("content", "")), encoding="utf-8")
+        content = item.get("content", "")
+        if isinstance(content, str):
+            text = content
+        else:
+            # Models sometimes return structured JSON content instead of a
+            # string. Writing Python's repr would corrupt those files with
+            # single quotes, so serialize non-string content as real JSON.
+            text = json.dumps(content, ensure_ascii=False, indent=2) + "\n"
+        target.write_text(text, encoding="utf-8")
         written.append(str(rel))
     return written
 

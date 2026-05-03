@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import os
@@ -143,6 +144,111 @@ class AgentConfig:
     project_design: ProjectDesign
 
 
+DEFAULT_CONFIG: dict[str, Any] = {
+    "implementation_model": {
+        "name": "qwen3.6-27b-q4km",
+        "base_url": "http://127.0.0.1:8161/v1",
+        "api_key": "not-needed",
+        "model": "local-gguf",
+        "context_window": 76800,
+        "max_tokens": 32768,
+        "temperature": 0.25,
+        "request_timeout_seconds": 21_600,
+        "retry_attempts": 20,
+        "retry_sleep_seconds": 30,
+        "request_heartbeat_seconds": 60,
+        "preserve_reasoning": True,
+    },
+    "feedback_model": None,
+    "mcp_tools": {
+        "terminal": True,
+        "web_scraping": False,
+        "web_interaction": True,
+    },
+    "runtime": {
+        "docker_isolation": True,
+        "docker_image": "agentic-feedback-coding:local",
+        "docker_user": "host",
+        "workspace": "workspaces/my-agentic-project",
+        "plan_file": "PLAN.md",
+        "requirements_file": "REQUIREMENTS.md",
+        "research_file": "RESEARCH.md",
+        "command_timeout_seconds": 120,
+        "max_command_timeout_seconds": 21_600,
+        "print_transcript": True,
+        "live_turn_max_chars": 0,
+        "color_transcript": True,
+        "final_summary": "compact",
+        "feedback_response_max_tokens": 4096,
+    },
+    "context_compaction": {
+        "enabled": True,
+        "threshold_ratio": 0.8,
+        "keep_recent_turns": 8,
+        "summary_max_tokens": 1024,
+        "tool_output_max_chars": 4000,
+        "workspace_file_max_bytes": 20000,
+        "git_diff_max_chars": 20000,
+        "transcript_review_max_chars": 24000,
+    },
+    "loop": {
+        "max_iterations": 3,
+    },
+    "phases": {
+        "requirements_refinement": {"max_iterations": 2},
+        "plan_validation": {"max_iterations": 2},
+        "implementation": {"max_iterations": 7},
+    },
+    "resolution_policy": {
+        "max_same_error_repeats": 2,
+        "allow_requirement_dilution": True,
+        "allow_skip_with_note": True,
+        "stop_on_cannot_resolve": False,
+    },
+    "quality_policy": {
+        "assume_code_quality_when_unspecified": True,
+        "require_research_and_structure_step": True,
+    },
+    "review_policy": {
+        "hard_pushback_iterations": 3,
+        "compromise_iterations": 4,
+        "final_review_iterations": 1,
+    },
+    "web_research": {
+        "enabled": False,
+        "max_search_results": 3,
+        "max_pages": 3,
+        "timeout_seconds": 15,
+        "max_page_bytes": 1_000_000,
+        "excerpt_chars": 3000,
+        "user_agent": "agenticFeedbackCoding/0.1 (+local research harness)",
+    },
+    "git_policy": {
+        "enabled": True,
+        "commit_completed_steps": True,
+        "require_step_diff": True,
+        "leave_final_changes_uncommitted": False,
+        "final_reset_mode": "soft",
+        "commit_user_name": "agenticFeedbackCoding",
+        "commit_user_email": "agentic-feedback@example.local",
+    },
+    "project_design": {
+        "title": "Agentic project",
+        "prompt": "Build a small, well-tested project and document how to run it.",
+    },
+}
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _model(data: dict[str, Any], *, base_url_override: str | None = None) -> ModelConfig:
     return ModelConfig(
         name=str(data["name"]),
@@ -230,7 +336,7 @@ def _git_policy(data: dict[str, Any]) -> GitPolicy:
 
 def load_config(path: str | Path, repo_root: Path | None = None) -> AgentConfig:
     cfg_path = Path(path).resolve()
-    data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    data = _deep_merge(DEFAULT_CONFIG, json.loads(cfg_path.read_text(encoding="utf-8")))
     base = repo_root.resolve() if repo_root else cfg_path.parent
 
     feedback = data.get("feedback_model")

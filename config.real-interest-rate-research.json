@@ -1,0 +1,96 @@
+{
+  "implementation_model": {
+    "name": "gemma4-26b-a4b-q4km",
+    "base_url": "http://127.0.0.1:8161/v1",
+    "api_key": "not-needed",
+    "model": "local-gguf",
+    "context_window": 76800,
+    "max_tokens": 32768,
+    "temperature": 0.2,
+    "request_timeout_seconds": 21600,
+    "retry_attempts": 20,
+    "retry_sleep_seconds": 30,
+    "request_heartbeat_seconds": 60,
+    "preserve_reasoning": true
+  },
+  "feedback_model": null,
+  "mcp_tools": {
+    "terminal": true,
+    "web_scraping": true,
+    "web_interaction": false
+  },
+  "runtime": {
+    "docker_isolation": true,
+    "docker_image": "agentic-feedback-coding:local",
+    "docker_user": "host",
+    "workspace": "workspaces/real-interest-rate-research",
+    "command_timeout_seconds": 120,
+    "print_transcript": true,
+    "live_turn_max_chars": 20000,
+    "color_transcript": true,
+    "max_command_timeout_seconds": 21600,
+    "final_summary": "compact",
+    "feedback_response_max_tokens": 4096
+  },
+  "context_compaction": {
+    "enabled": true,
+    "threshold_ratio": 0.8,
+    "keep_recent_turns": 8,
+    "summary_max_tokens": 1024,
+    "tool_output_max_chars": 4000,
+    "workspace_file_max_bytes": 20000,
+    "git_diff_max_chars": 20000,
+    "transcript_review_max_chars": 24000
+  },
+  "loop": {
+    "max_iterations": 3
+  },
+  "phases": {
+    "requirements_refinement": {
+      "max_iterations": 2
+    },
+    "plan_validation": {
+      "max_iterations": 2
+    },
+    "implementation": {
+      "max_iterations": 8
+    }
+  },
+  "resolution_policy": {
+    "max_same_error_repeats": 2,
+    "allow_requirement_dilution": true,
+    "allow_skip_with_note": true,
+    "stop_on_cannot_resolve": false
+  },
+  "quality_policy": {
+    "assume_code_quality_when_unspecified": true,
+    "require_research_and_structure_step": true
+  },
+  "review_policy": {
+    "hard_pushback_iterations": 3,
+    "compromise_iterations": 4,
+    "final_review_iterations": 1
+  },
+  "web_research": {
+    "enabled": true,
+    "max_search_results": 3,
+    "max_pages": 5,
+    "timeout_seconds": 20,
+    "max_page_bytes": 1000000,
+    "excerpt_chars": 3500,
+    "user_agent": "agenticFeedbackCoding/0.1 (+local research harness)"
+  },
+  "git_policy": {
+    "enabled": true,
+    "commit_completed_steps": true,
+    "require_step_diff": true,
+    "leave_final_changes_uncommitted": false,
+    "final_reset_mode": "soft",
+    "commit_user_name": "agenticFeedbackCoding",
+    "commit_user_email": "agentic-feedback@example.local"
+  },
+  "project_design": {
+    "title": "Interest-rate news impact analysis",
+    "prompt": "Use web research to review current major economic and financial news as of 2026-05-02 and write a sourced short-, medium-, and long-term analysis of likely interest-rate impacts. Build a small documented research package with SOURCES.json, ANALYSIS.md, README.md, and a validation script that checks every claim section cites at least one fetched source URL. Do not invent facts; if sources are partial, clearly label the limitations. Maintain PLAN.md during the work."
+  }
+}
