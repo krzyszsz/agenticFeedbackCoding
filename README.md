@@ -1,8 +1,8 @@
-# Intro: the problem to solve
+# Intro: the problems to solve
 
-* Problem 1-quality: When using AI models for coding, or even just for brainstorming, a lot of answers are very vague, not properly checked, not properly developed, as if the AI-model was hoping for you to be fine with low quality work. Solution: automated feedback - the same model can play a role of an auditor that pushes back, forces proper planning and checks the testsing evidence.
+* Quality: When using AI models for coding, or even just for brainstorming, a lot of answers are very vague, not properly checked, not properly developed, as if the AI-model was hoping for you to be fine with low quality work. Solution: automated feedback - the same model can play a role of an auditor that pushes back, forces proper planning and checks the testsing evidence.
 
-* Problem 2-control: You don't want to give the entire machine to a random AI model that can run unpredictable commands in your system. You need to just let it work within a workspace directory that is only visible from a docker container so it does the work for you but only sees what you want it to see. Solution: running a light script that just spins 2 dockers: one serving a model and the other using the model - everything locked up and safe.
+* Lack of control: You don't want to give the entire machine to a random AI model that can run unpredictable commands in your system. You need to just let it work within a workspace directory that is only visible from a docker container so it does the work for you but only sees what you want it to see. Solution: running a light script that just spins 2 dockers: one serving a model and the other using the model - everything locked up and safe.
 
 #agenticFeedbackCoding
 
