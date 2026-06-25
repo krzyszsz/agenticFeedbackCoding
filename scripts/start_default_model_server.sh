@@ -5,9 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$REPO_ROOT/scripts/env.sh"
 
+if [ -n "${MODEL_PROFILE:-}" ]; then
+  eval "$(PYTHONPATH="$REPO_ROOT" python3 -m feedback_agent.model_profiles env "$MODEL_PROFILE")"
+fi
+
 SERVER_IMAGE="${SERVER_IMAGE:-agentic-feedback-llama-vulkan:local}"
-CONTAINER="${CONTAINER:-agentic-qwen36-server}"
+CONTAINER="${CONTAINER:-agentic-gemma4-26b-mtp-server}"
 MODEL_PATH="${MODEL_PATH:-$QWEN36_LOCAL_DIR/$QWEN36_MODEL_FILE}"
+MODEL_DRAFT_PATH="${MODEL_DRAFT_PATH:-}"
 MMPROJ_PATH="${MMPROJ_PATH:-$QWEN36_LOCAL_DIR/$QWEN36_MMPROJ_FILE}"
 PORT="${PORT:-8161}"
 PUBLISH_HOST="${PUBLISH_HOST:-127.0.0.1}"
@@ -24,8 +29,10 @@ OOM_SCORE_ADJ="${OOM_SCORE_ADJ:-500}"
 USE_DRI="${USE_DRI:-1}"
 LLAMA_DEVICE="${LLAMA_DEVICE:-Vulkan0}"
 REASONING_MODE="${REASONING_MODE:-on}"
-REASONING_BUDGET="${REASONING_BUDGET:-1024}"
+REASONING_BUDGET="${REASONING_BUDGET:-4096}"
 REASONING_FORMAT="${REASONING_FORMAT:-deepseek}"
+SPEC_TYPE="${SPEC_TYPE:-}"
+SPEC_DRAFT_N_MAX="${SPEC_DRAFT_N_MAX:-0}"
 
 if [ ! -f "$MODEL_PATH" ]; then
   echo "Missing model: $MODEL_PATH" >&2
@@ -36,6 +43,19 @@ fi
 EXTRA_ARGS="--jinja --reasoning $REASONING_MODE --reasoning-budget $REASONING_BUDGET --reasoning-format $REASONING_FORMAT --no-context-shift"
 if [ -f "$MMPROJ_PATH" ]; then
   EXTRA_ARGS="--mmproj $MMPROJ_PATH $EXTRA_ARGS"
+fi
+if [ -n "$MODEL_DRAFT_PATH" ]; then
+  if [ ! -f "$MODEL_DRAFT_PATH" ]; then
+    echo "Missing MTP draft model: $MODEL_DRAFT_PATH" >&2
+    exit 1
+  fi
+  EXTRA_ARGS="$EXTRA_ARGS --model-draft $MODEL_DRAFT_PATH"
+fi
+if [ -n "$SPEC_TYPE" ]; then
+  EXTRA_ARGS="$EXTRA_ARGS --spec-type $SPEC_TYPE"
+fi
+if [ "$SPEC_DRAFT_N_MAX" -gt 0 ]; then
+  EXTRA_ARGS="$EXTRA_ARGS --spec-draft-n-max $SPEC_DRAFT_N_MAX"
 fi
 if [ -n "$LLAMA_DEVICE" ] && [ "$USE_DRI" = "1" ]; then
   EXTRA_ARGS="$EXTRA_ARGS --device $LLAMA_DEVICE"
@@ -50,9 +70,14 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 if [ "${REBUILD_SERVER_IMAGE:-0}" = "1" ] || ! "${DOCKER[@]}" image inspect "$SERVER_IMAGE" >/dev/null 2>&1; then
+  LLAMA_CPP_CACHEBUST_VALUE="${LLAMA_CPP_CACHEBUST:-0}"
+  if [ "${REBUILD_SERVER_IMAGE:-0}" = "1" ] && [ -z "${LLAMA_CPP_CACHEBUST:-}" ]; then
+    LLAMA_CPP_CACHEBUST_VALUE="$(date +%s)"
+  fi
   "${DOCKER[@]}" build \
     -f "$REPO_ROOT/docker/llama-cpp-vulkan.Dockerfile" \
     --build-arg "LLAMA_CPP_REF=${LLAMA_CPP_REF:-master}" \
+    --build-arg "LLAMA_CPP_CACHEBUST=$LLAMA_CPP_CACHEBUST_VALUE" \
     -t "$SERVER_IMAGE" \
     "$REPO_ROOT"
 fi
@@ -69,6 +94,12 @@ case "$MODEL_ROOT" in
   "$HF_ROOT"|"$HF_ROOT"/*) ;;
   *) VOLUME_ARGS+=(-v "$MODEL_ROOT:$MODEL_ROOT:ro") ;;
 esac
+if [ -n "${MODEL_LOCAL_DIR:-}" ]; then
+  case "$MODEL_LOCAL_DIR" in
+    "$HF_ROOT"|"$HF_ROOT"/*|"$MODEL_ROOT"|"$MODEL_ROOT"/*) ;;
+    *) VOLUME_ARGS+=(-v "$MODEL_LOCAL_DIR:$MODEL_LOCAL_DIR:ro") ;;
+  esac
+fi
 
 NETWORK_ARGS=()
 if [ "$DOCKER_NETWORK" = "host" ]; then
@@ -102,6 +133,11 @@ for _ in $(seq 1 "${READY_ATTEMPTS:-60}"); do
   code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PUBLISH_PORT/v1/models" || true)"
   if [ "$code" = "200" ]; then
     echo "Model server ready on host: http://127.0.0.1:$PUBLISH_PORT/v1"
+    echo "Model profile: ${MODEL_PROFILE:-manual}"
+    echo "Model path: $MODEL_PATH"
+    if [ -n "$MODEL_DRAFT_PATH" ]; then
+      echo "MTP draft path: $MODEL_DRAFT_PATH"
+    fi
     if [ "$DOCKER_NETWORK" != "host" ]; then
       echo "Model server ready on Docker network '$DOCKER_NETWORK': http://$CONTAINER:$PORT/v1"
     fi

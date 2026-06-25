@@ -133,6 +133,8 @@ class OpenAICompatClient:
             "temperature": self.cfg.temperature if temperature is None else temperature,
             "max_tokens": self.cfg.max_tokens if max_tokens is None else max_tokens,
         }
+        if self.cfg.send_reasoning_budget and self.cfg.reasoning_budget_tokens is not None:
+            payload["reasoning_budget"] = self.cfg.reasoning_budget_tokens
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             f"{self.cfg.base_url}/chat/completions",

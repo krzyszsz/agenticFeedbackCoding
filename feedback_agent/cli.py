@@ -26,6 +26,8 @@ def _compact_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "workspace": summary.get("workspace"),
         "steps": steps,
         "final_review_status": (summary.get("final_review") or {}).get("status"),
+        "approach_review_status": (summary.get("approach_review") or {}).get("status"),
+        "approach_attempts": len(summary.get("approach_history") or []),
         "transcript_jsonl": summary.get("transcript_jsonl"),
         "transcript_markdown": summary.get("transcript_markdown"),
         "active_transcript_jsonl": summary.get("active_transcript_jsonl"),

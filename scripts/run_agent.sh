@@ -4,6 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$PROJECT_DIR"
+source "$REPO_ROOT/scripts/env.sh"
+
+if [ -n "${MODEL_PROFILE:-}" ]; then
+  eval "$(PYTHONPATH="$REPO_ROOT" python3 -m feedback_agent.model_profiles env "$MODEL_PROFILE")"
+fi
 
 CONFIG_PATH="$PROJECT_DIR/config.example.json"
 WORKSPACE_OVERRIDE=""
@@ -118,8 +123,8 @@ if [ "$docker_enabled" = "1" ] && [ "${AGENT_IN_CONTAINER:-0}" != "1" ]; then
   fi
 
   agent_network="${AGENT_DOCKER_NETWORK:-${DOCKER_NETWORK:-agentic-feedback-net}}"
-  model_server_container="${MODEL_SERVER_CONTAINER:-agentic-qwen36-server}"
-  model_server_port="${MODEL_SERVER_PORT:-8161}"
+  model_server_container="${MODEL_SERVER_CONTAINER:-${CONTAINER:-agentic-gemma4-26b-mtp-server}}"
+  model_server_port="${MODEL_SERVER_PORT:-${PORT:-8161}}"
   network_args=()
   env_args=(
     -e AGENT_IN_CONTAINER=1

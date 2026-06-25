@@ -1,17 +1,19 @@
 {
   "implementation_model": {
-    "name": "qwen3.6-27b-q4km",
+    "name": "gemma4-26b-a4b-qat-mtp",
     "base_url": "http://127.0.0.1:8161/v1",
     "api_key": "not-needed",
     "model": "local-gguf",
-    "context_window": 76800,
+    "context_window": 131072,
     "max_tokens": 32768,
     "temperature": 0.25,
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
     "retry_sleep_seconds": 30,
     "request_heartbeat_seconds": 30,
-    "preserve_reasoning": true
+    "preserve_reasoning": true,
+    "reasoning_budget_tokens": 4096,
+    "send_reasoning_budget": false
   },
   "feedback_model": null,
   "mcp_tools": {
@@ -33,7 +35,7 @@
     "color_transcript": true,
     "max_command_timeout_seconds": 21600,
     "final_summary": "compact",
-    "feedback_response_max_tokens": 4096
+    "feedback_response_max_tokens": 2048
   },
   "context_compaction": {
     "enabled": true,
@@ -46,13 +48,17 @@
     "transcript_review_max_chars": 24000
   },
   "loop": {
-    "max_iterations": 3
+    "max_iterations": 3,
+    "max_approach_reattempts": 5
   },
   "project_design": {
     "title": "Starter task tracker project",
     "prompt": "Build a Python command-line task tracker. It should support adding tasks, marking tasks done, listing tasks, and saving state as JSON. Keep the implementation well structured, testable, and documented. Maintain PLAN.md during the work."
   },
   "phases": {
+    "analysis": {
+      "max_iterations": 2
+    },
     "requirements_refinement": {
       "max_iterations": 2
     },

@@ -1,6 +1,7 @@
 FROM ubuntu:24.04 AS build
 
 ARG LLAMA_CPP_REF=master
+ARG LLAMA_CPP_CACHEBUST=0
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN set -eux; \
@@ -17,6 +18,7 @@ RUN set -eux; \
 
 WORKDIR /opt
 RUN set -eux; \
+    echo "llama.cpp ref=${LLAMA_CPP_REF} cachebust=${LLAMA_CPP_CACHEBUST}"; \
     for attempt in 1 2 3; do \
       rm -rf /opt/llama.cpp; \
       if git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /opt/llama.cpp; then \

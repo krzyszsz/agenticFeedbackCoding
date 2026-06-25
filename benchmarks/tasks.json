@@ -1,0 +1,258 @@
+{
+  "version": 1,
+  "description": "General-purpose harness benchmark corpus. Tasks are intentionally varied and should not be hard-coded into prompts or harness logic.",
+  "tasks": [
+    {
+      "id": "algo-001-balanced-grid",
+      "title": "Balanced grid count",
+      "category": "algorithmic_exact",
+      "grading": "automatic",
+      "prompt": "Create ANSWER.txt only. Count the 4-character strings over alphabet {A,B,C,D} that contain exactly two vowels if A is the only vowel and have no adjacent equal characters. Put only the integer answer in ANSWER.txt.",
+      "post_validation_commands": [["bash", "-lc", "test \"$(tr -d '\\n ' < ANSWER.txt)\" = \"24\""]]
+    },
+    {
+      "id": "algo-002-nested-parity",
+      "title": "Nested parity puzzle",
+      "category": "algorithmic_exact",
+      "grading": "automatic",
+      "prompt": "Create ANSWER.txt only. Consider integers n from 1 to 120. Keep n if n is divisible by exactly one of 3, 5, 7, and the digit sum of n is odd. Return the sum of all kept n as a single integer.",
+      "post_validation_commands": [["bash", "-lc", "test \"$(tr -d '\\n ' < ANSWER.txt)\" = \"1878\""]]
+    },
+    {
+      "id": "algo-003-multiset-path",
+      "title": "Constrained multiset paths",
+      "category": "algorithmic_exact",
+      "grading": "automatic",
+      "prompt": "Create ANSWER.txt only. How many distinct permutations of A,A,B,B,C,C have no identical adjacent letters and do not start with C? Return only the integer.",
+      "post_validation_commands": [["bash", "-lc", "test \"$(tr -d '\\n ' < ANSWER.txt)\" = \"20\""]]
+    },
+    {
+      "id": "algo-004-layered-filter",
+      "title": "Layered filter",
+      "category": "algorithmic_exact",
+      "grading": "automatic",
+      "prompt": "Create ANSWER.txt only. From the numbers 10 through 99, keep those whose tens digit is smaller than the ones digit, whose product of digits is divisible by 6, and whose digit sum is not divisible by 5. Return the count.",
+      "post_validation_commands": [["bash", "-lc", "test \"$(tr -d '\\n ' < ANSWER.txt)\" = \"11\""]]
+    },
+    {
+      "id": "algo-005-state-machine",
+      "title": "Tiny state machine",
+      "category": "algorithmic_exact",
+      "grading": "automatic",
+      "prompt": "Create ANSWER.txt only. A machine starts at x=2. For each character in ABACAB: A means x=3x+1, B means x=x-4, C means x=floor(x/2). Return the final x.",
+      "post_validation_commands": [["bash", "-lc", "test \"$(tr -d '\\n ' < ANSWER.txt)\" = \"12\""]]
+    },
+    {
+      "id": "code-001-slug-cli",
+      "title": "Slug CLI",
+      "category": "coding",
+      "grading": "automatic",
+      "prompt": "Build a tiny Python CLI slugify.py. It should read one command-line argument, lowercase it, replace runs of non-alphanumeric characters with one hyphen, trim hyphens, and print the slug. Include tests and README.",
+      "post_validation_commands": [["python", "slugify.py", "Hello, Agentic World!"], ["bash", "-lc", "test \"$(python slugify.py 'Hello, Agentic World!')\" = \"hello-agentic-world\""]]
+    },
+    {
+      "id": "code-002-jsonl-aggregate",
+      "title": "JSONL aggregate",
+      "category": "coding",
+      "grading": "automatic",
+      "prompt": "Build a Python script jsonl_sum.py that reads JSONL from stdin and prints total quantity grouped by category as sorted JSON. Include tests and an example.",
+      "post_validation_commands": [["bash", "-lc", "printf '%s\\n' '{\"category\":\"b\",\"quantity\":2}' '{\"category\":\"a\",\"quantity\":3}' '{\"category\":\"b\",\"quantity\":4}' | python jsonl_sum.py | python -c 'import json,sys; assert json.load(sys.stdin)=={\"a\":3,\"b\":6}'"]]
+    },
+    {
+      "id": "code-003-interval-merge",
+      "title": "Interval merge",
+      "category": "coding",
+      "grading": "automatic",
+      "prompt": "Build a Python module intervals.py with merge_intervals(pairs). It must merge closed integer intervals, validate start <= end, and include unit tests and README.",
+      "post_validation_commands": [["python", "-c", "from intervals import merge_intervals; assert merge_intervals([(5,7),(1,3),(2,6),(10,10)]) == [(1,7),(10,10)]"]]
+    },
+    {
+      "id": "code-004-config-normalizer",
+      "title": "Config normalizer",
+      "category": "coding",
+      "grading": "automatic",
+      "prompt": "Create normalize_config.py. It reads a JSON object file path, recursively sorts object keys, removes keys with null values, keeps list order, and writes normalized JSON to stdout. Include tests.",
+      "post_validation_commands": [["bash", "-lc", "printf '{\"b\":null,\"a\":{\"d\":2,\"c\":null},\"z\":[{\"b\":1,\"a\":2}]}' > sample.json && test \"$(python normalize_config.py sample.json)\" = '{\"a\":{\"d\":2},\"z\":[{\"a\":2,\"b\":1}]}'"]]
+    },
+    {
+      "id": "code-005-existing-bugfix",
+      "title": "Existing bugfix",
+      "category": "existing_project",
+      "grading": "automatic",
+      "setup_files": [
+        {"path": "calc.py", "content": "def median(values):\n    values = sorted(values)\n    mid = len(values) // 2\n    if len(values) % 2:\n        return values[mid]\n    return values[mid] / 2\n"},
+        {"path": "test_calc.py", "content": "import unittest\nfrom calc import median\n\nclass MedianTests(unittest.TestCase):\n    def test_odd(self):\n        self.assertEqual(median([3, 1, 2]), 2)\n    def test_even(self):\n        self.assertEqual(median([10, 2, 4, 6]), 5)\n\nif __name__ == '__main__':\n    unittest.main()\n"}
+      ],
+      "prompt": "Fix the existing Python median implementation. Preserve the test intent, add a short BUGFIX_NOTES.md, and verify with unittest.",
+      "post_validation_commands": [["python", "-m", "unittest", "-v"]]
+    },
+    {
+      "id": "tool-001-disk-monitor",
+      "title": "Disk monitor loop",
+      "category": "tool_periodic",
+      "grading": "automatic",
+      "prompt": "Build monitor_disk.sh and README.md. The script should check disk free space periodically with df, print one status line each interval, stop after a configurable number of checks, and write ACTION_REQUIRED when free percentage is below a threshold. It must support CHECK_INTERVAL_SECONDS, MAX_CHECKS, and MIN_FREE_PERCENT environment overrides so tests do not wait 30 seconds.",
+      "post_validation_commands": [["bash", "-lc", "CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=2 MIN_FREE_PERCENT=0 bash monitor_disk.sh | tee monitor.out && test $(grep -c 'check=' monitor.out) -eq 2"]]
+    },
+    {
+      "id": "tool-002-log-watch",
+      "title": "Log watch checkpoint",
+      "category": "tool_periodic",
+      "grading": "automatic",
+      "prompt": "Create watch_log.sh. It should tail a log file path, poll every configurable interval, remember the last checked line in .watch_state, and print TRIGGERED when a configurable pattern appears. Include README and a fast validation script.",
+      "post_validation_commands": [["bash", "-lc", "printf 'ok\\nALERT one\\n' > app.log && WATCH_INTERVAL_SECONDS=0 MAX_POLLS=1 PATTERN=ALERT bash watch_log.sh app.log | grep TRIGGERED"]]
+    },
+    {
+      "id": "tool-003-output-truncation",
+      "title": "Huge output discipline",
+      "category": "tool_safety",
+      "grading": "automatic",
+      "prompt": "Create huge_output.py that can print a configurable number of lines and validate_huge_output.py that runs it with a bounded line count and asserts the output format. Do not rely on dumping huge output into README.",
+      "post_validation_commands": [["python", "validate_huge_output.py"]]
+    },
+    {
+      "id": "tool-004-timeout-friendly",
+      "title": "Timeout friendly command",
+      "category": "tool_safety",
+      "grading": "automatic",
+      "prompt": "Create wait_for_file.py. It should poll for a file until timeout_seconds, print periodic status, and exit 0 when the file appears or 2 on timeout. Include tests that complete quickly.",
+      "post_validation_commands": [["python", "-c", "import subprocess,sys; r=subprocess.run([sys.executable,'wait_for_file.py','missing.file','--timeout-seconds','0.1','--interval-seconds','0.02'], text=True, capture_output=True); assert r.returncode==2 and 'timeout' in (r.stdout+r.stderr).lower()"]]
+    },
+    {
+      "id": "tool-005-curl-json-safety",
+      "title": "Curl JSON safety",
+      "category": "tool_safety",
+      "grading": "manual",
+      "prompt": "Create CURL_NOTES.md explaining a safe pattern for sending complex JSON with curl by writing the JSON to a file and using --data-binary @file. Include an example payload with nested quotes. Do not run an external network request.",
+      "manual_pass_criteria": ["Notes recommend request body files for complex JSON.", "No external network request is required.", "Example JSON is valid."]
+    },
+    {
+      "id": "web-001-static-accessibility",
+      "title": "Accessible static page",
+      "category": "frontend",
+      "grading": "automatic",
+      "prompt": "Build a static index.html and style.css for a compact personal notes page. Include semantic landmarks, visible focus states, no external assets, and a Python validation script that checks structure.",
+      "post_validation_commands": [["python", "validate_site.py"]]
+    },
+    {
+      "id": "web-002-browser-interaction",
+      "title": "Browser interaction",
+      "category": "frontend",
+      "grading": "automatic",
+      "prompt": "Build a single-page counter app with index.html, app.js, and style.css. Include a Python Playwright validation script that opens the page, clicks increment/decrement, and writes reports/counter_report.json.",
+      "post_validation_commands": [["python", "validate_counter.py"]]
+    },
+    {
+      "id": "research-001-source-notes",
+      "title": "Source-backed notes",
+      "category": "research",
+      "grading": "manual",
+      "prompt": "Using only available local knowledge unless web research is enabled, write ANALYSIS.md comparing two approaches for making a command-line tool resilient to malformed input. Include explicit assumptions and validation ideas.",
+      "manual_pass_criteria": ["Compares at least two approaches.", "States assumptions instead of inventing current facts.", "Includes validation strategy."]
+    },
+    {
+      "id": "workflow-001-analysis-first",
+      "title": "Analysis-first runbook",
+      "category": "workflow",
+      "grading": "manual",
+      "prompt": "Build a small runbook template RUNBOOK.md for solving arbitrary coding tasks. It must start with analysis, list alternative approaches, plan, execute steps, verify, repair, and decide whether to try another approach. Keep it domain-neutral.",
+      "manual_pass_criteria": ["Starts with analysis before planning.", "Includes alternatives and fallback triggers.", "Is domain-neutral and not benchmark-specific."]
+    },
+    {
+      "id": "workflow-002-autonomous-repair",
+      "title": "Autonomous repair notes",
+      "category": "workflow",
+      "grading": "manual",
+      "prompt": "Create REPAIR_POLICY.md for an AI coding loop. It should explain how a model receives failure evidence and prior repair history, then autonomously chooses the next repair. Avoid telling it one fixed solution.",
+      "manual_pass_criteria": ["Repair choice remains model-owned.", "Evidence and history are preserved.", "No single fixed solution is prescribed."]
+    },
+    {
+      "id": "data-001-csv-window",
+      "title": "CSV rolling window",
+      "category": "coding",
+      "grading": "automatic",
+      "prompt": "Create rolling_average.py. It reads CSV with columns timestamp,value and prints a JSON list of 3-sample rolling averages rounded to 2 decimals. Include tests.",
+      "post_validation_commands": [["bash", "-lc", "printf 'timestamp,value\\n1,2\\n2,4\\n3,6\\n4,8\\n' > data.csv && test \"$(python rolling_average.py data.csv)\" = '[4.0,6.0]'"]]
+    },
+    {
+      "id": "data-002-dedupe",
+      "title": "Stable dedupe",
+      "category": "coding",
+      "grading": "automatic",
+      "prompt": "Create dedupe_lines.py. It reads stdin and prints unique lines preserving first occurrence, with --ignore-case option. Include tests and README.",
+      "post_validation_commands": [["bash", "-lc", "printf 'A\\nb\\na\\nB\\nc\\n' | python dedupe_lines.py --ignore-case | diff -u - <(printf 'A\\nb\\nc\\n')"]]
+    },
+    {
+      "id": "safety-001-no-destructive-tools",
+      "title": "No destructive tool plan",
+      "category": "tool_safety",
+      "grading": "manual",
+      "prompt": "Write SAFE_COPY_PLAN.md describing how to verify source and destination before copying important files. Include dry-run/listing checks and explicit refusal to use dd, mkfs, or broad rm commands without user confirmation.",
+      "manual_pass_criteria": ["Includes source/destination verification.", "Avoids destructive commands.", "Requires explicit confirmation for disk-level operations."]
+    },
+    {
+      "id": "safety-002-context-overflow",
+      "title": "Context overflow fixture",
+      "category": "tool_safety",
+      "grading": "automatic",
+      "prompt": "Create spammer.py that can emit many bytes and validate_spammer.py that runs it with a small size. Document why harnesses should truncate tool output with a visible marker.",
+      "post_validation_commands": [["python", "validate_spammer.py"], ["grep", "-qi", "truncate", "README.md"]]
+    },
+    {
+      "id": "planning-001-conflict-resolution",
+      "title": "Conflict resolution",
+      "category": "planning",
+      "grading": "manual",
+      "prompt": "Create DECISIONS.md for a hypothetical task with conflicting constraints: fastest possible implementation, exhaustive tests, and no dependencies. Resolve the conflict with explicit assumptions and a verifiable compromise.",
+      "manual_pass_criteria": ["Names the conflict.", "Chooses a verifiable compromise.", "Avoids pretending all constraints are fully satisfied."]
+    },
+    {
+      "id": "planning-002-plan-update",
+      "title": "Plan update after blocker",
+      "category": "planning",
+      "grading": "manual",
+      "prompt": "Create PLAN_UPDATE_EXAMPLE.md showing how an AI runbook should update a plan when a step becomes impossible. Include a skipped/deprecated step and a replacement step with verification.",
+      "manual_pass_criteria": ["Shows stale step handling.", "Adds replacement step.", "Preserves verification."]
+    },
+    {
+      "id": "long-001-periodic-summary",
+      "title": "Periodic summary script",
+      "category": "tool_periodic",
+      "grading": "automatic",
+      "prompt": "Create periodic_summary.sh. It should run a command every interval, append timestamped output to a log, stop after MAX_CHECKS, and print a final summary. Defaults may be 30 seconds, but tests must override to zero.",
+      "post_validation_commands": [["bash", "-lc", "CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=3 COMMAND='printf ok' bash periodic_summary.sh | tee periodic.out && test $(grep -c ok periodic.out) -ge 3"]]
+    },
+    {
+      "id": "long-002-watch-and-react",
+      "title": "Watch and react",
+      "category": "tool_periodic",
+      "grading": "automatic",
+      "prompt": "Create watch_and_react.sh. It should check a file every interval and append a line to actions.log once a pattern appears. It must be testable with zero interval and bounded polls.",
+      "post_validation_commands": [["bash", "-lc", "printf READY > state.txt && WATCH_INTERVAL_SECONDS=0 MAX_POLLS=2 PATTERN=READY bash watch_and_react.sh state.txt && grep READY actions.log"]]
+    },
+    {
+      "id": "integration-001-mini-package",
+      "title": "Mini package",
+      "category": "integration",
+      "grading": "automatic",
+      "prompt": "Create a small Python package textkit with functions words(text) and top_words(text, n). Include pyproject.toml, tests, and README.",
+      "post_validation_commands": [["python", "-m", "unittest", "discover", "-v"], ["python", "-c", "from textkit import top_words; assert top_words('a b a c b a', 2)==[('a',3),('b',2)]"]]
+    },
+    {
+      "id": "integration-002-doc-consistency",
+      "title": "Doc consistency",
+      "category": "integration",
+      "grading": "automatic",
+      "prompt": "Build a tiny project with hello.py and README.md. Include validate_docs.py that ensures README commands reference real files and the documented command works.",
+      "post_validation_commands": [["python", "validate_docs.py"]]
+    },
+    {
+      "id": "manual-001-design-review",
+      "title": "Design review",
+      "category": "manual_quality",
+      "grading": "manual",
+      "prompt": "Create DESIGN_REVIEW.md evaluating whether a generic AI harness should solve user tasks itself or only manage model context, iteration, tools, and verification. The answer must reject harness-side cheating and explain boundaries.",
+      "manual_pass_criteria": ["Clearly states harness boundaries.", "Rejects solving benchmark tasks in harness code.", "Explains context/iteration/tool/verification responsibilities."]
+    }
+  ]
+}

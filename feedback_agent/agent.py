@@ -25,6 +25,105 @@ from .workspace import (
 )
 
 
+ANALYSIS_CONTRACT = """
+Return strict JSON only:
+{
+  "problem_restatement": "concise restatement of the user's request",
+  "domain_and_constraints": ["important domain fact, constraint, source, environment, or uncertainty"],
+  "initial_source_check": {
+    "sources_checked": ["workspace file, configured research result, command output, or none"],
+    "source_gaps": ["gap or unavailable source"],
+    "freshness_risks": ["fact that may need web/tool verification later"]
+  },
+  "possible_solution_paths": [
+    {
+      "id": "A",
+      "description": "approach summary",
+      "advantages": ["why this may work"],
+      "risks": ["why this may fail"],
+      "verification_strategy": "how this path would be verified"
+    }
+  ],
+  "recommended_path": {
+    "path_id": "A",
+    "rationale": "why this is the best first approach",
+    "fallback_trigger": "what evidence would justify trying another path"
+  },
+  "analysis_quality": {
+    "is_comprehensive": true,
+    "is_domain_aware": true,
+    "is_actionable_for_planning": true,
+    "remaining_unknowns": ["unknown to preserve"]
+  }
+}
+Do not write project files. Do not solve benchmark tasks in the harness. The
+purpose is to orient later model-driven planning: restate the request, identify
+constraints, name what is possible or impossible, and compare multiple viable
+approaches before choosing one. Keep the analysis universal and problem-domain
+aware; do not inject instructions that target only one historical failure mode.
+Start with `{`, return one JSON object, and stop immediately after the matching
+closing `}`.
+"""
+
+
+ANALYSIS_REVIEW_CONTRACT = """
+Return strict JSON only:
+{
+  "status": "resolved|needs_rework|cannot_resolve",
+  "needs_rework": false,
+  "summary": "review summary",
+  "required_changes": ["specific analysis gap to fix"],
+  "quality_questions": ["question the next analysis pass must answer"]
+}
+Reject analysis that jumps straight to a plan, considers only one approach,
+ignores available workspace/research/source context, or bakes in a narrow
+solution that would make the harness less universal.
+"""
+
+
+APPROACH_REVIEW_CONTRACT = """
+Return strict JSON only:
+{
+  "status": "resolved|try_another_approach|needs_rework|cannot_resolve",
+  "needs_rework": false,
+  "summary": "whether the executed approach answered the user request",
+  "decision": "keep_result|retry_with_new_approach|stop",
+  "recommended_next_approach": "only when retrying",
+  "evidence_reviewed": ["final review, command evidence, plan state, or transcript fact"],
+  "runbook_updates": ["note to preserve for the next approach"]
+}
+Decide whether the completed workflow was the right response to the user's
+request. If another approach is warranted, explain the trigger and provide a
+new approach direction. Do not retry merely for variety; retry only when the
+evidence shows a meaningful gap, a better angle is needed, or the task itself
+requires periodic re-checking.
+"""
+
+
+TOOL_CALL_VERIFICATION_CONTRACT = """
+Return strict JSON only:
+{
+  "status": "approved|blocked|needs_revision",
+  "summary": "tool-call verification summary",
+  "commands": [
+    {
+      "index": 0,
+      "decision": "approved|blocked",
+      "risk_level": "low|medium|high",
+      "reason": "why this command is safe or unsafe",
+      "safer_alternative": "optional safer command or plan change"
+    }
+  ]
+}
+Review each proposed terminal call before the harness executes it. Use the full
+chat history, current plan, workspace context, and deterministic findings. Push
+back on destructive or misdirected operations, wrong source/destination paths,
+malformed quoting, commands that cannot verify the intended behavior, or timeout
+requests that are unjustified. Approve only commands that are appropriate for
+the current task and bounded by the configured workspace/tool policy.
+"""
+
+
 REQUIREMENTS_CONTRACT = """
 Return strict JSON only:
 {
@@ -188,6 +287,7 @@ REVIEW_STATUSES = {
     "needs_plan_change",
     "skipped_with_note",
     "resolved_with_compromise",
+    "try_another_approach",
 }
 
 
@@ -271,8 +371,10 @@ class FeedbackLoopAgent:
         self.impl_client = implementation_client or OpenAICompatClient(config.implementation_model)
         self.feedback_client = feedback_client or OpenAICompatClient(config.feedback_model or config.implementation_model)
         self.requirements: dict[str, Any] = {}
+        self.problem_analysis: dict[str, Any] = {}
         self.plan_steps: list[dict[str, Any]] = []
         self.plan_notes: list[str] = []
+        self.approach_history: list[dict[str, Any]] = []
         self.web_research_result: dict[str, Any] = {
             "status": "not_run",
             "requested": False,
@@ -382,6 +484,10 @@ class FeedbackLoopAgent:
             *(f"- {note}" for note in note_tail),
             "Requirements summary:",
             self._requirements_summary_for_prompt(),
+            "Problem analysis summary:",
+            self._analysis_summary_for_prompt(),
+            "Approach history:",
+            self._approach_history_summary_for_prompt(),
             f"Web research status: {self.web_research_result.get('status', 'not_run')}",
             "Plan file tail:",
             self._safe_file_excerpt(self._plan_path(), 6000, tail=True),
@@ -574,6 +680,16 @@ class FeedbackLoopAgent:
             return feedback_cfg.max_tokens
         return max(512, min(feedback_cfg.max_tokens, configured))
 
+    def _structured_control_tokens(self, ceiling: int = 4096) -> int:
+        """Bound non-file-generation JSON phases.
+
+        Analysis, requirements, and plan-refinement turns are orchestration
+        control messages. They should be detailed enough to guide later work,
+        but they should not inherit the large implementation payload ceiling
+        reserved for generated files.
+        """
+        return max(2048, min(self.config.implementation_model.max_tokens, ceiling))
+
     def _extract_json_or_retry(
         self,
         raw: str,
@@ -593,6 +709,10 @@ class FeedbackLoopAgent:
         try:
             return extract_json_object(raw)
         except Exception as exc:
+            if feedback:
+                inferred = self._feedback_reasoning_intent_fallback(phase, raw, exc)
+                if inferred is not None:
+                    return inferred
             tail = self._repair_tail_for_prompt(raw)
             step_limit, limit_is_hard = self._configured_plan_step_limit()
             if step_limit and limit_is_hard:
@@ -649,6 +769,95 @@ class FeedbackLoopAgent:
                 )
                 repaired_minimal = self._implementation_chat(last_chance_prompt, max_tokens=4096)
                 return extract_json_object(repaired_minimal)
+
+    def _feedback_reasoning_intent_fallback(
+        self,
+        phase: str,
+        raw: str,
+        parse_error: Exception,
+    ) -> dict[str, Any] | None:
+        """Recover clear reviewer intent from reasoning-only feedback.
+
+        Some local models decide correctly in `<think>` text but never emit the
+        required JSON before hitting the token cap. A second repair call often
+        repeats the same loop and wastes minutes. This fallback only fires when
+        the unparseable reviewer text itself contains a clear accept/reject
+        decision; otherwise the normal JSON repair path still runs.
+        """
+        text = re.sub(r"\s+", " ", raw).strip()
+        if not text:
+            return None
+        tail = text[-2400:].lower()
+        positive_markers = (
+            "i will accept",
+            "i'll accept",
+            "i accept",
+            "will accept",
+            "i will approve",
+            "i approve",
+            "looks complete",
+            "looks good",
+            "fully comply",
+            "fully complies",
+            "plan is feasible",
+            "feasible, clear, and verifiable",
+            "no required changes",
+            "no changes required",
+        )
+        negative_markers = (
+            "needs rework",
+            "needs_rework",
+            "needs plan change",
+            "needs_plan_change",
+            "needs requirements change",
+            "needs_requirements_change",
+            "cannot accept",
+            "do not accept",
+            "reject",
+            "missing",
+            "must fix",
+            "must be fixed",
+            "not verifiable",
+            "not feasible",
+            "not clear",
+        )
+        positive = any(marker in tail for marker in positive_markers)
+        negative = any(marker in tail for marker in negative_markers)
+        if not positive and not negative:
+            return None
+        if positive and not negative:
+            review = {
+                "status": "resolved",
+                "needs_rework": False,
+                "summary": f"{phase} reviewer emitted reasoning-only output; harness inferred acceptance from the reviewer text.",
+                "required_changes": [],
+                "inferred_from_malformed_response": True,
+                "parse_error": str(parse_error),
+            }
+            if "PLAN_VALIDATION" in phase:
+                review["planning_confirmation"] = {
+                    "feasible": True,
+                    "clear": True,
+                    "verifiable": True,
+                    "verification_matrix": [],
+                }
+            return review
+        status = "needs_rework"
+        if "PLAN_VALIDATION" in phase:
+            status = "needs_plan_change"
+        elif "REQUIREMENTS" in phase and "requirements" in tail:
+            status = "needs_requirements_change"
+        return {
+            "status": status,
+            "needs_rework": True,
+            "summary": f"{phase} reviewer emitted reasoning-only output; harness inferred requested rework from the reviewer text.",
+            "required_changes": [
+                "Address the reviewer concern described in the malformed reasoning output.",
+                "Return compact JSON evidence on the next pass so review can proceed deterministically.",
+            ],
+            "inferred_from_malformed_response": True,
+            "parse_error": str(parse_error),
+        }
 
     def _repair_tail_for_prompt(self, raw: str, limit: int = 1200) -> str:
         """Return bounded recovery context for malformed model output.
@@ -723,19 +932,53 @@ class FeedbackLoopAgent:
     def run(self) -> dict:
         self.initialize()
         research_result = self._web_research_phase()
-        req_result = self._requirements_refinement_phase()
-        plan_result = self._plan_validation_phase()
-        git_baseline = self._git_baseline_commit()
+        git_baseline: dict[str, Any] = {"committed": False, "reason": "No implementation baseline was created."}
+        analysis_result: dict[str, Any] = {}
+        req_result: dict[str, Any] = {}
+        plan_result: dict[str, Any] = {}
         step_results: list[dict[str, Any]] = []
-        while True:
-            step = self._next_pending_step()
-            if step is None:
+        final_review: dict[str, Any] = {}
+        approach_review: dict[str, Any] = {}
+        retry_context = ""
+        for approach_attempt in range(1, self.config.loop.max_approach_reattempts + 1):
+            self._append_plan_note(f"[approach {approach_attempt}] starting analysis and planning pass.")
+            analysis_result = self._analysis_phase(extra_context=retry_context, approach_attempt=approach_attempt)
+            req_result = self._requirements_refinement_phase(extra_context=retry_context)
+            plan_result = self._plan_validation_phase()
+            if approach_attempt == 1:
+                git_baseline = self._git_baseline_commit()
+            step_results = []
+            while True:
+                step = self._next_pending_step()
+                if step is None:
+                    break
+                step_results.append(self._implementation_loop_for_step(step))
+                self._write_plan_doc()
+                if step_results[-1]["status"] == "cannot_resolve" and self.config.resolution_policy.stop_on_cannot_resolve:
+                    break
+            final_review = self._final_review_phase(step_results)
+            approach_review = self._approach_review_phase(approach_attempt, step_results, final_review)
+            self.approach_history.append({
+                "approach_attempt": approach_attempt,
+                "analysis": analysis_result,
+                "requirements_refinement": req_result,
+                "plan_validation": plan_result,
+                "steps": self._compact_step_results_for_prompt(step_results),
+                "final_review_status": final_review.get("status"),
+                "final_status": self._final_status(step_results, final_review),
+                "approach_review": approach_review,
+            })
+            if not self._approach_review_requests_retry(approach_review):
                 break
-            step_results.append(self._implementation_loop_for_step(step))
-            self._write_plan_doc()
-            if step_results[-1]["status"] == "cannot_resolve" and self.config.resolution_policy.stop_on_cannot_resolve:
+            if approach_attempt >= self.config.loop.max_approach_reattempts:
+                self._append_plan_note(
+                    "[approach] retry requested, but max_approach_reattempts was reached; keeping latest result."
+                )
                 break
-        final_review = self._final_review_phase(step_results)
+            retry_context = json.dumps(self._compact_approach_review_for_retry(approach_review), ensure_ascii=False)
+            self._append_plan_note(
+                f"[approach {approach_attempt}] reviewer requested another approach: {approach_review.get('summary', '')}"
+            )
         git_finalize = self._git_finalize_policy()
         active_transcript_md = self.state_dir / "conversation.md"
         full_transcript_md = self.state_dir / "conversation.full.md"
@@ -748,6 +991,7 @@ class FeedbackLoopAgent:
             "active_transcript_jsonl": ".agent_state/conversation.jsonl",
             "active_transcript_markdown": ".agent_state/conversation.md",
             "web_research": research_result,
+            "problem_analysis": analysis_result,
             "requirements_refinement": req_result,
             "plan_validation": plan_result,
             "git": {
@@ -758,6 +1002,8 @@ class FeedbackLoopAgent:
             },
             "steps": step_results,
             "final_review": final_review,
+            "approach_review": approach_review,
+            "approach_history": self.approach_history,
             "final_status": self._final_status(step_results, final_review),
         }
         (self.state_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -790,6 +1036,136 @@ class FeedbackLoopAgent:
             )
         return result
 
+    def _analysis_phase(self, *, extra_context: str | None = None, approach_attempt: int = 1) -> dict[str, Any]:
+        """Analyze the problem before requirements and planning.
+
+        The harness asks the model to compare approaches and identify source
+        gaps, but it does not decide the solution. A reviewer pass pushes back
+        on shallow or single-path analysis before planning can begin.
+        """
+        iterations: list[dict[str, Any]] = []
+        latest: dict[str, Any] = {}
+        review: dict[str, Any] = {}
+        for index in range(1, self.config.phases.analysis.max_iterations + 1):
+            prompt = (
+                f"PROBLEM_ANALYSIS_PHASE approach_attempt={approach_attempt} iteration={index}\n"
+                "Analyze the user's request before planning. Restate the problem, inspect the available "
+                "workspace/research/source context, identify what is possible or uncertain, and compare "
+                "multiple solution paths. Do not write project files and do not solve benchmark tasks in "
+                "the harness itself. This phase prepares later model-driven requirements and planning.\n"
+                "Challenge yourself before returning: Are the analysis and solution paths comprehensive, "
+                "domain-aware, and adequate for the user's request? Redo weak analysis inside this response "
+                "before emitting final JSON.\n"
+                f"{self._execution_environment_guidance()}\n"
+                f"{self._harness_state_file_guidance()}\n"
+                f"Web research evidence: {compact_research_for_prompt(self.web_research_result)}\n"
+                f"Prior approach history: {self._approach_history_summary_for_prompt()}\n"
+                f"Extra context from prior approach review: {extra_context or 'none'}\n\n"
+                f"{ANALYSIS_CONTRACT}"
+            )
+            raw = self._implementation_chat(prompt, max_tokens=self._structured_control_tokens(6144))
+            try:
+                latest = self._extract_json_or_retry(
+                    raw,
+                    phase="PROBLEM_ANALYSIS_PHASE",
+                    contract=ANALYSIS_CONTRACT,
+                )
+            except Exception as exc:
+                latest = {
+                    "problem_restatement": "Problem analysis failed to return parseable JSON.",
+                    "domain_and_constraints": [f"Analysis parse failure recorded: {exc}"],
+                    "initial_source_check": {"sources_checked": [], "source_gaps": ["analysis parse failure"], "freshness_risks": []},
+                    "possible_solution_paths": [],
+                    "recommended_path": {"path_id": "", "rationale": "", "fallback_trigger": ""},
+                    "analysis_quality": {
+                        "is_comprehensive": False,
+                        "is_domain_aware": False,
+                        "is_actionable_for_planning": False,
+                        "remaining_unknowns": ["No valid analysis yet."],
+                    },
+                    "parse_error": str(exc),
+                }
+            self.problem_analysis = latest
+            review = self._analysis_review(index, latest)
+            iterations.append({"iteration": index, "analysis": latest, "review": review})
+            if self._status(review) == "resolved":
+                self._append_plan_note(f"[analysis] resolved after iteration {index}: {review.get('summary', '')}")
+                return {"status": "resolved", "iterations": iterations}
+            self.conversation.append(
+                "user",
+                "ANALYSIS_REWORK_DIRECTIVE:\nRevise the problem analysis using this review. "
+                "Do not narrow the harness toward one benchmark; preserve general-purpose problem solving:\n"
+                + json.dumps(self._compact_review_for_transcript(review), indent=2),
+            )
+        fallback = self._fallback_resolution("analysis", review)
+        return {"status": fallback["status"], "iterations": iterations, "resolution": fallback}
+
+    def _analysis_review(self, index: int, analysis: dict[str, Any]) -> dict[str, Any]:
+        prompt = {
+            "phase": "PROBLEM_ANALYSIS_REVIEW_PHASE",
+            "iteration": index,
+            "project_design": self.config.project_design.prompt,
+            "analysis": analysis,
+            "web_research_evidence": self.web_research_result,
+            "prior_approach_history": self.approach_history,
+            "checks": [
+                "the request is restated before planning",
+                "available workspace, research, or source context is acknowledged",
+                "uncertainties and impossible constraints are preserved",
+                "multiple solution paths are compared",
+                "a recommended first path and fallback trigger are named",
+                "the analysis does not contain a benchmark-specific solution shortcut",
+            ],
+            "expected_json": {
+                "status": "resolved|needs_rework|cannot_resolve",
+                "needs_rework": True,
+                "summary": "review summary",
+                "required_changes": ["specific analysis gap"],
+                "quality_questions": ["question"],
+            },
+        }
+        raw = self._feedback_chat(
+            "PROBLEM_ANALYSIS_REVIEW_PHASE\n"
+            "Review the pre-plan problem analysis. Push back if it skips source/context checks, "
+            "lists only one path, or starts solving the task instead of setting up a universal workflow.\n"
+            + json.dumps(prompt),
+            temperature=0.1,
+        )
+        review = self._normalize_review(self._extract_json_or_retry(
+            raw,
+            phase="PROBLEM_ANALYSIS_REVIEW_PHASE",
+            contract=ANALYSIS_REVIEW_CONTRACT,
+            feedback=True,
+        ))
+        deterministic = self._analysis_structural_findings(analysis)
+        if deterministic:
+            existing = [str(item) for item in review.get("required_changes", [])]
+            review["required_changes"] = existing + [item for item in deterministic if item not in existing]
+            if self._status(review) == "resolved":
+                review["status"] = "needs_rework"
+                review["needs_rework"] = True
+                review["summary"] = "Deterministic analysis checks found missing pre-plan coverage."
+        return review
+
+    def _analysis_structural_findings(self, analysis: dict[str, Any]) -> list[str]:
+        findings: list[str] = []
+        if not str(analysis.get("problem_restatement") or "").strip():
+            findings.append("Analysis is missing a problem_restatement.")
+        paths = analysis.get("possible_solution_paths") or []
+        if not isinstance(paths, list) or len(paths) < 2:
+            findings.append("Analysis must compare at least two possible solution paths before planning.")
+        recommended = analysis.get("recommended_path")
+        if not isinstance(recommended, dict) or not recommended.get("path_id"):
+            findings.append("Analysis is missing a recommended_path.path_id.")
+        quality = analysis.get("analysis_quality") or {}
+        if isinstance(quality, dict):
+            for key in ("is_comprehensive", "is_domain_aware", "is_actionable_for_planning"):
+                if quality.get(key) is not True:
+                    findings.append(f"analysis_quality.{key} is not true.")
+        else:
+            findings.append("Analysis is missing analysis_quality.")
+        return findings
+
     def _requirements_refinement_phase(self, extra_context: str | None = None) -> dict:
         """Turn an underspecified project brief into requirements and a draft plan."""
         iterations: list[dict[str, Any]] = []
@@ -812,13 +1188,19 @@ class FeedbackLoopAgent:
                 f"{self._default_quality_instruction()}\n"
                 f"{self._execution_environment_guidance()}\n"
                 f"{self._harness_state_file_guidance()}\n"
+                f"Problem analysis summary: {self._analysis_summary_for_prompt()}\n"
+                "Use the recommended path from the analysis as the first planning direction, but preserve fallback "
+                "triggers and open unknowns. If planning reveals the recommended path is wrong, record that and "
+                "choose a better path instead of forcing the earlier analysis.\n"
                 f"Web research evidence: {compact_research_for_prompt(self.web_research_result)}\n"
                 "If web research status is completed or partial, use those findings in the requirements and plan; "
                 "the first research/structure step must cite the source URLs in generated project notes. "
                 "If web research is skipped or disabled, record available-knowledge notes instead and do not invent URLs.\n"
+                "Challenge yourself before returning: Are the analysis, requirements, assumptions, and plan comprehensive "
+                "and adequate for the problem domain? If not, fix them before emitting JSON.\n"
                 f"Extra context: {extra_context or 'none'}\n\n{REQUIREMENTS_CONTRACT}"
             )
-            raw = self._implementation_chat(prompt, max_tokens=max(self.config.implementation_model.max_tokens, 4096))
+            raw = self._implementation_chat(prompt, max_tokens=self._structured_control_tokens(6144))
             try:
                 latest = self._extract_json_or_retry(
                     raw,
@@ -892,7 +1274,9 @@ class FeedbackLoopAgent:
             "If constraints conflict, request a clear compromise instead of repeatedly enforcing both sides "
             "of an impossible constraint. Per-attempt output-size guidance is not a plan-step limit.\n"
             "If default quality policy applies, reject requirements that omit project structure, tests, documentation, "
-            "or the initial research/structure planning step.\n"
+            "or the initial research/structure planning step. If default_quality_policy.applies is false because "
+            "the user explicitly constrained deliverables to one output/artifact, do not require extra project files; "
+            "require validation evidence that respects the artifact constraint instead.\n"
             "Apply execution_environment strictly. If deterministic_environment_findings is non-empty, request a "
             "requirements or plan correction instead of accepting incompatible assumptions.\n"
             "If WEB_RESEARCH_TOOL_RESULT has completed or partial sources, reject requirements that ignore those sources. "
@@ -980,6 +1364,9 @@ class FeedbackLoopAgent:
             "A command that only starts an HTTP server is not validation. Treat step-count limits as "
             "hard only when the user explicitly says hard/strict/exactly/must; otherwise prefer a "
             "practical feasible verifiable plan. Per-attempt file-count guidance is not a plan-step limit.\n"
+            "Challenge the plan before accepting it: Are the analysis and planning comprehensive and adequate "
+            "to the request and domain? Does any step need to be updated because it is impossible, stale, "
+            "or no longer useful? Push back with needs_plan_change if so.\n"
             f"{self._execution_environment_guidance()}\n"
             f"{self._harness_state_file_guidance()}\n"
             + json.dumps(prompt),
@@ -1016,7 +1403,7 @@ class FeedbackLoopAgent:
             f"Web research evidence: {compact_research_for_prompt(self.web_research_result)}\n"
             f"Review: {json.dumps(self._compact_review_for_transcript(review))}\n\n{PLAN_REFINEMENT_CONTRACT}"
         )
-        raw = self._implementation_chat(prompt)
+        raw = self._implementation_chat(prompt, max_tokens=self._structured_control_tokens())
         try:
             payload = self._extract_json_or_retry(
                 raw,
@@ -1122,7 +1509,9 @@ class FeedbackLoopAgent:
             self.conversation.append(
                 "user",
                 "NEXT_IMPLEMENTATION_DIRECTIVE:\nApply this step review in the next attempt. "
-                "Keep previous requirements, plan validation, and this step context in mind:\n"
+                "Keep previous requirements, analysis, plan validation, repair history, and this step context in mind. "
+                "Summarize what remains incomplete and complete those gaps if possible. If the plan is now stale, "
+                "impossible, or no longer useful, request needs_plan_change instead of burning attempts on it:\n"
                 + json.dumps(self._compact_review_for_transcript(review), indent=2),
             )
         resolution = self._fallback_resolution(f"step {step['id']}", attempts[-1]["review"] if attempts else {})
@@ -1143,6 +1532,9 @@ class FeedbackLoopAgent:
             "Work on this single plan step only. Do not silently jump ahead. If the step is impossible, "
             "use resolution_request and explain why. Cross-check your edits against this step's acceptance "
             "criteria and include validation commands that prove the step whenever terminal tools are enabled.\n"
+            "You are responsible for choosing the repair strategy. Use the recorded analysis, review findings, "
+            "command evidence, and prior repair history to decide what to change; the harness provides evidence "
+            "and boundaries, not a predetermined solution.\n"
             "Do not stage or commit with git. The harness owns git add/commit after feedback accepts a step. "
             "You may run read-only git commands such as git status or git diff for your own evidence.\n"
             f"Do not rewrite {self.config.runtime.plan_file} just to mark the current step complete; put progress in plan_note. "
@@ -1161,6 +1553,7 @@ class FeedbackLoopAgent:
             "If previous attempts created malformed code, first stabilize the affected files using conservative "
             "canonical source. If a file is already correct, do not rewrite it just for variety; repeated rewrites "
             "should reduce risk, not generate new syntax variants.\n"
+            f"Problem analysis summary: {self._analysis_summary_for_prompt()}\n"
             f"Requirements summary: {self._requirements_summary_for_prompt()}\n"
             f"Validated plan step ids: {[step.get('id') for step in self.plan_steps]}\n"
             f"Workflow state context:\n{self._workflow_state_for_prompt(step)}\n"
@@ -1198,12 +1591,16 @@ class FeedbackLoopAgent:
         written = write_files(self.workspace, allowed_files)
         command_results = []
         if self.config.mcp_tools.terminal:
-            command_results = run_commands(
-                self.workspace,
+            command_results = self._run_verified_commands(
                 payload.get("commands", []),
-                self.config.runtime.command_timeout_seconds,
-                self.config.runtime.max_command_timeout_seconds,
-                output_limit_chars=self.config.context_compaction.tool_output_max_chars,
+                source="implementation",
+                context={
+                    "step": step,
+                    "attempt": attempt,
+                    "plan_note": payload.get("plan_note"),
+                    "test_evidence": payload.get("test_evidence", []),
+                    "purpose": "Implementation-agent requested terminal commands for the current plan step.",
+                },
             )
         note = payload.get("plan_note") or f"{step['id']} attempt {attempt} implementation pass completed."
         self._append_plan_note(f"[{step['id']} attempt {attempt}] {note}")
@@ -1319,6 +1716,102 @@ class FeedbackLoopAgent:
         fallback = self._fallback_resolution("final review", iterations[-1]["review"] if iterations else {})
         self._append_plan_note(f"[final review] {fallback['status']}: {fallback['note']}")
         return {"status": fallback["status"], "iterations": iterations, "resolution": fallback}
+
+    def _approach_review_phase(
+        self,
+        approach_attempt: int,
+        step_results: list[dict[str, Any]],
+        final_review: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Ask whether the executed approach was the right response.
+
+        This is separate from correctness review. A project can pass its plan
+        but still reveal that another approach is needed, for example a
+        periodic monitoring task that must check again later or a plan that
+        satisfied narrow tests while missing the user's broader intent.
+        """
+        prompt = {
+            "phase": "APPROACH_REVIEW_PHASE",
+            "approach_attempt": approach_attempt,
+            "max_approach_reattempts": self.config.loop.max_approach_reattempts,
+            "project_design": self.config.project_design.prompt,
+            "problem_analysis": self._analysis_summary_for_prompt(),
+            "requirements": self._requirements_summary_for_prompt(),
+            "plan": self._compact_plan_for_prompt(),
+            "step_results": self._compact_step_results_for_prompt(step_results),
+            "final_review": self._compact_final_review_for_approach(final_review),
+            "prior_approach_history": self._approach_history_summary_for_prompt(),
+            "expected_json": {
+                "status": "resolved|try_another_approach|needs_rework|cannot_resolve",
+                "needs_rework": False,
+                "summary": "decision summary",
+                "decision": "keep_result|retry_with_new_approach|stop",
+                "recommended_next_approach": "only when retrying",
+                "evidence_reviewed": ["evidence"],
+                "runbook_updates": ["note"],
+            },
+        }
+        raw = self._feedback_chat_with_compact_context(
+            "APPROACH_REVIEW_PHASE\n"
+            "Decide whether the completed approach was the right response to the original user request. "
+            "Use the final review and evidence, but evaluate broader fit: whether a different approach, "
+            "another timed check, a requirements correction, or a plan rethink is warranted. Do not retry "
+            "for style or novelty; retry only when evidence shows a meaningful gap or the task requires "
+            "periodic re-checking. Summarize gaps and failures, and if they can be completed within the "
+            "existing approach say so without requesting a full retry.\n"
+            + json.dumps(prompt),
+            context_note=(
+                "The full transcript remains in .agent_state/conversation.full.jsonl. "
+                "This phase reviews approach adequacy, not implementation details already covered by final review."
+            ),
+            temperature=0.1,
+        )
+        review = self._normalize_review(self._extract_json_or_retry(
+            raw,
+            phase="APPROACH_REVIEW_PHASE",
+            contract=APPROACH_REVIEW_CONTRACT,
+            feedback=True,
+        ))
+        decision = str(review.get("decision") or "").strip()
+        if decision == "retry_with_new_approach" and self._status(review) == "resolved":
+            review["status"] = "try_another_approach"
+            review["needs_rework"] = True
+        if self._status(review) == "try_another_approach" and not review.get("recommended_next_approach"):
+            review["recommended_next_approach"] = "Re-run analysis and planning from the recorded gaps."
+        self._append_plan_note(f"[approach review {approach_attempt}] {review.get('summary', 'no summary')}")
+        return review
+
+    def _approach_review_requests_retry(self, review: dict[str, Any]) -> bool:
+        return self._status(review) == "try_another_approach" or str(review.get("decision")) == "retry_with_new_approach"
+
+    def _compact_approach_review_for_retry(self, review: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in {
+                "status": review.get("status"),
+                "summary": review.get("summary"),
+                "decision": review.get("decision"),
+                "recommended_next_approach": review.get("recommended_next_approach"),
+                "runbook_updates": review.get("runbook_updates", []),
+                "required_changes": review.get("required_changes", []),
+            }.items()
+            if value not in (None, "", [])
+        }
+
+    def _compact_final_review_for_approach(self, final_review: dict[str, Any]) -> dict[str, Any]:
+        iterations = final_review.get("iterations") or []
+        last = iterations[-1] if iterations else {}
+        review = last.get("review") or {}
+        return {
+            "status": final_review.get("status"),
+            "resolution": final_review.get("resolution"),
+            "last_review_status": review.get("status"),
+            "last_review_summary": review.get("summary"),
+            "required_changes": self._clip_list_for_transcript(review.get("required_changes", [])),
+            "deterministic_evidence_findings": self._clip_list_for_transcript(
+                review.get("deterministic_evidence_findings", [])
+            ),
+        }
 
     def _final_project_review(self, attempt: int, step_results: list[dict[str, Any]]) -> dict:
         feedback_tool_evidence = self._final_feedback_tool_evidence(step_results)
@@ -1660,12 +2153,14 @@ class FeedbackLoopAgent:
         written = write_files(self.workspace, allowed_files)
         command_results = []
         if self.config.mcp_tools.terminal:
-            command_results = run_commands(
-                self.workspace,
+            command_results = self._run_verified_commands(
                 payload.get("commands", []),
-                self.config.runtime.command_timeout_seconds,
-                self.config.runtime.max_command_timeout_seconds,
-                output_limit_chars=self.config.context_compaction.tool_output_max_chars,
+                source="final_correction",
+                context={
+                    "attempt": attempt,
+                    "review": self._compact_review_for_correction(review),
+                    "purpose": "Implementation-agent requested terminal commands for final correction.",
+                },
             )
         self._append_plan_note(f"[final correction attempt {attempt}] {payload.get('plan_note', 'completed')}")
         return {
@@ -1778,6 +2273,42 @@ class FeedbackLoopAgent:
         summary = str(self.requirements.get("project_summary") or self.requirements.get("summary") or "")
         items = [str(item) for item in self.requirements.get("refined_requirements", [])[:8]]
         return json.dumps({"summary": summary, "key_requirements": items})
+
+    def _analysis_summary_for_prompt(self) -> str:
+        if not isinstance(self.problem_analysis, dict) or not self.problem_analysis:
+            return "No problem analysis available yet."
+        paths = self.problem_analysis.get("possible_solution_paths") or []
+        recommended = self.problem_analysis.get("recommended_path") or {}
+        return json.dumps({
+            "problem_restatement": self.problem_analysis.get("problem_restatement"),
+            "domain_and_constraints": self.problem_analysis.get("domain_and_constraints", [])[:8],
+            "source_gaps": (self.problem_analysis.get("initial_source_check") or {}).get("source_gaps", [])[:5],
+            "possible_solution_paths": [
+                {
+                    "id": path.get("id"),
+                    "description": path.get("description"),
+                    "risks": path.get("risks", [])[:3],
+                }
+                for path in paths[:5]
+                if isinstance(path, dict)
+            ],
+            "recommended_path": recommended,
+        }, ensure_ascii=False)
+
+    def _approach_history_summary_for_prompt(self) -> str:
+        if not self.approach_history:
+            return "No completed approach attempts yet."
+        compact = []
+        for item in self.approach_history[-5:]:
+            review = item.get("approach_review") or {}
+            compact.append({
+                "approach_attempt": item.get("approach_attempt"),
+                "final_status": item.get("final_status"),
+                "approach_decision": review.get("decision") or review.get("status"),
+                "summary": review.get("summary"),
+                "runbook_updates": review.get("runbook_updates", []),
+            })
+        return json.dumps(compact, ensure_ascii=False)
 
     def _harness_state_file_plan_findings(self, step: dict[str, Any]) -> list[str]:
         """Reject plans that turn workflow-control files into project artifacts.
@@ -2205,20 +2736,27 @@ class FeedbackLoopAgent:
         )
 
     def _default_quality_policy_payload(self) -> dict[str, Any]:
+        explicit_artifact_only = self._explicit_artifact_only_constraint()
         return {
             "applies": self._default_quality_policy_applies(),
+            "explicit_artifact_only_constraint": explicit_artifact_only,
             "assumed_requirement": (
                 "Unless the user explicitly says otherwise, code should be well structured, well tested, "
                 "well documented, and the first implementation step or first part of the first step should research "
                 "required patterns/knowledge, plan project structure, and update the remaining plan if structure "
-                "changes the task order. "
+                "changes the task order. Explicit user constraints such as outputting one named artifact only override "
+                "additional documentation or test deliverables, but do not remove the need for validation evidence. "
                 "Cited source URLs are required only when web research fetched sources."
             ),
         }
 
     def _default_quality_instruction(self) -> str:
         if not self._default_quality_policy_applies():
-            return "The user prompt appears to override the default code-quality policy; record that override explicitly."
+            return (
+                "The user prompt appears to override default extra deliverables or code-quality assumptions. "
+                "Record that override explicitly, do not add files that violate an output-only constraint, and still "
+                "plan validation commands/evidence that prove the requested artifact is correct."
+            )
         return (
             "Default quality policy applies unless the user explicitly says otherwise: add a requirement that the project "
             "is well structured, well tested, and well documented. The first implementation step, or the first part of "
@@ -2230,6 +2768,8 @@ class FeedbackLoopAgent:
 
     def _default_quality_policy_applies(self) -> bool:
         if not self.config.quality_policy.assume_code_quality_when_unspecified:
+            return False
+        if self._explicit_artifact_only_constraint():
             return False
         prompt = self.config.project_design.prompt.lower()
         overrides = [
@@ -2243,6 +2783,21 @@ class FeedbackLoopAgent:
             "ignore code quality",
         ]
         return not any(item in prompt for item in overrides)
+
+    def _explicit_artifact_only_constraint(self) -> bool:
+        """Detect explicit user constraints that limit deliverables.
+
+        This is intentionally conservative: it looks for an action verb near
+        `only`, so phrases like "A is the only vowel" do not disable the default
+        quality policy by themselves.
+        """
+        prompt = self.config.project_design.prompt.lower()
+        patterns = [
+            r"\b(?:create|write|produce|output|return|put)\b[^.?!\n]{0,100}\bonly\b",
+            r"\bonly\b[^.?!\n]{0,60}\b(?:file|artifact|answer|output)\b",
+            r"\b(?:single|one)\b[^.?!\n]{0,40}\b(?:file|artifact|output)\b",
+        ]
+        return any(re.search(pattern, prompt) for pattern in patterns)
 
     def _has_completed_research(self) -> bool:
         return self.web_research_result.get("status") in {"completed", "partial"} and bool(self._research_source_urls())
@@ -2424,6 +2979,297 @@ class FeedbackLoopAgent:
             return "hard_pushback"
         return "compromise"
 
+    def _run_verified_commands(
+        self,
+        commands: list[list[str] | dict[str, Any]],
+        *,
+        source: str,
+        context: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        commands = [command for command in commands if command]
+        if not commands:
+            return []
+        verification = self._tool_call_verification_phase(commands, source=source, context=context or {})
+        decisions = self._tool_verification_decisions(verification, len(commands))
+        results: list[dict[str, Any] | None] = [None] * len(commands)
+        runnable: list[Any] = []
+        runnable_indexes: list[int] = []
+        for index, command in enumerate(commands):
+            decision = decisions.get(index, {})
+            if str(decision.get("decision")) == "blocked":
+                results[index] = self._blocked_tool_result(command, decision, verification)
+                continue
+            runnable.append(command)
+            runnable_indexes.append(index)
+        if runnable:
+            executed = run_commands(
+                self.workspace,
+                runnable,
+                self.config.runtime.command_timeout_seconds,
+                self.config.runtime.max_command_timeout_seconds,
+                output_limit_chars=self.config.context_compaction.tool_output_max_chars,
+            )
+            for index, result in zip(runnable_indexes, executed):
+                result["tool_verification"] = decisions.get(index, {"decision": "approved"})
+                results[index] = result
+        return [result for result in results if result is not None]
+
+    def _tool_call_verification_phase(
+        self,
+        commands: list[Any],
+        *,
+        source: str,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        deterministic = self._deterministic_tool_call_findings(commands)
+        prompt = {
+            "phase": "TOOL_CALL_VERIFICATION_PHASE",
+            "source": source,
+            "commands": [
+                {"index": index, "command": command}
+                for index, command in enumerate(commands)
+            ],
+            "context": context,
+            "workflow_state": self._workflow_state_for_prompt(context.get("step") if isinstance(context.get("step"), dict) else None),
+            "deterministic_findings": deterministic,
+            "runtime_policy": {
+                "workspace": str(self.workspace),
+                "default_timeout_seconds": self.config.runtime.command_timeout_seconds,
+                "max_timeout_seconds": self.config.runtime.max_command_timeout_seconds,
+                "tool_output_max_chars": self.config.context_compaction.tool_output_max_chars,
+                "terminal_enabled": self.config.mcp_tools.terminal,
+            },
+            "expected_json": {
+                "status": "approved|blocked|needs_revision",
+                "summary": "verification summary",
+                "commands": [
+                    {
+                        "index": 0,
+                        "decision": "approved|blocked",
+                        "risk_level": "low|medium|high",
+                        "reason": "reason",
+                        "safer_alternative": "optional",
+                    }
+                ],
+            },
+        }
+        raw = self._feedback_chat(
+            "TOOL_CALL_VERIFICATION_PHASE\n"
+            "Verify proposed terminal tool calls before execution. Use the whole transcript to understand intent. "
+            "Approve commands that are correctly targeted, bounded, and useful for the current plan. Block commands "
+            "that may destroy data, target the wrong path/device, depend on malformed quoting, run indefinitely, "
+            "or fail to verify the intended behavior. Deterministic findings are authoritative safety signals.\n"
+            + json.dumps(prompt),
+            temperature=0.0,
+        )
+        try:
+            review = self._extract_json_or_retry(
+                raw,
+                phase="TOOL_CALL_VERIFICATION_PHASE",
+                contract=TOOL_CALL_VERIFICATION_CONTRACT,
+                feedback=True,
+            )
+        except Exception as exc:
+            review = {
+                "status": "blocked",
+                "summary": f"Tool verifier returned malformed JSON: {exc}",
+                "commands": [
+                    {
+                        "index": index,
+                        "decision": "blocked",
+                        "risk_level": "medium",
+                        "reason": "Verifier output was malformed; retry with clearer command intent.",
+                    }
+                    for index, _command in enumerate(commands)
+                ],
+                "parse_error": str(exc),
+            }
+        review = self._normalize_tool_verification(review, commands, deterministic)
+        self.conversation.append(
+            "user",
+            "TOOL_CALL_VERIFICATION_RESULT:\n"
+            + json.dumps(self._compact_tool_verification_for_transcript(review), indent=2),
+        )
+        return review
+
+    def _normalize_tool_verification(
+        self,
+        review: dict[str, Any],
+        commands: list[Any],
+        deterministic: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        review = dict(review)
+        existing = {
+            int(item.get("index", -1)): dict(item)
+            for item in review.get("commands", [])
+            if isinstance(item, dict)
+        }
+        deterministic_by_index: dict[int, list[str]] = {}
+        for finding in deterministic:
+            deterministic_by_index.setdefault(int(finding.get("index", -1)), []).append(str(finding.get("reason", "")))
+        normalized = []
+        any_blocked = False
+        for index, command in enumerate(commands):
+            item = existing.get(index, {"index": index, "decision": "approved", "risk_level": "low", "reason": "No verifier concern."})
+            reasons = [str(item.get("reason") or "")]
+            if deterministic_by_index.get(index):
+                item["decision"] = "blocked"
+                item["risk_level"] = "high"
+                reasons.extend(deterministic_by_index[index])
+                item["reason"] = "; ".join(reason for reason in reasons if reason)
+            if str(item.get("decision")) not in {"approved", "blocked"}:
+                item["decision"] = "blocked"
+                item["reason"] = str(item.get("reason") or "Verifier did not explicitly approve this command.")
+            if item["decision"] == "blocked":
+                any_blocked = True
+            item["index"] = index
+            item["command"] = command
+            normalized.append(item)
+        review["commands"] = normalized
+        if any_blocked:
+            review["status"] = "blocked"
+        else:
+            review["status"] = "approved"
+        review.setdefault("summary", "Tool calls verified.")
+        return review
+
+    def _tool_verification_decisions(self, verification: dict[str, Any], command_count: int) -> dict[int, dict[str, Any]]:
+        decisions: dict[int, dict[str, Any]] = {}
+        for item in verification.get("commands", []):
+            if not isinstance(item, dict):
+                continue
+            index = int(item.get("index", -1))
+            if 0 <= index < command_count:
+                decisions[index] = item
+        return decisions
+
+    def _blocked_tool_result(self, command: Any, decision: dict[str, Any], verification: dict[str, Any]) -> dict[str, Any]:
+        expected = 0
+        if isinstance(command, dict):
+            expected = int(command.get("expected_returncode", 0))
+            command_parts = command.get("cmd") or command.get("command") or []
+        else:
+            command_parts = command
+        if isinstance(command_parts, str):
+            command_parts = [command_parts]
+        return {
+            "command": [str(part) for part in command_parts],
+            "returncode": 126,
+            "expected_returncode": expected,
+            "returncode_matches_expected": 126 == expected,
+            "stdout": "",
+            "stderr": (
+                "Tool call blocked before execution by verification step: "
+                + str(decision.get("reason") or verification.get("summary") or "no reason supplied")
+            ),
+            "timed_out": False,
+            "timeout_seconds": self.config.runtime.command_timeout_seconds,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "blocked_by_tool_verifier": True,
+            "tool_verification": decision,
+        }
+
+    def _deterministic_tool_call_findings(self, commands: list[Any]) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        for index, command in enumerate(commands):
+            parts = self._command_parts_for_safety(command)
+            if not parts:
+                continue
+            executable = Path(parts[0]).name
+            if executable in {"dd", "mkfs", "fdisk", "parted", "wipefs", "mount", "umount"}:
+                findings.append({
+                    "index": index,
+                    "risk_level": "high",
+                    "reason": f"`{executable}` can modify devices or filesystems and requires explicit user approval outside this harness.",
+                })
+            if executable in {"sudo", "su", "docker", "podman"}:
+                findings.append({
+                    "index": index,
+                    "risk_level": "high",
+                    "reason": f"`{executable}` can escape the normal workspace/tool boundary for generated project validation.",
+                })
+            if executable in {"rm", "cp", "mv", "chmod", "chown"}:
+                findings.extend(self._path_sensitive_tool_findings(index, executable, parts))
+            if executable == "curl":
+                findings.extend(self._curl_payload_findings(index, parts))
+            if executable in {"bash", "sh"} and len(parts) >= 3 and parts[1] in {"-c", "-lc"}:
+                script = parts[2]
+                if any(token in script for token in (" dd ", " mkfs", " fdisk", " parted", " wipefs")):
+                    findings.append({
+                        "index": index,
+                        "risk_level": "high",
+                        "reason": "Shell command contains a high-risk disk/filesystem operation.",
+                    })
+                if "curl" in script and script.count("'") % 2 == 1:
+                    findings.append({
+                        "index": index,
+                        "risk_level": "medium",
+                        "reason": "Shell curl command appears to have unbalanced single quotes; use an argv command or write a request body file.",
+                    })
+        return findings
+
+    def _command_parts_for_safety(self, command: Any) -> list[str]:
+        if isinstance(command, dict):
+            parts = command.get("cmd") or command.get("command") or []
+        else:
+            parts = command
+        if isinstance(parts, str):
+            return [parts]
+        return [str(part) for part in parts]
+
+    def _path_sensitive_tool_findings(self, index: int, executable: str, parts: list[str]) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        recursive = any(part in {"-r", "-R", "--recursive"} or (part.startswith("-") and "r" in part.lower()) for part in parts[1:])
+        for arg in parts[1:]:
+            if arg.startswith("-"):
+                continue
+            if arg in {"/", "/*", ".", "./"} and executable == "rm" and recursive:
+                findings.append({
+                    "index": index,
+                    "risk_level": "high",
+                    "reason": f"`{executable}` recursively targets `{arg}`, which is too broad for a generated tool call.",
+                })
+            if arg.startswith(("/dev/", "/mnt/", "/media/", "/home/", "/etc/", "/var/")):
+                findings.append({
+                    "index": index,
+                    "risk_level": "high",
+                    "reason": f"`{executable}` targets absolute path `{arg}` outside the project workspace.",
+                })
+        return findings
+
+    def _curl_payload_findings(self, index: int, parts: list[str]) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        for pos, part in enumerate(parts):
+            if part in {"-d", "--data", "--data-raw", "--data-binary"} and pos + 1 < len(parts):
+                payload = parts[pos + 1].strip()
+                if payload.startswith("{"):
+                    try:
+                        json.loads(payload)
+                    except json.JSONDecodeError as exc:
+                        findings.append({
+                            "index": index,
+                            "risk_level": "medium",
+                            "reason": f"curl JSON payload is malformed before execution: {exc}",
+                        })
+        return findings
+
+    def _compact_tool_verification_for_transcript(self, review: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "status": review.get("status"),
+            "summary": review.get("summary"),
+            "commands": [
+                {
+                    "index": item.get("index"),
+                    "decision": item.get("decision"),
+                    "risk_level": item.get("risk_level"),
+                    "reason": clamp_text(str(item.get("reason", "")), 800, marker="tool verification reason truncated"),
+                }
+                for item in review.get("commands", [])[:20]
+                if isinstance(item, dict)
+            ],
+        }
+
     def _step_feedback_tool_evidence(self, step: dict[str, Any]) -> dict[str, Any]:
         """Collect the evidence the feedback agent can inspect directly.
 
@@ -2435,12 +3281,13 @@ class FeedbackLoopAgent:
         validation_commands = step.get("validation_commands", [])
         validation_results: list[dict[str, Any]] = []
         if self.config.mcp_tools.terminal and validation_commands:
-            validation_results = run_commands(
-                self.workspace,
+            validation_results = self._run_verified_commands(
                 validation_commands,
-                self.config.runtime.command_timeout_seconds,
-                self.config.runtime.max_command_timeout_seconds,
-                output_limit_chars=self.config.context_compaction.tool_output_max_chars,
+                source="step_feedback_validation",
+                context={
+                    "step": step,
+                    "purpose": "Reviewer-owned validation commands for the current plan step.",
+                },
             )
         return {
             "kind": "step_feedback_tools",
@@ -2496,12 +3343,13 @@ class FeedbackLoopAgent:
                     runnable_commands.append(command)
             results: list[dict[str, Any]] = []
             if self.config.mcp_tools.terminal and runnable_commands:
-                results = run_commands(
-                    self.workspace,
+                results = self._run_verified_commands(
                     runnable_commands,
-                    self.config.runtime.command_timeout_seconds,
-                    self.config.runtime.max_command_timeout_seconds,
-                    output_limit_chars=self.config.context_compaction.tool_output_max_chars,
+                    source="final_feedback_validation",
+                    context={
+                        "step": step,
+                        "purpose": "Final-review validation commands from the accepted plan.",
+                    },
                 )
             accepted_commands = self._accepted_validation_commands_for_step(
                 step_result_by_id.get(str(step.get("id")), {})
@@ -2527,12 +3375,13 @@ class FeedbackLoopAgent:
                 accepted_commands_run.append(command)
             accepted_results: list[dict[str, Any]] = []
             if self.config.mcp_tools.terminal and accepted_commands_run:
-                accepted_results = run_commands(
-                    self.workspace,
+                accepted_results = self._run_verified_commands(
                     accepted_commands_run,
-                    self.config.runtime.command_timeout_seconds,
-                    self.config.runtime.max_command_timeout_seconds,
-                    output_limit_chars=self.config.context_compaction.tool_output_max_chars,
+                    source="final_accepted_validation",
+                    context={
+                        "step": step,
+                        "purpose": "Final-review rerun of validation-like commands accepted during implementation.",
+                    },
                 )
             step_validations.append({
                 "step_id": step.get("id"),

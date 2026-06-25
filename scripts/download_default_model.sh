@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$REPO_ROOT/scripts/env.sh"
 
+if [ -n "${MODEL_PROFILE:-}" ]; then
+  eval "$(PYTHONPATH="$REPO_ROOT" python3 -m feedback_agent.model_profiles env "$MODEL_PROFILE")"
+fi
+
 PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
 if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="${PYTHON_BIN_FALLBACK:-python3}"
@@ -22,9 +26,40 @@ if [ -z "${HF_TOKEN:-}" ] && [ -f "$HF_TOKEN_FILE" ]; then
   export HF_TOKEN="$(tr -d '\r\n' < "$HF_TOKEN_FILE")"
 fi
 
-mkdir -p "$QWEN36_LOCAL_DIR"
-VERIFY_JSON="${VERIFY_JSON:-$QWEN36_LOCAL_DIR/qwen36_27b_q4km_verify.json}"
+DOWNLOAD_REPO_ID="${MODEL_REPO_ID:-$QWEN36_REPO_ID}"
+DOWNLOAD_LOCAL_DIR="${MODEL_LOCAL_DIR:-$QWEN36_LOCAL_DIR}"
+DOWNLOAD_FILES=()
+if [ -n "${MODEL_FILE:-}" ]; then
+  DOWNLOAD_FILES+=("$MODEL_FILE")
+elif [ -n "${MODEL_PATH:-}" ]; then
+  DOWNLOAD_FILES+=("$(realpath --relative-to="$DOWNLOAD_LOCAL_DIR" "$MODEL_PATH" 2>/dev/null || basename "$MODEL_PATH")")
+else
+  DOWNLOAD_FILES+=("$QWEN36_MODEL_FILE")
+fi
+if [ -n "${MODEL_DRAFT_FILE:-}" ]; then
+  DOWNLOAD_FILES+=("$MODEL_DRAFT_FILE")
+elif [ -n "${MODEL_DRAFT_PATH:-}" ]; then
+  DOWNLOAD_FILES+=("$(realpath --relative-to="$DOWNLOAD_LOCAL_DIR" "$MODEL_DRAFT_PATH" 2>/dev/null || basename "$MODEL_DRAFT_PATH")")
+fi
+if [ -n "${MMPROJ_FILE:-}" ]; then
+  DOWNLOAD_FILES+=("$MMPROJ_FILE")
+elif [ -n "${MMPROJ_PATH:-}" ]; then
+  DOWNLOAD_FILES+=("$(realpath --relative-to="$DOWNLOAD_LOCAL_DIR" "$MMPROJ_PATH" 2>/dev/null || basename "$MMPROJ_PATH")")
+elif [ -z "${MODEL_PATH:-}" ]; then
+  DOWNLOAD_FILES+=("$QWEN36_MMPROJ_FILE")
+fi
+
+mkdir -p "$DOWNLOAD_LOCAL_DIR"
+VERIFY_JSON="${VERIFY_JSON:-$DOWNLOAD_LOCAL_DIR/model_verify.json}"
 export VERIFY_JSON
+export DOWNLOAD_REPO_ID DOWNLOAD_LOCAL_DIR
+DOWNLOAD_FILES_JSON="$("$PYTHON_BIN" - "${DOWNLOAD_FILES[@]}" <<'PY'
+import json
+import sys
+print(json.dumps(sys.argv[1:]))
+PY
+)"
+export DOWNLOAD_FILES_JSON
 
 "$PYTHON_BIN" - <<'PY'
 from __future__ import annotations
@@ -36,9 +71,9 @@ from pathlib import Path
 
 from huggingface_hub import HfApi, hf_hub_download
 
-repo_id = os.environ["QWEN36_REPO_ID"]
-local_dir = Path(os.environ["QWEN36_LOCAL_DIR"]).expanduser().resolve()
-files = [os.environ["QWEN36_MODEL_FILE"], os.environ["QWEN36_MMPROJ_FILE"]]
+repo_id = os.environ["DOWNLOAD_REPO_ID"]
+local_dir = Path(os.environ["DOWNLOAD_LOCAL_DIR"]).expanduser().resolve()
+files = json.loads(os.environ["DOWNLOAD_FILES_JSON"])
 token = os.environ.get("HF_TOKEN") or None
 verify_json = Path(os.environ["VERIFY_JSON"]).expanduser().resolve()
 

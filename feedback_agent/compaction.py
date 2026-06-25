@@ -24,13 +24,20 @@ def maybe_compact(
         return False
     old_turns = conversation.turns[:-cfg.keep_recent_turns]
     source = "\n\n".join(f"{t.role}: {t.content}" for t in old_turns)
+    initial_context = initial_request_context(conversation.turns)
     prompt = (
         "Summarize this coding-agent conversation into durable memory for a later model turn. "
-        "Preserve requirements, decisions, failed attempts, accepted evidence, open risks, and next steps. "
+        "Preserve the initial user request, requirements, decisions, facts discovered during analysis, "
+        "failed attempts, accepted evidence, open risks, and next steps. Prioritize information needed "
+        "for future repair or verification over dead-end detail. Mention dead ends only by outcome unless "
+        "their exact evidence is still needed. "
         "Do not mark a step complete unless the newest reviewer decision accepted it. "
         "If a later NEXT_IMPLEMENTATION_DIRECTIVE says needs_rework, pending, needs_plan_change, "
         "or needs_requirements_change, preserve that unresolved state exactly. "
         "Use plain prose or bullets, not JSON. Do not include <think> text or trivia.\n\n"
+        "Pinned initial request/context to preserve:\n"
+        + initial_context
+        + "\n\nOlder transcript to summarize:\n"
         + source[-120000:]
     )
     try:
@@ -44,6 +51,8 @@ def maybe_compact(
     cleaned = _clean_compaction_memory(memory)
     if _compaction_memory_is_too_weak(cleaned):
         cleaned = deterministic_compact(source)
+    if initial_context:
+        cleaned = f"INITIAL_REQUEST_CONTEXT:\n{initial_context}\n\n{cleaned}"
     control_state = latest_control_state(conversation.turns)
     if control_state:
         cleaned = f"{cleaned}\n\n{control_state}"
@@ -51,6 +60,26 @@ def maybe_compact(
         cleaned = f"{cleaned}\n\nPINNED_WORKFLOW_STATE:\n{pinned_context}"
     conversation.replace_with_memory(cleaned, cfg.keep_recent_turns)
     return True
+
+
+def initial_request_context(turns: list[Turn], *, limit: int = 8000) -> str:
+    """Return deterministic initial context that model summaries must not erase."""
+    selected: list[str] = []
+    for turn in turns:
+        if turn.role == "system":
+            selected.append(f"system: {_clip_compaction_line(turn.content, 2000)}")
+            continue
+        if turn.role == "user" and (
+            turn.content.startswith("PROJECT DESIGN:")
+            or turn.content.startswith("IMPLEMENTATION_AGENT_REQUEST:\nPROBLEM_ANALYSIS_PHASE")
+        ):
+            selected.append(f"user: {_clip_compaction_line(turn.content, 5000)}")
+        if len(selected) >= 3:
+            break
+    text = "\n\n".join(selected)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " ... [truncated initial request context]"
 
 
 def _clean_compaction_memory(memory: str) -> str:

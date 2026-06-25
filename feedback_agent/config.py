@@ -22,6 +22,8 @@ class ModelConfig:
     retry_sleep_seconds: int
     request_heartbeat_seconds: int
     preserve_reasoning: bool
+    reasoning_budget_tokens: int | None
+    send_reasoning_budget: bool
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,7 @@ class CompactionConfig:
 @dataclass(frozen=True)
 class LoopConfig:
     max_iterations: int
+    max_approach_reattempts: int
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,7 @@ class PhaseLoopConfig:
 
 @dataclass(frozen=True)
 class PhaseConfig:
+    analysis: PhaseLoopConfig
     requirements_refinement: PhaseLoopConfig
     plan_validation: PhaseLoopConfig
     implementation: PhaseLoopConfig
@@ -146,11 +150,11 @@ class AgentConfig:
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "implementation_model": {
-        "name": "qwen3.6-27b-q4km",
+        "name": "gemma4-26b-a4b-qat-mtp",
         "base_url": "http://127.0.0.1:8161/v1",
         "api_key": "not-needed",
         "model": "local-gguf",
-        "context_window": 76800,
+        "context_window": 131072,
         "max_tokens": 32768,
         "temperature": 0.25,
         "request_timeout_seconds": 21_600,
@@ -158,6 +162,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "retry_sleep_seconds": 30,
         "request_heartbeat_seconds": 30,
         "preserve_reasoning": True,
+        "reasoning_budget_tokens": 4096,
+        "send_reasoning_budget": False,
     },
     "feedback_model": None,
     "mcp_tools": {
@@ -179,7 +185,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "live_turn_max_chars": 0,
         "color_transcript": True,
         "final_summary": "compact",
-        "feedback_response_max_tokens": 4096,
+        "feedback_response_max_tokens": 2048,
     },
     "context_compaction": {
         "enabled": True,
@@ -193,8 +199,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "loop": {
         "max_iterations": 3,
+        "max_approach_reattempts": 5,
     },
     "phases": {
+        "analysis": {"max_iterations": 2},
         "requirements_refinement": {"max_iterations": 2},
         "plan_validation": {"max_iterations": 2},
         "implementation": {"max_iterations": 7},
@@ -263,6 +271,12 @@ def _model(data: dict[str, Any], *, base_url_override: str | None = None) -> Mod
         retry_sleep_seconds=max(0, int(data.get("retry_sleep_seconds", 30))),
         request_heartbeat_seconds=max(0, int(data.get("request_heartbeat_seconds", 30))),
         preserve_reasoning=bool(data.get("preserve_reasoning", True)),
+        reasoning_budget_tokens=(
+            None
+            if data.get("reasoning_budget_tokens") is None
+            else max(0, int(data.get("reasoning_budget_tokens", 4096)))
+        ),
+        send_reasoning_budget=bool(data.get("send_reasoning_budget", False)),
     )
 
 
@@ -275,6 +289,7 @@ def _phases(data: dict[str, Any], loop_data: dict[str, Any]) -> PhaseConfig:
     phase_data = data.get("phases", {})
     old_loop_iterations = int(loop_data.get("max_iterations", 3))
     return PhaseConfig(
+        analysis=_phase_loop(phase_data, "analysis", 2),
         requirements_refinement=_phase_loop(phase_data, "requirements_refinement", 2),
         plan_validation=_phase_loop(phase_data, "plan_validation", 2),
         implementation=_phase_loop(phase_data, "implementation", old_loop_iterations),
@@ -377,6 +392,7 @@ def load_config(path: str | Path, repo_root: Path | None = None) -> AgentConfig:
         context_compaction=CompactionConfig(**data["context_compaction"]),
         loop=LoopConfig(
             max_iterations=int(loop_data.get("max_iterations", 3)),
+            max_approach_reattempts=max(1, int(loop_data.get("max_approach_reattempts", 5))),
         ),
         phases=_phases(data, loop_data),
         resolution_policy=_resolution_policy(data),

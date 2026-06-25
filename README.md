@@ -8,7 +8,7 @@
 
 `agenticFeedbackCoding` runs a Docker-isolated local AI coding workflow: edit one JSON prompt, start an OpenAI-compatible model server, and let one agent implement while a second agent reviews every step with tests, git diffs, command output, file evidence, and screenshots/reports when available.
 
-The main tested setup uses `Qwen3.6-27B Q4_K_M` GGUF served by llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395 / Strix Halo. A second comparison run used `Gemma4-26B-A4B Q4_K_M` through the same endpoint shape. Other OpenAI-compatible local or remote models can be configured, but the evidence in this README comes from those local GGUF runs. Normal work uses two Docker containers for safety and reproducibility: one model-server container and one agent container on a shared Docker network. Only the generated project workspace is mounted out to the host.
+The default local profile is now `Gemma 4 26B A4B QAT MTP`, served by llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395 / Strix Halo. The harness also defines profiles for `Gemma 4 31B QAT MTP` and `Qwen3.6 27B MTP`; the Qwen profile is the available public/local MTP artifact corresponding to the requested Qwen dense slot. Other OpenAI-compatible local or remote models can be configured. Normal work uses two Docker containers for safety and reproducibility: one model-server container and one agent container on a shared Docker network. Only the generated project workspace is mounted out to the host.
 
 The project is intentionally config-driven. One JSON file defines the model endpoint, workspace, review strictness, allowed tools, web/offline mode, context-safety limits, and the project prompt.
 
@@ -31,7 +31,7 @@ flowchart LR
 
     subgraph Net["Docker network: agentic-feedback-net"]
         subgraph ModelContainer["Model server container"]
-            Model["GGUF model<br/>Qwen3.6 / Gemma4"]
+            Model["GGUF model profile<br/>Gemma/Qwen MTP or compatible"]
             API["llama.cpp server<br/>OpenAI-compatible REST API<br/>:8161/v1"]
             Model --> API
         end
@@ -63,7 +63,7 @@ Clone the repo, start the local model server, then run a real benchmark through 
 # sudo apt-get update && sudo apt-get install -y git docker.io python3 curl ca-certificates
 git clone https://github.com/krzyszsz/agenticFeedbackCoding.git
 cd agenticFeedbackCoding
-MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
+MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/start_default_model_server.sh
 bash scripts/build_and_run.sh --config config.real-palindrome.json
 ```
 
@@ -84,16 +84,19 @@ The important fields are usually enough:
 ```json
 {
   "implementation_model": {
+    "name": "gemma4-26b-a4b-qat-mtp",
     "base_url": "http://127.0.0.1:8161/v1",
     "model": "local-gguf",
-    "context_window": 76800,
+    "context_window": 131072,
     "max_tokens": 32768,
     "temperature": 0.25,
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
     "retry_sleep_seconds": 30,
     "request_heartbeat_seconds": 30,
-    "preserve_reasoning": true
+    "preserve_reasoning": true,
+    "reasoning_budget_tokens": 4096,
+    "send_reasoning_budget": false
   },
   "feedback_model": null,
   "mcp_tools": {
@@ -113,9 +116,16 @@ The important fields are usually enough:
     "color_transcript": true,
     "live_turn_max_chars": 0,
     "final_summary": "compact",
-    "feedback_response_max_tokens": 4096
+    "feedback_response_max_tokens": 2048
   },
   "web_research": { "enabled": false },
+  "loop": { "max_approach_reattempts": 5 },
+  "phases": {
+    "analysis": { "max_iterations": 2 },
+    "requirements_refinement": { "max_iterations": 2 },
+    "plan_validation": { "max_iterations": 2 },
+    "implementation": { "max_iterations": 7 }
+  },
   "project_design": {
     "title": "My new project",
     "prompt": "Build a browser game with tests and documentation."
@@ -152,14 +162,144 @@ That request is clamped by `runtime.max_command_timeout_seconds`. Model calls us
 
 `runtime.live_turn_max_chars` controls live console output for each transcript turn. The default `0` prints each turn fully as it happens. Set a positive value, for example `30000`, if you want progress to remain visible without a single huge tool payload flooding the terminal. Saved transcript files are not truncated by this setting.
 
+## Workflow Policy
+
+The harness uses one durable transcript and a runbook-style plan file. The
+workflow is intentionally model-driven and general purpose:
+
+| Phase | Owner | Purpose |
+|---|---|---|
+| Problem analysis | Implementation model, reviewed by feedback model | Restate the request, check available sources/context, name constraints, compare multiple solution paths, and choose a first approach. |
+| Requirements refinement | Implementation model, reviewed by feedback model | Convert the prompt and analysis into explicit requirements, assumptions, and a verifiable ordered plan. |
+| Plan validation | Feedback model plus deterministic checks | Push back on stale, impossible, non-verifying, or environment-incompatible plan steps before implementation starts. |
+| Step implementation | Implementation model | Choose autonomous repairs or edits for one plan step at a time, using failure evidence and prior repair history. |
+| Tool-call verification | Feedback model plus deterministic safety checks | Approve or block each proposed terminal call before execution. |
+| Step/final review | Feedback model plus tools | Re-run validation, inspect files/git diffs, and accept, reject, or request plan/requirements changes. |
+| Approach review | Feedback model | Decide whether the completed approach actually answered the original request or whether another approach should run. |
+
+`loop.max_approach_reattempts` defaults to `5`. Increase it for long-running or
+periodic tasks where the model may need to re-check logs, metrics, or external
+state several times.
+
+Repository-level harness principles live in `AGENTS.md`. The short version is:
+the harness manages context, iteration, tools, and verification; it must not
+solve benchmark tasks itself or encode one-off prompt fixes that make unrelated
+tasks worse.
+
+## Model Profiles
+
+Profile metadata lives in `feedback_agent/model_profiles.py` and can be
+inspected with:
+
+```bash
+python -m feedback_agent.model_profiles list
+```
+
+| Profile | Role | Port | Local status on this machine | Notes |
+|---|---|---:|---|---|
+| `gemma4-26b-a4b-qat-mtp` | weak/fast MoE | 8161 | target and MTP draft found under `/mnt/hf/models/gemma4-26b-a4b-it-qat-q4_0-gguf` | Default profile. |
+| `gemma4-31b-qat-mtp` | strong dense | 8162 | target and MTP draft found under `/mnt/hf/models/gemma4-31b-it-qat-gguf` | Higher-quality Gemma slot. |
+| `qwen3.6-27b-mtp` | strong dense | 8163 | profile download target `/mnt/hf/models/qwen3.6-27b-mtp-gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf` | Public MTP artifact corresponding to the requested Qwen dense slot. |
+
+Start a specific profile:
+
+```bash
+MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/start_default_model_server.sh
+MODEL_PROFILE=gemma4-31b-qat-mtp bash scripts/start_default_model_server.sh
+MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/download_default_model.sh
+MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/start_default_model_server.sh
+```
+
+The server launcher passes MTP speculative decoding flags to llama.cpp:
+`--spec-type draft-mtp`, `--spec-draft-n-max`, and `--model-draft` when the
+profile has a separate draft GGUF.
+
+Public profile references: [Gemma 4 26B A4B QAT GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF),
+[Gemma 4 31B QAT GGUF](https://huggingface.co/unsloth/gemma-4-31B-it-qat-GGUF),
+and [Qwen3.6 27B MTP GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF).
+
+## Benchmarks
+
+The benchmark corpus is `benchmarks/tasks.json`. It contains 30 tasks across
+exact-answer puzzles, coding, existing-project repair, frontend/browser checks,
+tool/terminal work, periodic monitoring, safety, planning, and manual quality
+review.
+
+| Category | Count | Grading |
+|---|---:|---|
+| `algorithmic_exact` | 5 | Automatic exact output |
+| `coding` / `existing_project` / `integration` | 9 | Automatic commands |
+| `tool_periodic` | 4 | Automatic fast interval overrides |
+| `tool_safety` | 5 | Automatic and manual |
+| `frontend` | 2 | Automatic structural/browser scripts |
+| `research` / `workflow` / `planning` / `manual_quality` | 5 | Manual pass/fail review |
+
+Dry-run task loading:
+
+```bash
+python scripts/run_benchmarks.py --dry-run --limit 30
+```
+
+Run the full corpus for the default fast model:
+
+```bash
+MODEL_PROFILE=gemma4-26b-a4b-qat-mtp \
+python scripts/run_benchmarks.py --implementation-profile gemma4-26b-a4b-qat-mtp
+```
+
+Run a paired main/verifier experiment:
+
+```bash
+python scripts/run_benchmarks.py \
+  --implementation-profile gemma4-26b-a4b-qat-mtp \
+  --feedback-profile gemma4-31b-qat-mtp
+```
+
+Run thinking-budget sweeps around the default 4096-token budget:
+
+```bash
+python scripts/run_benchmarks.py --implementation-profile gemma4-26b-a4b-qat-mtp --reasoning-budget-tokens 2048
+python scripts/run_benchmarks.py --implementation-profile gemma4-26b-a4b-qat-mtp --reasoning-budget-tokens 6144
+```
+
+The runner writes `results.json`, per-task logs, and `results.md` under
+`runs/benchmarks-<timestamp>/`. Generated workspaces are under
+`workspaces/benchmarks/<timestamp>/` and are intentionally ignored by git.
+
+Current repository-verification evidence:
+
+| Check | Result | Notes |
+|---|---|---|
+| Compile check | Pass | `python -m compileall feedback_agent scripts tests`. |
+| Unit tests | Pass | `python -m unittest discover -s tests -v`, 106 tests. |
+| Benchmark dry run | Pass | `python scripts/run_benchmarks.py --dry-run --limit 30`, all 30 tasks loaded. |
+| Gemma 26B MTP profile | Available | Target and draft files found locally. |
+| Gemma 31B MTP profile | Available | Target and draft files found locally. |
+| Qwen3.6 27B MTP profile | Available | Downloaded and verified with `MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/download_default_model.sh`; verification report at `/mnt/hf/models/qwen3.6-27b-mtp-gguf/model_verify.json`. |
+
+Development smoke attempts against `algo-001-balanced-grid` on
+`gemma4-26b-a4b-qat-mtp` were intentionally stopped after exposing harness
+issues; no successful real benchmark baseline is claimed yet.
+
+| Output dir | Result | Seconds | Finding |
+|---|---|---:|---|
+| `runs/benchmarks-smoke-gemma4-26b-mtp` | Fail, stopped | 408.9 | Reviewer could spend a full response in reasoning-only JSON repair. Fixed with reasoning-intent fallback and lower feedback token ceiling. |
+| `runs/benchmarks-smoke-gemma4-26b-mtp-retry` | Fail, stopped | 433.1 | Structured plan-refinement phases inherited the large implementation token budget. Fixed with bounded structured-control token limits. |
+| `runs/benchmarks-smoke-gemma4-26b-mtp-budgeted` | Fail, stopped | 237.6 | Default quality policy conflicted with explicit output-only prompts. Fixed by treating explicit artifact-only constraints as quality-deliverable overrides while preserving validation requirements. |
+
+Real multi-model benchmark result tables should be pasted from the generated
+`runs/benchmarks-*/results.md` after the three model servers have completed the
+full corpus. Do not fabricate benchmark numbers; if a server/model is missing,
+record that as the result.
+
 ## Safety Model
 
 Normal agentic work runs inside Docker. `scripts/run_agent.sh` refuses to run the workflow directly on the host unless `ALLOW_HOST_AGENT_RUN=1` is explicitly set for harness development.
 
 The standard setup uses two containers on one Docker network:
 
-- `scripts/start_default_model_server.sh` creates/uses `agentic-feedback-net`, starts the llama.cpp/Vulkan server as `agentic-qwen36-server`, and publishes `127.0.0.1:8161` for host-side checks.
-- `scripts/run_agent.sh` starts the agent container on the same network and overrides the in-container model URL to `http://agentic-qwen36-server:8161/v1`.
+- `scripts/start_default_model_server.sh` creates/uses `agentic-feedback-net`, starts the selected profile container, and publishes its configured host port for checks.
+- `scripts/run_agent.sh` starts the agent container on the same network and overrides the in-container model URL to the selected profile container.
 
 The agent container gets one writable mount: the configured `runtime.workspace`, mapped to `/workspace/project`. The config file is mounted read-only. The Docker socket is not mounted. Host networking is no longer required for the normal two-container path; keep it only as an explicit compatibility mode with `DOCKER_NETWORK=host AGENT_DOCKER_NETWORK=host`.
 
@@ -200,15 +340,18 @@ The agent runtime dependencies live inside the agent Docker image. You do not
 need to install Playwright, pytest, Python packages, or project-specific SDKs on
 the host for normal use.
 
-For the tested Qwen3.6 profile, download the model if needed and build/start
-the llama.cpp/Vulkan model-server image:
+For the default fast Gemma MTP profile, build/start the llama.cpp/Vulkan
+model-server image:
 
 ```bash
-HF_TOKEN_FILE=$HOME/hf.key MODEL_ROOT=$HOME/hf/models \
-bash scripts/download_default_model.sh
-
-MODEL_ROOT=$HOME/hf/models REBUILD_SERVER_IMAGE=1 \
+MODEL_PROFILE=gemma4-26b-a4b-qat-mtp REBUILD_SERVER_IMAGE=1 \
 bash scripts/start_default_model_server.sh
+```
+
+For a missing profile, download it first:
+
+```bash
+MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/download_default_model.sh
 ```
 
 `hf.key` is a plain text Hugging Face token outside this repo. Create it only if you need authenticated Hugging Face access:
@@ -224,20 +367,21 @@ Default model paths are defined in `scripts/env.sh`:
 HF_ROOT=$HOME/hf
 MODEL_ROOT=$HF_ROOT/models
 HF_TOKEN_FILE=$HOME/hf.key
+MODEL_PROFILE=gemma4-26b-a4b-qat-mtp
 ```
 
 Start the default llama.cpp/Vulkan server:
 
 ```bash
-MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
+MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/start_default_model_server.sh
 ```
 
-By default this starts llama.cpp with `CTX_SIZE=76800`, `PARALLEL=1`,
+By default this starts llama.cpp with `CTX_SIZE=131072`, `PARALLEL=1`,
 `MEM_LIMIT=75g`, `MEMORY_SWAP=75g`, `GPU_LAYERS=999`, reasoning enabled,
-`REASONING_BUDGET=1024`, `REASONING_FORMAT=deepseek`, and port `8161`.
-It also creates/uses the `agentic-feedback-net` Docker network, names the
-server container `agentic-qwen36-server`, and publishes the API on the host at
-`127.0.0.1:8161` for quick checks.
+`REASONING_BUDGET=4096`, `REASONING_FORMAT=deepseek`, and the selected
+profile port. It also creates/uses the `agentic-feedback-net` Docker network,
+names the server container from the selected profile, and publishes the API on
+the host for quick checks.
 Override `REASONING_MODE=off`, `REASONING_BUDGET=...`, or
 `REASONING_FORMAT=none|deepseek|deepseek-legacy` if a model needs different
 thinking behavior.

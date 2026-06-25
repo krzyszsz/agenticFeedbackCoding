@@ -21,6 +21,7 @@ from feedback_agent.compaction import (
     _clean_compaction_memory,
     _compaction_memory_is_too_weak,
     deterministic_compact,
+    initial_request_context,
     latest_control_state,
     maybe_compact,
 )
@@ -28,6 +29,7 @@ from feedback_agent.config import load_config
 from feedback_agent.conversation import Conversation, Turn
 from feedback_agent.git_tools import meaningful_changed_paths
 from feedback_agent.llm import ModelRequestHeartbeat, ModelRequestRetrier, format_assistant_message
+from feedback_agent.model_profiles import resolve_profile
 from feedback_agent.web_research import compact_research_for_prompt, fetch_page, search_queries_for_prompt
 from feedback_agent.workspace import collect_workspace_files, extract_json_object, run_commands, write_files, write_plan_doc
 
@@ -626,6 +628,34 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("PINNED_WORKFLOW_STATE", active_text)
             self.assertIn("S1 still pending", active_text)
 
+    def test_compaction_preserves_initial_request_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "work"
+            cfg_path = write_config(root, workspace, "initial task", "Build a very specific artifact named alpha.")
+            config = load_config(cfg_path)
+            conversation = Conversation(root / "conversation.jsonl")
+            conversation.append("system", "durable system prompt")
+            conversation.append("user", "PROJECT DESIGN: initial task\n\nBuild a very specific artifact named alpha.")
+            for index in range(12):
+                conversation.append("assistant", f"older implementation chatter {index}")
+            bad_compactor = ScriptedClient(["ok"])
+
+            self.assertIn("PROJECT DESIGN", initial_request_context(conversation.turns))
+            maybe_compact(
+                conversation,
+                config,
+                bad_compactor,
+                context_window=100,
+                incoming_tokens=1000,
+                pinned_context="Pinned state",
+                force=True,
+            )
+
+            active_text = (root / "conversation.jsonl").read_text(encoding="utf-8")
+            self.assertIn("INITIAL_REQUEST_CONTEXT", active_text)
+            self.assertIn("Build a very specific artifact named alpha", active_text)
+
     def test_live_echo_can_be_bounded_without_truncating_saved_transcripts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -668,6 +698,18 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(cfg.project_design.title, "Minimal")
             self.assertEqual(cfg.implementation_model.max_tokens, 32768)
             self.assertTrue(cfg.runtime.docker_isolation)
+            self.assertEqual(cfg.loop.max_approach_reattempts, 5)
+            self.assertEqual(cfg.phases.analysis.max_iterations, 2)
+            self.assertEqual(cfg.implementation_model.reasoning_budget_tokens, 4096)
+
+    def test_model_profile_aliases_resolve_mtp_models(self) -> None:
+        fast = resolve_profile("fast")
+        qwen_alias = resolve_profile("qwen-26b-qat-mtp")
+
+        self.assertEqual(fast.name, "gemma4-26b-a4b-qat-mtp")
+        self.assertIn("MTP", fast.draft_path)
+        self.assertEqual(qwen_alias.name, "qwen3.6-27b-mtp")
+        self.assertEqual(qwen_alias.spec_type, "draft-mtp")
 
     def test_load_config_can_override_model_base_urls_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -775,6 +817,42 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertTrue(results[1]["blocked_git_mutation"])
             self.assertIn("harness owns", results[1]["stderr"])
 
+    def test_tool_call_verifier_blocks_destructive_command_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+
+            results = agent._run_verified_commands(
+                [["dd", "if=/dev/zero", "of=/dev/sda", "bs=1M", "count=1"]],
+                source="unit_test",
+                context={"purpose": "prove destructive commands are blocked"},
+            )
+
+            self.assertEqual(results[0]["returncode"], 126)
+            self.assertTrue(results[0]["blocked_by_tool_verifier"])
+            self.assertIn("dd", results[0]["stderr"])
+            transcript = (workspace / ".agent_state" / "conversation.jsonl").read_text(encoding="utf-8")
+            self.assertIn("TOOL_CALL_VERIFICATION_RESULT", transcript)
+
+    def test_tool_call_verifier_blocks_malformed_curl_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+
+            results = agent._run_verified_commands(
+                [["curl", "-s", "-X", "POST", "-d", "{\"message\": \"unterminated}", "http://127.0.0.1:9"]],
+                source="unit_test",
+                context={"purpose": "prove malformed JSON payloads are blocked"},
+            )
+
+            self.assertEqual(results[0]["returncode"], 126)
+            self.assertTrue(results[0]["blocked_by_tool_verifier"])
+            self.assertIn("JSON payload is malformed", results[0]["stderr"])
+
     def test_shared_transcript_keeps_implementation_and_feedback_context_together(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -875,6 +953,36 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
             self.assertNotIn("at most 1", "\n".join(findings))
 
+    def test_output_only_prompt_overrides_extra_quality_deliverables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Count strings over {A,B,C,D} with exactly two vowels "
+                    "if A is the only vowel. Put only the integer answer in ANSWER.txt."
+                ),
+            )
+
+            self.assertFalse(agent._default_quality_policy_applies())
+            self.assertTrue(agent._explicit_artifact_only_constraint())
+            self.assertIn("output-only", agent._default_quality_instruction())
+
+    def test_only_as_domain_fact_does_not_override_default_quality_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt="Build a counting helper where A is the only vowel in the alphabet.",
+            )
+
+            self.assertTrue(agent._default_quality_policy_applies())
+            self.assertFalse(agent._explicit_artifact_only_constraint())
+
     def test_plan_refinement_preserves_active_step_validation_updates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -919,6 +1027,83 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                 active_step["validation_commands"],
                 [["python", "-c", "print('fresh reviewer evidence')"]],
             )
+
+    def test_problem_analysis_phase_runs_before_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            analysis_payload = {
+                "problem_restatement": "Build a checked artifact after analysis.",
+                "domain_and_constraints": ["No external source is required."],
+                "initial_source_check": {
+                    "sources_checked": ["configured prompt"],
+                    "source_gaps": [],
+                    "freshness_risks": [],
+                },
+                "possible_solution_paths": [
+                    {
+                        "id": "A",
+                        "description": "Small direct implementation.",
+                        "advantages": ["fast"],
+                        "risks": ["limited scope"],
+                        "verification_strategy": "unit test",
+                    },
+                    {
+                        "id": "B",
+                        "description": "Package structure first.",
+                        "advantages": ["scales"],
+                        "risks": ["more files"],
+                        "verification_strategy": "unit and docs checks",
+                    },
+                ],
+                "recommended_path": {
+                    "path_id": "A",
+                    "rationale": "The task is small.",
+                    "fallback_trigger": "Use B if scope grows.",
+                },
+                "analysis_quality": {
+                    "is_comprehensive": True,
+                    "is_domain_aware": True,
+                    "is_actionable_for_planning": True,
+                    "remaining_unknowns": [],
+                },
+            }
+            implementation = ScriptedClient([json.dumps(analysis_payload)])
+            agent = FeedbackLoopAgent(
+                load_config(write_config(root, workspace, "analysis", "Build a checked artifact."), repo_root=root),
+                implementation_client=implementation,
+                feedback_client=ScriptedClient(),
+            )
+            agent.initialize()
+
+            result = agent._analysis_phase()
+
+            self.assertEqual(result["status"], "resolved")
+            self.assertEqual(agent.problem_analysis["recommended_path"]["path_id"], "A")
+            prompt = implementation.calls[0]["messages"][-1]["content"]
+            self.assertIn("PROBLEM_ANALYSIS_PHASE", prompt)
+            self.assertIn("multiple solution paths", prompt)
+
+    def test_approach_review_can_request_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            retry_review = {
+                "status": "try_another_approach",
+                "needs_rework": True,
+                "summary": "Periodic check requires another pass.",
+                "decision": "retry_with_new_approach",
+                "recommended_next_approach": "Watch the log again from the last checkpoint.",
+                "evidence_reviewed": ["final review"],
+                "runbook_updates": ["last checked line 10"],
+            }
+            agent = load_test_agent(root, workspace, feedback_responses=[json.dumps(retry_review)])
+            agent.initialize()
+
+            review = agent._approach_review_phase(1, [], {"status": "resolved", "iterations": []})
+
+            self.assertTrue(agent._approach_review_requests_retry(review))
+            self.assertEqual(review["recommended_next_approach"], "Watch the log again from the last checkpoint.")
 
     def test_research_structure_skeleton_step_satisfies_quality_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1872,6 +2057,25 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(review["status"], "needs_rework")
             self.assertIn("focused directly verifiable change", "\n".join(review["required_changes"]))
             self.assertIn("parse_error", review)
+
+    def test_reasoning_only_feedback_acceptance_does_not_force_json_repair_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, feedback_responses=[])
+            agent.initialize()
+
+            review = agent._extract_json_or_retry(
+                "<think>The plan is feasible, clear, and verifiable. I'll accept.</think>",
+                phase="PLAN_VALIDATION_PHASE",
+                contract='{"status":"resolved|needs_plan_change","required_changes":["specific change"]}',
+                feedback=True,
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertFalse(review["needs_rework"])
+            self.assertTrue(review["inferred_from_malformed_response"])
+            self.assertEqual(agent.feedback_client.calls, [])
 
     def test_malformed_implementation_repair_becomes_noop_payload_instead_of_crash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
