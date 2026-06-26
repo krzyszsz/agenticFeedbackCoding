@@ -38,7 +38,14 @@ Return strict JSON only:
   "possible_solution_paths": [
     {
       "id": "A",
-      "description": "approach summary",
+      "description": "first viable approach summary",
+      "advantages": ["why this may work"],
+      "risks": ["why this may fail"],
+      "verification_strategy": "how this path would be verified"
+    },
+    {
+      "id": "B",
+      "description": "second materially different viable approach summary",
       "advantages": ["why this may work"],
       "risks": ["why this may fail"],
       "verification_strategy": "how this path would be verified"
@@ -58,9 +65,10 @@ Return strict JSON only:
 }
 Do not write project files. Do not solve benchmark tasks in the harness. The
 purpose is to orient later model-driven planning: restate the request, identify
-constraints, name what is possible or impossible, and compare multiple viable
-approaches before choosing one. Keep the analysis universal and problem-domain
-aware; do not inject instructions that target only one historical failure mode.
+constraints, name what is possible or impossible, and compare at least two
+materially different viable approaches before choosing one. Keep the analysis
+universal and problem-domain aware; do not inject instructions that target only
+one historical failure mode.
 Start with `{`, return one JSON object, and stop immediately after the matching
 closing `}`.
 """
@@ -780,14 +788,55 @@ class FeedbackLoopAgent:
 
         Some local models decide correctly in `<think>` text but never emit the
         required JSON before hitting the token cap. A second repair call often
-        repeats the same loop and wastes minutes. This fallback only fires when
-        the unparseable reviewer text itself contains a clear accept/reject
-        decision; otherwise the normal JSON repair path still runs.
+        repeats the same loop and wastes minutes. This fallback only short-cuts
+        clear approval. Negative or mixed reasoning commonly contains useful
+        details that must be preserved through the normal JSON repair prompt.
         """
         text = re.sub(r"\s+", " ", raw).strip()
         if not text:
             return None
         tail = text[-2400:].lower()
+        if "TOOL_CALL_VERIFICATION" in phase:
+            tool_positive_markers = (
+                "i will approve",
+                "i'll approve",
+                "i approve",
+                "will approve",
+                "approve this command",
+                "this is correct",
+                "is correct",
+                "safe to run",
+                "correctly targeted",
+                "bounded",
+            )
+            tool_negative_markers = (
+                "blocked",
+                "block this",
+                "i will block",
+                "unsafe",
+                "destructive",
+                "wrong path",
+                "wrong target",
+                "malformed quoting",
+                "do not approve",
+                "not approve",
+                "needs revision",
+                "needs_revision",
+            )
+            tool_positive = any(marker in tail for marker in tool_positive_markers)
+            tool_negative = any(marker in tail for marker in tool_negative_markers)
+            if tool_positive and not tool_negative:
+                return {
+                    "status": "approved",
+                    "summary": (
+                        f"{phase} reviewer emitted reasoning-only output; "
+                        "harness inferred command approval from the reviewer text."
+                    ),
+                    "commands": [],
+                    "inferred_from_malformed_response": True,
+                    "parse_error": str(parse_error),
+                }
+            return None
         positive_markers = (
             "i will accept",
             "i'll accept",
@@ -801,6 +850,11 @@ class FeedbackLoopAgent:
             "fully complies",
             "plan is feasible",
             "feasible, clear, and verifiable",
+            "project is complete",
+            "meets all requirements",
+            "all requirements are met",
+            "implementation is solid",
+            "complete and meets all requirements",
             "no required changes",
             "no changes required",
         )
@@ -821,8 +875,31 @@ class FeedbackLoopAgent:
             "not feasible",
             "not clear",
         )
-        positive = any(marker in tail for marker in positive_markers)
-        negative = any(marker in tail for marker in negative_markers)
+        positive_scope = tail
+        negative_scope = tail
+        if "FINAL_PROJECT_REVIEW" in phase:
+            positive_scope = text.lower()
+            positive_markers = positive_markers + (
+                "everything looks correct",
+                "implementation is complete and verified",
+                "complete and verified",
+                "project is finished",
+                "all steps resolved",
+                "step is resolved",
+            )
+            negative_markers = tuple(marker for marker in negative_markers if marker != "missing") + (
+                "incorrect result",
+                "result is incorrect",
+                "mismatch",
+                "does not meet",
+                "failed validation",
+                "validation failed",
+                "returned non-zero",
+                "cannot verify",
+                "not actually complete",
+            )
+        positive = any(marker in positive_scope for marker in positive_markers)
+        negative = any(marker in negative_scope for marker in negative_markers)
         if not positive and not negative:
             return None
         if positive and not negative:
@@ -842,22 +919,7 @@ class FeedbackLoopAgent:
                     "verification_matrix": [],
                 }
             return review
-        status = "needs_rework"
-        if "PLAN_VALIDATION" in phase:
-            status = "needs_plan_change"
-        elif "REQUIREMENTS" in phase and "requirements" in tail:
-            status = "needs_requirements_change"
-        return {
-            "status": status,
-            "needs_rework": True,
-            "summary": f"{phase} reviewer emitted reasoning-only output; harness inferred requested rework from the reviewer text.",
-            "required_changes": [
-                "Address the reviewer concern described in the malformed reasoning output.",
-                "Return compact JSON evidence on the next pass so review can proceed deterministically.",
-            ],
-            "inferred_from_malformed_response": True,
-            "parse_error": str(parse_error),
-        }
+        return None
 
     def _repair_tail_for_prompt(self, raw: str, limit: int = 1200) -> str:
         """Return bounded recovery context for malformed model output.
@@ -1250,6 +1312,11 @@ class FeedbackLoopAgent:
     def _requirements_review(self, index: int, requirements: dict[str, Any]) -> dict:
         """Ask the feedback agent whether requirements are actionable enough."""
         environment_findings = self._environment_assumption_findings(requirements=requirements)
+        computed_answer_findings = self._computed_answer_validation_findings(
+            requirements=requirements,
+            plan=normalize_plan_steps(requirements.get("plan", [])) if isinstance(requirements, dict) else [],
+        )
+        deterministic_findings = environment_findings + computed_answer_findings
         prompt = {
             "phase": "REQUIREMENTS_REVIEW_PHASE",
             "iteration": index,
@@ -1259,6 +1326,7 @@ class FeedbackLoopAgent:
             "default_quality_policy": self._default_quality_policy_payload(),
             "execution_environment": self._execution_environment_payload(),
             "deterministic_environment_findings": environment_findings,
+            "deterministic_requirements_findings": deterministic_findings,
             "expected_json": {
                 "status": "resolved|needs_rework|needs_requirements_change|cannot_resolve|skipped_with_note",
                 "needs_rework": True,
@@ -1279,6 +1347,8 @@ class FeedbackLoopAgent:
             "require validation evidence that respects the artifact constraint instead.\n"
             "Apply execution_environment strictly. If deterministic_environment_findings is non-empty, request a "
             "requirements or plan correction instead of accepting incompatible assumptions.\n"
+            "If deterministic_requirements_findings is non-empty, request correction instead of accepting the "
+            "requirements as-is.\n"
             "If WEB_RESEARCH_TOOL_RESULT has completed or partial sources, reject requirements that ignore those sources. "
             "If web research is skipped or disabled, do not require cited source URLs; request available-knowledge notes instead.\n"
             + json.dumps(prompt),
@@ -1291,13 +1361,13 @@ class FeedbackLoopAgent:
             feedback=True,
         )
         review = self._normalize_review(review)
-        if environment_findings:
+        if deterministic_findings:
             existing = [str(item) for item in review.get("required_changes", [])]
-            review["required_changes"] = existing + [item for item in environment_findings if item not in existing]
+            review["required_changes"] = existing + [item for item in deterministic_findings if item not in existing]
             if self._status(review) == "resolved":
                 review["status"] = "needs_requirements_change"
                 review["needs_rework"] = True
-                review["summary"] = "Deterministic environment checks found incompatible browser/tooling assumptions."
+                review["summary"] = "Deterministic requirements checks found unresolved validation or environment issues."
         return review
 
     def _plan_validation_phase(self) -> dict:
@@ -1335,6 +1405,7 @@ class FeedbackLoopAgent:
                 "each step has acceptance criteria",
                 "each step has validation commands or an explicit non-command validation method",
                 "validation commands terminate and assert behavior instead of starting a server forever",
+                "computed-answer artifact tasks use semantic validation that recomputes or independently checks the answer, not only file existence or numeric format",
                 "browser/UI steps have executable browser evidence such as Playwright, screenshots, or a validation report when web interaction tools are enabled",
                 "browser/UI plans match the agent container tools; Python Playwright is available, but Node/npm/npx/@playwright/test are not available unless explicitly configured",
                 "project deliverables must not be harness-owned state files such as PLAN.md, REQUIREMENTS.md, or RESEARCH.md",
@@ -1643,6 +1714,8 @@ class FeedbackLoopAgent:
                 "Run-result failures, timeouts, missing files, broken UI hooks, and weak validation must be called out.",
                 "Ask concrete cross-check questions against the refined requirements and the current step acceptance criteria.",
                 "Use feedback_tool_evidence first: it is the reviewer-owned file snapshot and independent validation command run.",
+                "For computed-answer tasks, inspect code and command evidence with bounded sanity checks; do not manually enumerate long candidate sets or re-solve the whole calculation in the review turn.",
+                "If semantic proof is absent or too weak, return needs_rework requesting a stronger validation command or verifier instead of replacing missing proof with ad hoc scratch derivation.",
                 "Use feedback_tool_evidence.git.status_short/diff_stat/diff to review changes since the last accepted step commit.",
                 "Untracked meaningful paths are valid pre-acceptance implementation evidence; the harness will stage and commit after acceptance.",
                 "If git meaningful_changed_paths is empty for an implementation step, request the missing change and name the current plan requirement.",
@@ -1676,13 +1749,18 @@ class FeedbackLoopAgent:
             "STEP_REVIEW_PHASE\n"
             f"Review mode: {review_mode}. Critically verify exactly one plan step. "
             "Use the whole transcript to avoid repeating old mistakes, but judge only the current step "
-            "against its acceptance criteria and test evidence.\n"
+            "against its acceptance criteria and test evidence. Use reviewer-owned validation results as primary "
+            "evidence. Do bounded sanity checks, but do not spend the review re-solving exact-answer tasks, "
+            "manually enumerating long candidate sets, or performing full arithmetic derivations. If proof is "
+            "weak, request stronger validation evidence instead.\n"
             + json.dumps(prompt),
             context_note=(
                 "The full multi-turn transcript is stored in .agent_state/conversation.full.jsonl. "
                 "Use this compact step-review payload plus reviewer-owned validation reruns. "
                 "If the compact evidence shows failed commands, missing files, or no meaningful git diff, "
-                "request concrete implementation changes instead of accepting the step. Do not request git add/commit."
+                "request concrete implementation changes instead of accepting the step. For exact computed outputs, "
+                "do not replace command evidence with long manual derivation; ask for better validation if needed. "
+                "Do not request git add/commit."
             ),
             temperature=0.1,
         )
@@ -1835,11 +1913,17 @@ class FeedbackLoopAgent:
         raw = self._feedback_chat_with_compact_context(
             "FINAL_PROJECT_REVIEW_PHASE\n"
             "Review the whole project after all plan steps. Re-check original requirements, final files, "
-            "and all test evidence. Push back if the project lacks proof or contradicts requirements.\n"
+            "and all test evidence. Use reviewer-owned validation results and deterministic evidence findings "
+            "as the primary proof. Do bounded sanity checks around that evidence, but do not spend the final "
+            "review re-solving algorithmic tasks, re-deriving long calculations, or replacing missing validation "
+            "with ad hoc scratch work. If validation only proves file shape, existence, or formatting when the "
+            "request needs semantic correctness, return needs_rework requesting stronger validation evidence. "
+            "Push back if the project lacks proof or contradicts requirements.\n"
             + json.dumps(prompt),
             context_note=(
                 "The full multi-turn transcript is stored in .agent_state/conversation.full.jsonl. "
                 "Use this compact final-review payload plus reviewer-owned validation reruns to decide. "
+                "Prefer the rerun evidence over manual derivations; request better validation when proof is weak. "
                 "All individual plan steps were reviewed before this final pass."
             ),
             temperature=0.1,
@@ -2185,6 +2269,7 @@ class FeedbackLoopAgent:
             findings.append(
                 f"Plan has {len(self.plan_steps)} steps but the project prompt has a hard limit of at most {step_limit}."
             )
+        computed_answer_semantic_validation_present = self._computed_answer_plan_has_semantic_validation(self.plan_steps)
         seen_ids: set[str] = set()
         for step in self.plan_steps:
             step_id = str(step.get("id") or "<missing>")
@@ -2195,7 +2280,12 @@ class FeedbackLoopAgent:
                 findings.append(f"{step_id} has no acceptance criteria.")
             if not step.get("validation_commands"):
                 findings.append(f"{step_id} has no validation commands or explicit validation method.")
-            findings.extend(self._validation_command_findings(step))
+            findings.extend(
+                self._validation_command_findings(
+                    step,
+                    computed_answer_semantic_validation_present=computed_answer_semantic_validation_present,
+                )
+            )
             findings.extend(self._harness_state_file_plan_findings(step))
             for dep in step.get("depends_on", []):
                 if dep not in seen_ids:
@@ -2243,6 +2333,7 @@ class FeedbackLoopAgent:
                     "Web research evidence exists, so the first research/structure step must require citing and applying source URLs."
                 )
         findings.extend(self._environment_assumption_findings(requirements=self.requirements, plan=self.plan_steps))
+        findings.extend(self._computed_answer_validation_findings(requirements=self.requirements, plan=self.plan_steps))
         confirmation = self.requirements.get("planning_confirmation") if isinstance(self.requirements, dict) else None
         if not isinstance(confirmation, dict):
             findings.append("Requirements are missing planning_confirmation.")
@@ -2342,7 +2433,12 @@ class FeedbackLoopAgent:
                 )
         return findings
 
-    def _validation_command_findings(self, step: dict[str, Any]) -> list[str]:
+    def _validation_command_findings(
+        self,
+        step: dict[str, Any],
+        *,
+        computed_answer_semantic_validation_present: bool = False,
+    ) -> list[str]:
         findings: list[str] = []
         commands = step.get("validation_commands") or []
         command_text = json.dumps(commands).lower()
@@ -2393,6 +2489,16 @@ class FeedbackLoopAgent:
                     "or wrapping the exception assertion. Replace it with a command object using expected_returncode, "
                     "or a small wrapper command/script that exits 0 only when the expected error occurs."
                 )
+            if (
+                self._computed_answer_prompt_requires_semantic_validation()
+                and not computed_answer_semantic_validation_present
+                and self._looks_like_shape_only_answer_validation(step, raw_parts)
+            ):
+                findings.append(
+                    f"{step_id} validation is shape-only for a computed-answer artifact, and the plan has no "
+                    "semantic validation step. Add validation that recomputes the answer or independently checks "
+                    "the requested calculation."
+                )
             if self.config.mcp_tools.web_interaction:
                 step_text = (self.config.project_design.prompt + " " + json.dumps(step, sort_keys=True)).lower()
                 if any(part in ("npm", "npx", "node") for part in parts) and not self._explicit_dependency_setup_is_present(step_text):
@@ -2402,6 +2508,180 @@ class FeedbackLoopAgent:
                         "an explicit bounded dependency/setup step for the requested stack."
                     )
         return findings
+
+    def _computed_answer_prompt_requires_semantic_validation(self) -> bool:
+        """Detect answer-only computed artifacts without solving the task.
+
+        The harness must not hard-code benchmark answers. It can still require
+        the model-driven plan to prove semantic correctness when the user asks
+        for a single computed artifact such as an answer file.
+        """
+        if not self._explicit_artifact_only_constraint():
+            return False
+        prompt = self.config.project_design.prompt.lower()
+        artifact_markers = ("answer.txt", "single integer", "integer answer", "return only the integer")
+        computation_markers = (
+            "count",
+            "how many",
+            "sum",
+            "calculate",
+            "compute",
+            "evaluate",
+            "final x",
+            "final value",
+            "consider integers",
+            "permutations",
+            "strings over",
+        )
+        return any(marker in prompt for marker in artifact_markers) and any(
+            marker in prompt for marker in computation_markers
+        )
+
+    def _computed_answer_validation_findings(
+        self,
+        *,
+        requirements: dict[str, Any] | None = None,
+        plan: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
+        """Reject validation plans that hard-code a computed answer.
+
+        A good answer-only benchmark may ultimately contain one integer, but
+        the validation plan should recompute or independently enumerate that
+        integer. Baking a numeric answer into requirements or validation text
+        turns the benchmark into confirmation of a guess.
+        """
+        if not self._computed_answer_prompt_requires_semantic_validation():
+            return []
+        plan_to_check = plan if plan is not None else self.plan_steps
+        payload = {
+            "planning_confirmation": (requirements or self.requirements or {}).get("planning_confirmation", {}),
+            "plan": plan_to_check,
+        }
+        text = json.dumps(payload, sort_keys=True).lower()
+        findings: list[str] = []
+        if not any(marker in text for marker in ("answer.txt", "single integer", "integer answer", "output")):
+            return []
+        if plan_to_check and not self._computed_answer_plan_has_semantic_validation(plan_to_check):
+            findings.append(
+                "Computed-answer validation plan does not explicitly require semantic validation. "
+                "It must say that a validator recomputes, enumerates, or independently checks the requested calculation."
+            )
+        hardcoded_patterns = (
+            r"\bexpected(?:\s+(?:answer|value|sum|integer|result))?\s*(?:is|=|:)?\s*\(?\d{2,}\)?",
+            r"\bcorrect(?:\s+(?:answer|value|sum|integer|result))?\s*(?:is|=|:)?\s*\(?\d{2,}\)?",
+            r"\bmatches?\s+(?:the\s+)?(?:expected|correct)[^.;,\n]*\b\d{2,}\b",
+            r"\bagainst\s+(?:the\s+)?expected\s+(?:value|answer|sum|integer|result)\s*\(?\d{2,}\)?",
+        )
+        if not any(re.search(pattern, text) for pattern in hardcoded_patterns):
+            return findings
+        semantic_markers = (
+            "recompute",
+            "recomputed",
+            "recomputing",
+            "independent",
+            "independently",
+            "enumerate",
+            "enumeration",
+            "brute force",
+            "cross-check",
+            "cross check",
+            "derive expected",
+            "for n in range",
+            "itertools",
+            "product(",
+            "permutations(",
+            "sum(",
+        )
+        if any(marker in text for marker in semantic_markers):
+            return findings
+        findings.append(
+            "Computed-answer validation appears to hard-code an expected numeric answer. "
+            "Replace it with semantic validation that recomputes or independently enumerates the requested calculation."
+        )
+        return findings
+
+    def _computed_answer_plan_has_semantic_validation(self, plan: list[dict[str, Any]]) -> bool:
+        if not self._computed_answer_prompt_requires_semantic_validation():
+            return False
+        semantic_markers = (
+            "recompute",
+            "recomputed",
+            "recomputing",
+            "recalculate",
+            "re-calculates",
+            "re-calculated",
+            "independent",
+            "independently",
+            "enumerate",
+            "enumeration",
+            "brute force",
+            "cross-check",
+            "cross check",
+            "derive expected",
+            "for n in range",
+            "itertools",
+            "product(",
+            "permutations(",
+            "sum(",
+        )
+        for step in plan:
+            text = json.dumps(
+                {
+                    "title": step.get("title", ""),
+                    "description": step.get("description", ""),
+                    "acceptance_criteria": step.get("acceptance_criteria", []),
+                    "validation_commands": step.get("validation_commands", []),
+                },
+                sort_keys=True,
+            ).lower()
+            if any(marker in text for marker in semantic_markers):
+                return True
+        return False
+
+    def _looks_like_shape_only_answer_validation(self, step: dict[str, Any], raw_parts: list[str]) -> bool:
+        """Return True for checks that prove format but not computed correctness."""
+        step_text = json.dumps(
+            {
+                "title": step.get("title", ""),
+                "description": step.get("description", ""),
+                "acceptance_criteria": step.get("acceptance_criteria", []),
+            },
+            sort_keys=True,
+        ).lower()
+        command_text = " ".join(raw_parts).lower()
+        combined = f"{step_text} {command_text}"
+        if not any(marker in combined for marker in ("answer.txt", "single integer", "integer answer", "output")):
+            return False
+        shape_markers = (
+            "isdigit",
+            "test -f",
+            "grep",
+            "regex",
+            "^[0-9]",
+            "^[0-9]+$",
+            "contains only digits",
+            "non-empty",
+            "not empty",
+            "wc -c",
+            "wc -l",
+        )
+        semantic_markers = (
+            "recompute",
+            "independent",
+            "brute force",
+            "enumerate",
+            "assert total",
+            "expected =",
+            "expected=",
+            "itertools",
+            "for n in range",
+            "permutations(",
+            "product(",
+            "sum(",
+        )
+        return any(marker in combined for marker in shape_markers) and not any(
+            marker in command_text for marker in semantic_markers
+        )
 
     def _command_expected_returncode(self, command: list[Any] | dict[str, Any]) -> int:
         if isinstance(command, dict):
@@ -2793,6 +3073,7 @@ class FeedbackLoopAgent:
         """
         prompt = self.config.project_design.prompt.lower()
         patterns = [
+            r"\b(?:create|write|produce|output|return|put)\b\s+[a-z0-9_.-]+\s+only\b",
             r"\b(?:create|write|produce|output|return|put)\b[^.?!\n]{0,100}\bonly\b",
             r"\bonly\b[^.?!\n]{0,60}\b(?:file|artifact|answer|output)\b",
             r"\b(?:single|one)\b[^.?!\n]{0,40}\b(?:file|artifact|output)\b",
@@ -3063,27 +3344,34 @@ class FeedbackLoopAgent:
             temperature=0.0,
         )
         try:
-            review = self._extract_json_or_retry(
-                raw,
-                phase="TOOL_CALL_VERIFICATION_PHASE",
-                contract=TOOL_CALL_VERIFICATION_CONTRACT,
-                feedback=True,
-            )
-        except Exception as exc:
-            review = {
-                "status": "blocked",
-                "summary": f"Tool verifier returned malformed JSON: {exc}",
-                "commands": [
-                    {
-                        "index": index,
-                        "decision": "blocked",
-                        "risk_level": "medium",
-                        "reason": "Verifier output was malformed; retry with clearer command intent.",
+            review = extract_json_object(raw)
+        except Exception as initial_exc:
+            inferred = self._tool_verification_reasoning_fallback(raw, commands, initial_exc)
+            if inferred is not None:
+                review = inferred
+            else:
+                try:
+                    review = self._extract_json_or_retry(
+                        raw,
+                        phase="TOOL_CALL_VERIFICATION_PHASE",
+                        contract=TOOL_CALL_VERIFICATION_CONTRACT,
+                        feedback=True,
+                    )
+                except Exception as exc:
+                    review = {
+                        "status": "blocked",
+                        "summary": f"Tool verifier returned malformed JSON: {exc}",
+                        "commands": [
+                            {
+                                "index": index,
+                                "decision": "blocked",
+                                "risk_level": "medium",
+                                "reason": "Verifier output was malformed; retry with clearer command intent.",
+                            }
+                            for index, _command in enumerate(commands)
+                        ],
+                        "parse_error": str(exc),
                     }
-                    for index, _command in enumerate(commands)
-                ],
-                "parse_error": str(exc),
-            }
         review = self._normalize_tool_verification(review, commands, deterministic)
         self.conversation.append(
             "user",
@@ -3091,6 +3379,75 @@ class FeedbackLoopAgent:
             + json.dumps(self._compact_tool_verification_for_transcript(review), indent=2),
         )
         return review
+
+    def _tool_verification_reasoning_fallback(
+        self,
+        raw: str,
+        commands: list[Any],
+        parse_error: Exception,
+    ) -> dict[str, Any] | None:
+        """Infer clear tool-verifier intent from reasoning-only output.
+
+        Tool-call verification is a safety gate. If a local model clearly says a
+        proposed command should be blocked but fails to emit JSON, the safe
+        fallback is to block the commands and feed that evidence back into the
+        normal implementation/review loop.
+        """
+        text = re.sub(r"\s+", " ", raw).strip().lower()
+        if not text:
+            return None
+        block_markers = (
+            "i will block",
+            "i'll block",
+            "i must block",
+            "will block",
+            "must block",
+            "should block",
+            "block this",
+            "blocked",
+            "unsafe",
+            "destructive",
+            "wrong target",
+            "wrong path",
+            "will not create",
+            "does not create",
+            "will fail",
+            "would fail",
+            "file not found",
+            "filenotfounderror",
+        )
+        approve_markers = (
+            "i will approve",
+            "i'll approve",
+            "approved",
+            "safe to run",
+            "correctly targeted",
+        )
+        if not any(marker in text for marker in block_markers):
+            return None
+        if any(marker in text for marker in approve_markers) and not any(marker in text for marker in ("but", "however", "except")):
+            return None
+        return {
+            "status": "blocked",
+            "summary": (
+                "Tool verifier emitted reasoning-only output with clear blocking intent; "
+                "harness inferred blocked tool calls from the reviewer text."
+            ),
+            "commands": [
+                {
+                    "index": index,
+                    "decision": "blocked",
+                    "risk_level": "medium",
+                    "reason": (
+                        "Verifier reasoning indicated the proposed command was unsafe, misdirected, "
+                        "or would not satisfy the current step."
+                    ),
+                }
+                for index, _command in enumerate(commands)
+            ],
+            "inferred_from_malformed_response": True,
+            "parse_error": str(parse_error),
+        }
 
     def _normalize_tool_verification(
         self,

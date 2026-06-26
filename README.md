@@ -271,21 +271,32 @@ Current repository-verification evidence:
 | Check | Result | Notes |
 |---|---|---|
 | Compile check | Pass | `python -m compileall feedback_agent scripts tests`. |
-| Unit tests | Pass | `python -m unittest discover -s tests -v`, 106 tests. |
+| Unit tests | Pass | `python -m unittest discover -s tests -v`, 121 tests. |
 | Benchmark dry run | Pass | `python scripts/run_benchmarks.py --dry-run --limit 30`, all 30 tasks loaded. |
 | Gemma 26B MTP profile | Available | Target and draft files found locally. |
 | Gemma 31B MTP profile | Available | Target and draft files found locally. |
 | Qwen3.6 27B MTP profile | Available | Downloaded and verified with `MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/download_default_model.sh`; verification report at `/mnt/hf/models/qwen3.6-27b-mtp-gguf/model_verify.json`. |
 
-Development smoke attempts against `algo-001-balanced-grid` on
-`gemma4-26b-a4b-qat-mtp` were intentionally stopped after exposing harness
-issues; no successful real benchmark baseline is claimed yet.
+Completed Docker-isolated smoke benchmarks use the documented two-container
+workflow: one model-server container and one separate agent/harness container.
 
-| Output dir | Result | Seconds | Finding |
+| Output dir | Model | Task | Result | Seconds | Evidence |
+|---|---|---|---|---:|---|
+| `runs/benchmarks-smoke-gemma4-26b-mtp-repair-fallback` | `gemma4-26b-a4b-qat-mtp` | `algo-001-balanced-grid` | Pass | 888.9 | `results.md`, `results.json`; final status `resolved`, post-validation exact answer check passed. |
+| `runs/benchmarks-smoke-gemma4-26b-mtp-algo002-semantic-required` | `gemma4-26b-a4b-qat-mtp` | `algo-002-nested-parity` | Pass | 879.5 | `results.md`, `results.json`; final status `resolved`, semantic validator reported `ANSWER.txt` contains the correct sum `1878`. |
+
+Earlier development smoke attempts against `algo-001-balanced-grid` and
+`algo-002-nested-parity` were intentionally stopped after exposing harness
+issues. These are retained as debugging evidence rather than benchmark passes.
+
+| Output dir | Result | Seconds | Finding fixed afterwards |
 |---|---|---:|---|
 | `runs/benchmarks-smoke-gemma4-26b-mtp` | Fail, stopped | 408.9 | Reviewer could spend a full response in reasoning-only JSON repair. Fixed with reasoning-intent fallback and lower feedback token ceiling. |
 | `runs/benchmarks-smoke-gemma4-26b-mtp-retry` | Fail, stopped | 433.1 | Structured plan-refinement phases inherited the large implementation token budget. Fixed with bounded structured-control token limits. |
 | `runs/benchmarks-smoke-gemma4-26b-mtp-budgeted` | Fail, stopped | 237.6 | Default quality policy conflicted with explicit output-only prompts. Fixed by treating explicit artifact-only constraints as quality-deliverable overrides while preserving validation requirements. |
+| `runs/benchmarks-smoke-gemma4-26b-mtp-algo002` | Fail, stopped | n/a | Output-only detection missed filename-style prompts such as `ANSWER.txt only`. Fixed with filename-aware artifact-only detection. |
+| `runs/benchmarks-smoke-gemma4-26b-mtp-algo002-retry` | Fail, stopped | n/a | The analysis contract did not force two materially different solution paths. Fixed by making paths `A` and `B` explicit in the JSON contract. |
+| `runs/benchmarks-smoke-gemma4-26b-mtp-algo002-finalreview-fallback` | Fail, stopped | n/a | Requirements/plan validation allowed a hard-coded expected answer in computed-output tasks. Fixed with deterministic semantic-validation findings. |
 
 Real multi-model benchmark result tables should be pasted from the generated
 `runs/benchmarks-*/results.md` after the three model servers have completed the

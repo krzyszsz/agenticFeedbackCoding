@@ -16,7 +16,7 @@ import unittest
 import urllib.error
 from typing import Any
 
-from feedback_agent.agent import FeedbackLoopAgent
+from feedback_agent.agent import ANALYSIS_CONTRACT, FeedbackLoopAgent
 from feedback_agent.compaction import (
     _clean_compaction_memory,
     _compaction_memory_is_too_weak,
@@ -970,6 +970,248 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertTrue(agent._explicit_artifact_only_constraint())
             self.assertIn("output-only", agent._default_quality_instruction())
 
+    def test_filename_dot_output_only_prompt_overrides_extra_quality_deliverables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Consider integers n from 1 to 120 and return "
+                    "the sum of values that pass the filters."
+                ),
+            )
+
+            self.assertFalse(agent._default_quality_policy_applies())
+            self.assertTrue(agent._explicit_artifact_only_constraint())
+
+    def test_computed_answer_plan_rejects_shape_only_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Consider integers n from 1 to 120. "
+                    "Keep n if n is divisible by exactly one of 3, 5, 7, and return the sum."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Computed answer")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create answer file",
+                    "description": "Compute the requested value and write ANSWER.txt.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt contains the single integer output."],
+                    "validation_commands": [[
+                        "python",
+                        "-c",
+                        "from pathlib import Path; s=Path('ANSWER.txt').read_text().strip(); assert s.isdigit()",
+                    ]],
+                    "status": "pending",
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertIn("shape-only", "\n".join(findings))
+            self.assertIn("semantic validation", "\n".join(findings))
+
+    def test_computed_answer_plan_allows_semantic_validator_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Count the 4-character strings over alphabet {A,B,C,D} "
+                    "that satisfy the listed constraints."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Computed answer")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create answer and semantic validator",
+                    "description": "Compute the requested value and validate it by independent enumeration.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt matches the independently recomputed count."],
+                    "validation_commands": [["python", "validate_answer.py"]],
+                    "status": "pending",
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("shape-only", "\n".join(findings))
+
+    def test_computed_answer_plan_allows_format_precursor_with_later_semantic_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Consider integers n from 1 to 120. "
+                    "Keep n if n is divisible by exactly one of 3, 5, 7, and return the sum."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Computed answer")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create candidate answer",
+                    "description": "Compute the requested value and write ANSWER.txt.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt exists and contains a single integer."],
+                    "validation_commands": [[
+                        "python",
+                        "-c",
+                        "from pathlib import Path; s=Path('ANSWER.txt').read_text().strip(); assert s.isdigit()",
+                    ]],
+                    "status": "pending",
+                },
+                {
+                    "id": "S2",
+                    "title": "Semantically verify answer",
+                    "description": "Run a validator that independently recomputes the requested sum.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["ANSWER.txt matches the independently recomputed sum."],
+                    "validation_commands": [["python", "verify.py"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("shape-only", "\n".join(findings))
+
+    def test_computed_answer_plan_rejects_hardcoded_expected_answer_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Consider integers n from 1 to 120. "
+                    "Keep n if n is divisible by exactly one of 3, 5, 7, and return the sum."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Computed answer")
+            agent.requirements["planning_confirmation"] = {
+                "is_feasible": True,
+                "is_clear": True,
+                "is_verifiable": True,
+                "verification_strategy": "Run validate.py and assert ANSWER.txt matches expected value 1751.",
+            }
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create answer and validator",
+                    "description": "Create validate.py to compare ANSWER.txt against the expected value 1751.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt contains the correct integer 1751."],
+                    "validation_commands": [["python", "validate.py"]],
+                    "status": "pending",
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertIn("hard-code", "\n".join(findings))
+            self.assertIn("recomputes", "\n".join(findings))
+
+    def test_computed_answer_plan_rejects_vague_validator_without_semantic_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Consider integers n from 1 to 120. "
+                    "Keep n if n is divisible by exactly one of 3, 5, 7, and return the sum."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Computed answer")
+            agent.requirements["planning_confirmation"] = {
+                "is_feasible": True,
+                "is_clear": True,
+                "is_verifiable": True,
+                "verification_strategy": "Run validate.py to check that ANSWER.txt contains the correct integer sum.",
+            }
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create answer and validator",
+                    "description": "Create solution.py and validate.py to verify the result and output format.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt contains only the correct integer sum."],
+                    "validation_commands": [["python", "validate.py"]],
+                    "status": "pending",
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertIn("semantic validation", "\n".join(findings))
+            self.assertIn("recomputes", "\n".join(findings))
+
+    def test_requirements_review_enforces_hardcoded_answer_validation_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Consider integers n from 1 to 120. "
+                    "Keep n if n is divisible by exactly one of 3, 5, 7, and return the sum."
+                ),
+                feedback_responses=[
+                    json.dumps({
+                        "status": "resolved",
+                        "needs_rework": False,
+                        "summary": "Looks complete.",
+                        "required_changes": [],
+                    })
+                ],
+            )
+            agent.initialize()
+            requirements = base_requirements("Computed answer")
+            requirements["planning_confirmation"] = {
+                "is_feasible": True,
+                "is_clear": True,
+                "is_verifiable": True,
+                "verification_strategy": "Run validate.py and assert ANSWER.txt matches expected value 1751.",
+            }
+            requirements["plan"] = [
+                {
+                    "id": "S1",
+                    "title": "Create answer and validator",
+                    "description": "Create validate.py to compare ANSWER.txt against the expected value 1751.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt contains the correct integer 1751."],
+                    "validation_commands": [["python", "validate.py"]],
+                }
+            ]
+
+            review = agent._requirements_review(1, requirements)
+
+            self.assertEqual(review["status"], "needs_requirements_change")
+            self.assertIn("hard-code", "\n".join(review["required_changes"]))
+
     def test_only_as_domain_fact_does_not_override_default_quality_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1083,6 +1325,11 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             prompt = implementation.calls[0]["messages"][-1]["content"]
             self.assertIn("PROBLEM_ANALYSIS_PHASE", prompt)
             self.assertIn("multiple solution paths", prompt)
+
+    def test_analysis_contract_demonstrates_two_solution_paths(self) -> None:
+        self.assertIn('"id": "A"', ANALYSIS_CONTRACT)
+        self.assertIn('"id": "B"', ANALYSIS_CONTRACT)
+        self.assertIn("at least two", ANALYSIS_CONTRACT)
 
     def test_approach_review_can_request_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2004,6 +2251,72 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(review["status"], "needs_rework")
             self.assertIn("invoice_calc/disintcounts.py", "\n".join(review["required_changes"]))
 
+    def test_final_review_prompt_prefers_evidence_over_manual_derivation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Final review evidence discipline")
+            step = {
+                "id": "T1",
+                "title": "Write checked answer",
+                "description": "Write answer.txt and validate it.",
+                "depends_on": [],
+                "acceptance_criteria": ["answer.txt exists"],
+                "validation_commands": [["test", "-f", "answer.txt"]],
+                "status": "resolved",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            (workspace / "answer.txt").write_text("42\n", encoding="utf-8")
+
+            agent._final_project_review(
+                1,
+                [{"step_id": "T1", "status": "resolved", "attempts": [{"implementation": {"commands": []}}]}],
+            )
+
+            prompt = agent.feedback_client.calls[-1]["messages"][-1]["content"]
+            self.assertIn("reviewer-owned validation results", prompt)
+            self.assertIn("do not spend the final review re-solving algorithmic tasks", prompt)
+            self.assertIn("requesting stronger validation evidence", prompt)
+
+    def test_step_review_prompt_prefers_validation_over_manual_derivation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Step review evidence discipline")
+            step = {
+                "id": "T1",
+                "title": "Write checked answer",
+                "description": "Write answer.txt and validate it.",
+                "depends_on": [],
+                "acceptance_criteria": ["answer.txt exists"],
+                "validation_commands": [["test", "-f", "answer.txt"]],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            (workspace / "answer.txt").write_text("42\n", encoding="utf-8")
+
+            agent._step_review_pass(
+                step,
+                1,
+                {
+                    "written": ["answer.txt"],
+                    "commands": [],
+                    "raw": {"test_evidence": ["answer.txt validation requested"]},
+                },
+                "hard_pushback",
+            )
+
+            prompt = agent.feedback_client.calls[-1]["messages"][-1]["content"]
+            self.assertIn("reviewer-owned validation results as primary evidence", prompt)
+            self.assertIn("do not spend the review re-solving exact-answer tasks", prompt)
+            self.assertIn("request stronger validation evidence", prompt)
+
     def test_browser_guidance_prefers_python_playwright_without_node_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2076,6 +2389,120 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertFalse(review["needs_rework"])
             self.assertTrue(review["inferred_from_malformed_response"])
             self.assertEqual(agent.feedback_client.calls, [])
+
+    def test_reasoning_only_final_review_completion_does_not_force_json_repair_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, feedback_responses=[])
+            agent.initialize()
+
+            review = agent._extract_json_or_retry(
+                "<think>The project is complete and meets all requirements. The implementation is solid.</think>",
+                phase="FINAL_PROJECT_REVIEW_PHASE",
+                contract='{"status":"resolved|needs_rework","required_changes":["specific change"]}',
+                feedback=True,
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertFalse(review["needs_rework"])
+            self.assertTrue(review["inferred_from_malformed_response"])
+            self.assertEqual(agent.feedback_client.calls, [])
+
+    def test_long_reasoning_final_review_completion_does_not_force_json_repair_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, feedback_responses=[])
+            agent.initialize()
+
+            raw = (
+                "<think>Everything looks correct. The implementation is complete and verified. "
+                "All steps resolved.</think>\n"
+                + "Candidate cross-check note. " * 400
+            )
+            review = agent._extract_json_or_retry(
+                raw,
+                phase="FINAL_PROJECT_REVIEW_PHASE",
+                contract='{"status":"resolved|needs_rework","required_changes":["specific change"]}',
+                feedback=True,
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertFalse(review["needs_rework"])
+            self.assertTrue(review["inferred_from_malformed_response"])
+            self.assertEqual(agent.feedback_client.calls, [])
+
+    def test_reasoning_only_tool_call_approval_does_not_force_json_repair_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, feedback_responses=[])
+            agent.initialize()
+
+            review = agent._extract_json_or_retry(
+                "<think>The command is correctly targeted and bounded. I'll approve it.</think>",
+                phase="TOOL_CALL_VERIFICATION_PHASE",
+                contract='{"status":"approved|blocked","commands":[{"index":0,"decision":"approved|blocked"}]}',
+                feedback=True,
+            )
+
+            self.assertEqual(review["status"], "approved")
+            self.assertEqual(review["commands"], [])
+            self.assertTrue(review["inferred_from_malformed_response"])
+            self.assertEqual(agent.feedback_client.calls, [])
+
+    def test_reasoning_only_tool_call_block_does_not_force_json_repair_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                feedback_responses=[
+                    "<think>`python logic.py` will not create ANSWER.txt, so I will block this command.</think>"
+                ],
+            )
+            agent.initialize()
+
+            review = agent._tool_call_verification_phase(
+                [["python", "logic.py"], ["python", "verify_answer.py"]],
+                source="implementation",
+                context={"purpose": "test"},
+            )
+
+            self.assertEqual(review["status"], "blocked")
+            self.assertEqual([item["decision"] for item in review["commands"]], ["blocked", "blocked"])
+            self.assertTrue(review["inferred_from_malformed_response"])
+            self.assertEqual(len(agent.feedback_client.calls), 1)
+
+    def test_reasoning_only_feedback_rejection_uses_json_repair_not_generic_rework(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            repair = {
+                "status": "needs_rework",
+                "needs_rework": True,
+                "summary": "Validation command references a verifier script that the plan never creates.",
+                "required_changes": ["Add a plan step that creates verify_solution.py before running it."],
+            }
+            agent = load_test_agent(root, workspace, feedback_responses=[json.dumps(repair)])
+            agent.initialize()
+
+            review = agent._extract_json_or_retry(
+                (
+                    "<think>The validation command is flawed: it runs verify_solution.py, "
+                    "but the plan never creates that script. I will request rework.</think>"
+                ),
+                phase="REQUIREMENTS_REVIEW_PHASE",
+                contract='{"status":"resolved|needs_rework","required_changes":["specific change"]}',
+                feedback=True,
+            )
+
+            self.assertEqual(review["status"], "needs_rework")
+            self.assertIn("verifier script", review["summary"])
+            self.assertEqual(review["required_changes"], repair["required_changes"])
+            self.assertEqual(len(agent.feedback_client.calls), 1)
 
     def test_malformed_implementation_repair_becomes_noop_payload_instead_of_crash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
