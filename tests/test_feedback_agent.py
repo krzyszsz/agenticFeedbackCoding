@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 import functools
 import http.server
 import io
@@ -12,12 +13,15 @@ import subprocess
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.error
 from typing import Any
 
+import scripts.run_benchmarks as run_benchmarks
 from feedback_agent.agent import ANALYSIS_CONTRACT, FeedbackLoopAgent
 from feedback_agent.compaction import (
+    _bounded_recent_turn_count,
     _clean_compaction_memory,
     _compaction_memory_is_too_weak,
     deterministic_compact,
@@ -193,6 +197,156 @@ def base_requirements(summary: str = "Checked artifact") -> dict[str, Any]:
 
 
 class FeedbackLoopAgentTests(unittest.TestCase):
+    def test_benchmark_suite_selection_preserves_declared_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            suite_path = Path(tmp) / "suites.json"
+            suite_path.write_text(json.dumps({
+                "suites": {
+                    "ordered": {
+                        "task_ids": ["second", "first", "second"],
+                    }
+                }
+            }), encoding="utf-8")
+            tasks = [
+                {"id": "first", "title": "First"},
+                {"id": "second", "title": "Second"},
+            ]
+
+            suite_ids = run_benchmarks.load_suite_ids(suite_path, "ordered")
+            selected = run_benchmarks.select_tasks(tasks, suite_ids, None)
+
+            self.assertEqual([task["id"] for task in selected], ["second", "first"])
+
+    def test_benchmark_config_applies_web_research_and_task_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            task = {
+                "id": "research-demo",
+                "title": "Research demo",
+                "category": "research",
+                "prompt": "Use fetched source evidence.",
+                "web_research": True,
+                "config_overrides": {
+                    "runtime": {
+                        "docker_user": "root",
+                        "command_timeout_seconds": 180,
+                    },
+                    "phases": {
+                        "implementation": {"max_iterations": 9},
+                    },
+                },
+            }
+
+            cfg = run_benchmarks.benchmark_config(
+                task,
+                repo_root=root,
+                workspace=workspace,
+                implementation_profile="gemma4-26b-a4b-qat-mtp",
+                feedback_profile=None,
+                docker_isolation=True,
+                reasoning_budget_tokens=None,
+                max_tokens=4096,
+                feedback_response_max_tokens=2048,
+            )
+
+            self.assertTrue(cfg["web_research"]["enabled"])
+            self.assertTrue(cfg["mcp_tools"]["web_scraping"])
+            self.assertEqual(cfg["implementation_model"]["max_tokens"], 4096)
+            self.assertTrue(cfg["implementation_model"]["send_reasoning_budget"])
+            self.assertEqual(cfg["runtime"]["feedback_response_max_tokens"], 2048)
+            self.assertEqual(cfg["runtime"]["docker_user"], "root")
+            self.assertEqual(cfg["runtime"]["command_timeout_seconds"], 180)
+            self.assertEqual(cfg["phases"]["implementation"]["max_iterations"], 9)
+
+    def test_benchmark_harness_sets_feedback_docker_url_for_pair_runs(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class FakePopen:
+            returncode = 0
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+                self.pid = 12345
+
+            def communicate(self, timeout: int | None = None) -> tuple[str, None]:
+                captured["timeout"] = timeout
+                return "ok", None
+
+        def fake_run(*args: Any, **kwargs: Any) -> types.SimpleNamespace:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return types.SimpleNamespace(returncode=0, stdout="ok")
+
+        original_popen = run_benchmarks.subprocess.Popen
+        original_run = run_benchmarks.subprocess.run
+        try:
+            run_benchmarks.subprocess.Popen = FakePopen  # type: ignore[assignment]
+            run_benchmarks.subprocess.run = fake_run  # type: ignore[assignment]
+            returncode, _elapsed, output = run_benchmarks.run_harness(
+                Path.cwd(),
+                Path("config.json"),
+                implementation_profile="gemma4-26b-a4b-qat-mtp",
+                feedback_profile="gemma4-31b-qat-mtp",
+                timeout_seconds=123,
+            )
+        finally:
+            run_benchmarks.subprocess.Popen = original_popen  # type: ignore[assignment]
+            run_benchmarks.subprocess.run = original_run  # type: ignore[assignment]
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(output, "ok")
+        self.assertEqual(captured["timeout"], 123)
+        self.assertEqual(
+            captured["kwargs"]["env"]["AGENT_FEEDBACK_BASE_URL"],
+            "http://agentic-gemma4-31b-mtp-server:8162/v1",
+        )
+        self.assertIn("AGENT_CONTAINER_NAME", captured["kwargs"]["env"])
+
+    def test_benchmark_timeout_removes_named_agent_container(self) -> None:
+        captured: dict[str, Any] = {"run_calls": []}
+
+        class FakePopen:
+            returncode = None
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                captured["popen_kwargs"] = kwargs
+                self.pid = 12345
+                self.calls = 0
+
+            def communicate(self, timeout: int | None = None) -> tuple[str, None]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="scripts/run_agent.sh", timeout=timeout or 0, output="partial")
+                return " after-cleanup", None
+
+        def fake_run(*args: Any, **kwargs: Any) -> types.SimpleNamespace:
+            captured["run_calls"].append((args, kwargs))
+            return types.SimpleNamespace(returncode=0, stdout="removed")
+
+        original_popen = run_benchmarks.subprocess.Popen
+        original_run = run_benchmarks.subprocess.run
+        try:
+            run_benchmarks.subprocess.Popen = FakePopen  # type: ignore[assignment]
+            run_benchmarks.subprocess.run = fake_run  # type: ignore[assignment]
+            returncode, _elapsed, output = run_benchmarks.run_harness(
+                Path.cwd(),
+                Path("config.json"),
+                implementation_profile="gemma4-26b-a4b-qat-mtp",
+                feedback_profile=None,
+                timeout_seconds=1,
+            )
+        finally:
+            run_benchmarks.subprocess.Popen = original_popen  # type: ignore[assignment]
+            run_benchmarks.subprocess.run = original_run  # type: ignore[assignment]
+
+        self.assertEqual(returncode, 124)
+        self.assertIn("partial after-cleanup", output)
+        container_name = captured["popen_kwargs"]["env"]["AGENT_CONTAINER_NAME"]
+        docker_call = captured["run_calls"][0][0][0]
+        self.assertEqual(docker_call, ["docker", "rm", "-f", container_name])
+
     def test_workspace_collection_summarizes_binary_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -527,6 +681,51 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             ps = subprocess.run(["ps", "-p", child_pid], capture_output=True, text=True)
             self.assertNotEqual(ps.returncode, 0)
 
+    def test_command_timeout_kills_background_child_after_shell_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            started = time.monotonic()
+            results = run_commands(
+                root,
+                [[
+                    "bash",
+                    "-c",
+                    "sleep 60 & echo $! > child.pid; exit 0",
+                ]],
+                timeout_seconds=1,
+                max_timeout_seconds=1,
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 4)
+            self.assertTrue(results[0]["timed_out"])
+            self.assertEqual(results[0]["returncode"], 124)
+            child_pid = (root / "child.pid").read_text(encoding="utf-8").strip()
+            time.sleep(0.2)
+            ps = subprocess.run(["ps", "-p", child_pid], capture_output=True, text=True)
+            self.assertNotEqual(ps.returncode, 0)
+
+    def test_command_completion_cleans_background_children(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            results = run_commands(
+                root,
+                [[
+                    "bash",
+                    "-c",
+                    "sleep 60 >/dev/null 2>&1 & echo $! > child.pid; exit 7",
+                ]],
+                timeout_seconds=30,
+                max_timeout_seconds=30,
+            )
+
+            self.assertFalse(results[0]["timed_out"])
+            self.assertEqual(results[0]["returncode"], 7)
+            child_pid = (root / "child.pid").read_text(encoding="utf-8").strip()
+            time.sleep(0.2)
+            ps = subprocess.run(["ps", "-p", child_pid], capture_output=True, text=True)
+            self.assertNotEqual(ps.returncode, 0)
+
     def test_compaction_keeps_append_only_full_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -587,6 +786,43 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
         self.assertIn("truncated long compaction line", compacted)
         self.assertLess(len(compacted), 3000)
+
+    def test_compaction_recent_tail_respects_token_budget(self) -> None:
+        turns = [
+            Turn("user", "older context " * 2000),
+            Turn("assistant", "large tool evidence " * 4000),
+            Turn("user", "latest request"),
+            Turn("assistant", "latest response"),
+        ]
+
+        keep = _bounded_recent_turn_count(turns, max_turns=4, max_tokens=20)
+
+        self.assertEqual(keep, 2)
+
+    def test_compaction_uses_hard_token_ceiling_below_context_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "work"
+            cfg_path = write_config(root, workspace, "compact ceiling", "Build anything.")
+            config = load_config(cfg_path)
+            conversation = Conversation(root / "conversation.jsonl")
+            conversation.append("system", "durable system prompt")
+            conversation.append("user", "PROJECT DESIGN: compact ceiling\n\nBuild anything.")
+            conversation.append("assistant", "old verbose evidence " * 9000)
+            conversation.append("user", "latest request")
+            compactor = ScriptedClient(["Requirement: preserve compacted project context and latest request."])
+
+            compacted = maybe_compact(
+                conversation,
+                config,
+                compactor,
+                context_window=131072,
+                incoming_tokens=1,
+                pinned_context="Pinned state",
+            )
+
+            self.assertTrue(compacted)
+            self.assertIn("Compacted durable memory", (root / "conversation.jsonl").read_text(encoding="utf-8"))
 
     def test_compaction_preserves_authoritative_rework_directive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -835,6 +1071,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("dd", results[0]["stderr"])
             transcript = (workspace / ".agent_state" / "conversation.jsonl").read_text(encoding="utf-8")
             self.assertIn("TOOL_CALL_VERIFICATION_RESULT", transcript)
+            self.assertEqual(agent.feedback_client.calls, [])
 
     def test_tool_call_verifier_blocks_malformed_curl_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -852,6 +1089,29 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(results[0]["returncode"], 126)
             self.assertTrue(results[0]["blocked_by_tool_verifier"])
             self.assertIn("JSON payload is malformed", results[0]["stderr"])
+            self.assertEqual(agent.feedback_client.calls, [])
+
+    def test_tool_call_verifier_blocks_invalid_inline_python_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+
+            results = agent._run_verified_commands(
+                [[
+                    "python3",
+                    "-c",
+                    "import itertools; count=sum(1 for item in itertools.product('AB', repeat=2); assert count == 4",
+                ]],
+                source="unit_test",
+                context={"purpose": "prove invalid inline Python is blocked"},
+            )
+
+            self.assertEqual(results[0]["returncode"], 126)
+            self.assertTrue(results[0]["blocked_by_tool_verifier"])
+            self.assertIn("static syntax check", results[0]["stderr"])
+            self.assertEqual(agent.feedback_client.calls, [])
 
     def test_shared_transcript_keeps_implementation_and_feedback_context_together(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -872,6 +1132,27 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("IMPLEMENTATION_AGENT_RESPONSE", feedback_context)
             self.assertIn("FEEDBACK_AGENT_REQUEST", transcript)
             self.assertIn("FEEDBACK_AGENT_RESPONSE", transcript)
+
+    def test_visible_reasoning_is_not_reused_as_durable_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            impl = ScriptedClient(["<think>secret answer scratchpad 24</think>\n{\"note\":\"implementation turn\"}"])
+            reviewer = ScriptedClient()
+            cfg = load_config(write_config(root, workspace, "chat continuity", "Build anything."), repo_root=root)
+            agent = FeedbackLoopAgent(cfg, implementation_client=impl, feedback_client=reviewer)
+            agent.initialize()
+
+            raw = agent._implementation_chat("Create the first file.")
+            agent._feedback_chat("Review the first file.")
+
+            feedback_context = "\n".join(message["content"] for message in reviewer.calls[0]["messages"])
+            transcript = (workspace / ".agent_state" / "conversation.jsonl").read_text(encoding="utf-8")
+            self.assertIn("secret answer scratchpad", raw)
+            self.assertIn("visible reasoning omitted", feedback_context)
+            self.assertNotIn("secret answer scratchpad", feedback_context)
+            self.assertNotIn("secret answer scratchpad", transcript)
+            self.assertIn("implementation turn", transcript)
 
     def test_plan_validation_enforces_step_limit_and_server_only_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1038,11 +1319,15 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             agent.plan_steps = [
                 {
                     "id": "S1",
-                    "title": "Create answer and semantic validator",
+                    "title": "Create answer and semantic validation",
                     "description": "Compute the requested value and validate it by independent enumeration.",
                     "depends_on": [],
                     "acceptance_criteria": ["ANSWER.txt matches the independently recomputed count."],
-                    "validation_commands": [["python", "validate_answer.py"]],
+                    "validation_commands": [[
+                        "python",
+                        "-c",
+                        "from itertools import product; from pathlib import Path; count=sum(1 for s in product('ABCD', repeat=4)); assert Path('ANSWER.txt').read_text().strip() == str(count)",
+                    ]],
                     "status": "pending",
                 }
             ]
@@ -1050,6 +1335,153 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             findings = agent._plan_structural_findings()
 
             self.assertNotIn("shape-only", "\n".join(findings))
+
+    def test_artifact_only_validation_allows_tmp_validator_that_reads_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Consider integers n from 1 to 120. "
+                    "Return the computed sum as a single integer."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Computed answer")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create answer and semantic validation",
+                    "description": "Compute the requested value and validate it using a temporary validator.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt matches an independently recomputed sum."],
+                    "validation_commands": [[
+                        "sh",
+                        "-c",
+                        (
+                            "printf '%s\n' \"from pathlib import Path\" "
+                            "\"expected = sum(n for n in range(1, 121))\" "
+                            "\"actual = Path('ANSWER.txt').read_text().strip()\" "
+                            "\"assert actual == str(expected)\" > /tmp/validate_answer.py "
+                            "&& python /tmp/validate_answer.py"
+                        ),
+                    ]],
+                    "status": "pending",
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("appears to write or mutate", "\n".join(findings))
+
+    def test_artifact_only_validation_rejects_shell_redirect_to_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, prompt="Create ANSWER.txt only. Return the integer answer.")
+            agent.initialize()
+
+            mutated = agent._validation_command_appears_to_mutate_artifact([
+                "sh",
+                "-c",
+                "printf 42 > ANSWER.txt",
+            ])
+
+            self.assertTrue(mutated)
+
+    def test_artifact_only_validation_rejects_python_write_to_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, prompt="Create ANSWER.txt only. Return the integer answer.")
+            agent.initialize()
+
+            mutated = agent._validation_command_appears_to_mutate_artifact([
+                "python",
+                "-c",
+                "from pathlib import Path; Path('ANSWER.txt').write_text('42\\n')",
+            ])
+
+            self.assertTrue(mutated)
+
+    def test_computed_answer_plan_rejects_print_only_semantic_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Count the 4-character strings over alphabet {A,B,C,D} "
+                    "that satisfy the listed constraints."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Computed answer")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create answer and semantic validation",
+                    "description": "Compute the requested value and validate it by independent enumeration against ANSWER.txt.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt matches the independently recomputed count."],
+                    "validation_commands": [[
+                        "python",
+                        "-c",
+                        "from itertools import product; print(sum(1 for s in product('ABCD', repeat=4)))",
+                    ]],
+                    "status": "pending",
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertIn("compares the artifact", "\n".join(findings))
+
+    def test_computed_answer_plan_allows_loop_based_semantic_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Count the 4-character strings over alphabet {A,B,C,D} "
+                    "that satisfy the listed constraints."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Computed answer")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create answer",
+                    "description": "Compute the requested value and write ANSWER.txt.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt exists and contains an integer."],
+                    "validation_commands": [["test", "-f", "ANSWER.txt"]],
+                    "status": "pending",
+                },
+                {
+                    "id": "S2",
+                    "title": "Semantic validation of ANSWER.txt",
+                    "description": "Re-calculate the count using loops and compare it to ANSWER.txt.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["The value in ANSWER.txt matches the re-calculated count."],
+                    "validation_commands": [[
+                        "python",
+                        "-c",
+                        "alphabet=['A','B','C','D']; count=0; [count:=count+1 for s in [a+b+c+d for a in alphabet for b in alphabet for c in alphabet for d in alphabet] if s.count('A')==2 and all(s[i]!=s[i+1] for i in range(3))]; actual=open('ANSWER.txt').read().strip(); exit(0 if actual == str(count) else 1)",
+                    ]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("does not explicitly require semantic validation", "\n".join(findings))
 
     def test_computed_answer_plan_allows_format_precursor_with_later_semantic_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1085,7 +1517,11 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                     "description": "Run a validator that independently recomputes the requested sum.",
                     "depends_on": ["S1"],
                     "acceptance_criteria": ["ANSWER.txt matches the independently recomputed sum."],
-                    "validation_commands": [["python", "verify.py"]],
+                    "validation_commands": [[
+                        "python",
+                        "-c",
+                        "from pathlib import Path; total=sum(n for n in range(1, 121)); assert Path('ANSWER.txt').read_text().strip() == str(total)",
+                    ]],
                     "status": "pending",
                 },
             ]
@@ -1093,6 +1529,49 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             findings = agent._plan_structural_findings()
 
             self.assertNotIn("shape-only", "\n".join(findings))
+
+    def test_computed_answer_plan_rejects_split_compute_without_artifact_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Count the 4-character strings over alphabet {A,B,C,D} "
+                    "that satisfy the listed constraints."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Computed answer")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Brute-force verification and calculation",
+                    "description": "Use itertools.product to enumerate valid strings and print the count.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["The script outputs the correct integer count."],
+                    "validation_commands": [[
+                        "python",
+                        "-c",
+                        "from itertools import product; print(sum(1 for _ in product('ABCD', repeat=4)))",
+                    ]],
+                    "status": "pending",
+                },
+                {
+                    "id": "S2",
+                    "title": "Create ANSWER.txt",
+                    "description": "Write the verified integer result to ANSWER.txt.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["ANSWER.txt exists and contains only the integer result."],
+                    "validation_commands": [["cat", "ANSWER.txt"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertIn("compares the artifact", "\n".join(findings))
 
     def test_computed_answer_plan_rejects_hardcoded_expected_answer_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1168,6 +1647,110 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("semantic validation", "\n".join(findings))
             self.assertIn("recomputes", "\n".join(findings))
 
+    def test_artifact_only_plan_rejects_helper_workspace_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Count the 4-character strings over alphabet {A,B,C,D} "
+                    "that satisfy the listed constraints."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Artifact-only answer")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Create solver and answer",
+                    "description": "Create solver.py to calculate the answer and write ANSWER.txt.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["solver.py exists", "ANSWER.txt exists"],
+                    "validation_commands": [["python", "solver.py"]],
+                    "status": "pending",
+                },
+                {
+                    "id": "S2",
+                    "title": "Create verifier",
+                    "description": "Create validate.py for independent enumeration.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["validate.py confirms the answer."],
+                    "validation_commands": [["python", "validate.py"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            text = "\n".join(findings)
+            self.assertIn("extra workspace artifact", text)
+            self.assertIn("solver.py", text)
+            self.assertIn("validate.py", text)
+
+    def test_artifact_only_plan_ignores_dotted_python_identifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, prompt="Create ANSWER.txt only. Return the integer answer.")
+
+            refs = agent._file_references_in_text(
+                "python -c \"import os, itertools; os.path.exists('ANSWER.txt'); "
+                "itertools.product('ABCD'); s.count('A')\""
+            )
+
+            self.assertEqual(refs, {"ANSWER.txt"})
+
+    def test_artifact_only_write_guard_blocks_helper_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, prompt="Create ANSWER.txt only. Return the integer answer.")
+
+            allowed, skipped = agent._split_model_writable_files([
+                {"path": "ANSWER.txt", "content": "24\n"},
+                {"path": "solver.py", "content": "print(24)\n"},
+            ])
+
+            self.assertEqual([item["path"] for item in allowed], ["ANSWER.txt"])
+            self.assertEqual(skipped, ["solver.py"])
+
+    def test_artifact_only_final_review_rejects_extra_workspace_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, prompt="Create ANSWER.txt only. Return the integer answer.")
+
+            findings = agent._artifact_only_workspace_findings({
+                "workspace_files": [
+                    {"path": "ANSWER.txt", "content": "24\n"},
+                    {"path": ".gitignore", "content": ".agent_state/\n"},
+                    {"path": "solver.py", "content": "print(24)\n"},
+                    {"path": "PLAN.md", "content": "# harness\n"},
+                ]
+            })
+
+            self.assertIn("extra project artifact", "\n".join(findings))
+            self.assertIn("solver.py", "\n".join(findings))
+            self.assertNotIn(".gitignore", "\n".join(findings))
+            self.assertNotIn("gitignore", "\n".join(findings))
+
+    def test_artifact_only_final_review_ignores_harness_gitignore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, prompt="Create ANSWER.txt only. Return the integer answer.")
+
+            findings = agent._artifact_only_workspace_findings({
+                "workspace_files": [
+                    {"path": "./ANSWER.txt", "content": "24\n"},
+                    {"path": ".gitignore", "content": ".agent_state/\n"},
+                ]
+            })
+
+            self.assertEqual(findings, [])
+
     def test_requirements_review_enforces_hardcoded_answer_validation_guard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1211,6 +1794,114 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
             self.assertEqual(review["status"], "needs_requirements_change")
             self.assertIn("hard-code", "\n".join(review["required_changes"]))
+
+    def test_requirements_review_rejects_hardcoded_answer_with_semantic_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Count the 4-character strings over alphabet {A,B,C,D} "
+                    "that contain exactly two vowels if A is the only vowel and have no adjacent equal characters."
+                ),
+                feedback_responses=[
+                    json.dumps({
+                        "status": "resolved",
+                        "needs_rework": False,
+                        "summary": "Looks complete.",
+                        "required_changes": [],
+                    })
+                ],
+            )
+            agent.initialize()
+            requirements = base_requirements("Computed answer")
+            requirements["planning_confirmation"] = {
+                "is_feasible": True,
+                "is_clear": True,
+                "is_verifiable": True,
+                "verification_strategy": "Use brute force enumeration, then assert ANSWER.txt matches expected value 24.",
+            }
+            requirements["plan"] = [
+                {
+                    "id": "S1",
+                    "title": "Create answer",
+                    "description": "Use itertools.product to enumerate valid strings and write ANSWER.txt.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt contains exactly 24."],
+                    "validation_commands": [["python3", "-c", "import itertools; print('semantic enumeration')"]],
+                }
+            ]
+
+            review = agent._requirements_review(1, requirements)
+
+            self.assertEqual(review["status"], "needs_requirements_change")
+            self.assertIn("without embedding the final numeric answer", "\n".join(review["required_changes"]))
+
+    def test_requirements_review_applies_plan_structural_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create ANSWER.txt only. Count the 4-character strings over alphabet {A,B,C,D} "
+                    "that contain exactly two vowels if A is the only vowel and have no adjacent equal characters."
+                ),
+                feedback_responses=[
+                    json.dumps({
+                        "status": "resolved",
+                        "needs_rework": False,
+                        "summary": "Looks complete.",
+                        "required_changes": [],
+                    })
+                ],
+            )
+            agent.initialize()
+            requirements = base_requirements("Computed answer")
+            requirements["planning_confirmation"] = {
+                "is_feasible": True,
+                "is_clear": True,
+                "is_verifiable": True,
+                "verification_strategy": "Generate ANSWER.txt, then recompute and compare the artifact.",
+            }
+            requirements["plan"] = [
+                {
+                    "id": "S1",
+                    "title": "Generate answer",
+                    "description": "Generate ANSWER.txt.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["ANSWER.txt exists."],
+                    "validation_commands": [
+                        {
+                            "cmd": "python -c \"open('ANSWER.txt', 'w').write('24')\"",
+                            "timeout_seconds": 10,
+                        }
+                    ],
+                },
+                {
+                    "id": "S2",
+                    "title": "Semantic validation",
+                    "description": "Recompute and compare.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["The recomputed value matches ANSWER.txt."],
+                    "validation_commands": [[
+                        "python",
+                        "-c",
+                        "count=24; with open('ANSWER.txt') as f: actual=int(f.read()); exit(0 if actual == count else 1)",
+                    ]],
+                },
+            ]
+
+            review = agent._requirements_review(1, requirements)
+
+            text = "\n".join(review["required_changes"])
+            self.assertEqual(review["status"], "needs_requirements_change")
+            self.assertIn("string-valued cmd", text)
+            self.assertIn("appears to write or mutate", text)
+            self.assertIn("one-line `python -c` compound block", text)
 
     def test_only_as_domain_fact_does_not_override_default_quality_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1381,6 +2072,34 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
             self.assertNotIn("First plan step", "\n".join(findings))
 
+    def test_research_design_notes_step_satisfies_quality_gate_for_shell_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, title="disk monitor", prompt="Build a Bash disk monitor.")
+            agent.initialize()
+            agent.requirements = base_requirements("Disk monitor")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Research and Design",
+                    "description": (
+                        "Research df -P parsing patterns and write DESIGN_NOTES.md to document the "
+                        "implementation strategy and environment variable handling."
+                    ),
+                    "depends_on": [],
+                    "acceptance_criteria": [
+                        "DESIGN_NOTES.md exists and contains df -P parsing notes.",
+                    ],
+                    "validation_commands": [["test", "-f", "DESIGN_NOTES.md"]],
+                    "status": "pending",
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("First plan step", "\n".join(findings))
+
     def test_plan_validation_rejects_harness_state_file_as_project_deliverable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1454,7 +2173,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                 result,
                 {"validation_results": result["commands"], "git": {"meaningful_changed_paths": ["README.md"]}},
             )
-            self.assertIn("harness-owned state files", "\n".join(findings))
+            self.assertIn("harness-owned state", "\n".join(findings))
 
     def test_implementation_prompt_tells_model_how_to_create_empty_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1541,6 +2260,40 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertNotIn("8080/game/index.html", "\n".join(final_findings))
             self.assertNotIn("dot.net/v1", "\n".join(final_findings))
             self.assertNotIn("HOME/.dotnet", "\n".join(final_findings))
+
+    def test_step_reference_check_normalizes_dot_slash_artifact_references(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, title="disk monitor", prompt="Build a disk monitor script.")
+            agent.initialize()
+            evidence = {
+                "workspace_files": [
+                    {
+                        "path": "README.md",
+                        "content": "Run `./monitor_disk.sh --check .` every 30 seconds.",
+                    },
+                    {
+                        "path": "monitor_disk.sh",
+                        "content": "#!/usr/bin/env bash\n",
+                    },
+                ],
+            }
+
+            self.assertEqual(agent._workspace_reference_findings(evidence, allow_planned_future_refs=False), [])
+
+            missing_evidence = {
+                "workspace_files": [
+                    {
+                        "path": "README.md",
+                        "content": "Run `./missing.sh` after setup.",
+                    },
+                ],
+            }
+            findings = agent._workspace_reference_findings(missing_evidence, allow_planned_future_refs=False)
+
+            self.assertIn("`missing.sh`", "\n".join(findings))
+            self.assertNotIn("`/missing.sh`", "\n".join(findings))
 
     def test_feedback_review_runs_reviewer_owned_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1895,8 +2648,79 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
             findings = agent._validation_command_findings(step)
 
-            self.assertIn("try/except", "\n".join(findings))
+            self.assertIn("compound block", "\n".join(findings))
             self.assertIn("validation script", "\n".join(findings))
+
+    def test_plan_validation_rejects_one_line_nested_for_if_python_c(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S2",
+                "title": "Semantic verification",
+                "description": "Independently recompute an answer.",
+                "depends_on": [],
+                "acceptance_criteria": ["Answer is semantically validated."],
+                "validation_commands": [[
+                    "python",
+                    "-c",
+                    "import itertools; count=0; for p in itertools.product('ABCD', repeat=4): if p.count('A') == 2: count += 1",
+                ]],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertIn("compound block", "\n".join(findings))
+            self.assertIn("multiline shell command", "\n".join(findings))
+
+    def test_plan_validation_rejects_shell_wrapped_inline_python_syntax_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S3",
+                "title": "Semantic verification",
+                "description": "Independently recompute an answer.",
+                "depends_on": [],
+                "acceptance_criteria": ["Answer is semantically validated."],
+                "validation_commands": [[
+                    "bash",
+                    "-c",
+                    "python3 -c \"import itertools; count=sum(1 for item in itertools.product('AB', repeat=2); assert count == 4\"",
+                ]],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertIn("static syntax check", "\n".join(findings))
+            self.assertIn("shell-wrapped python -c", "\n".join(findings))
+
+    def test_plan_validation_rejects_artifact_mutating_validation_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, prompt="Create ANSWER.txt only. Return the integer answer.")
+            step = {
+                "id": "S1",
+                "title": "Calculate answer",
+                "description": "Calculate the answer and write ANSWER.txt.",
+                "depends_on": [],
+                "acceptance_criteria": ["ANSWER.txt exists."],
+                "validation_commands": [[
+                    "python",
+                    "-c",
+                    "open('ANSWER.txt', 'w').write('24')",
+                ]],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertIn("mutate the explicitly requested artifact", "\n".join(findings))
 
     def test_partial_failure_step_allows_compileall_success_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2452,6 +3276,59 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertTrue(review["inferred_from_malformed_response"])
             self.assertEqual(agent.feedback_client.calls, [])
 
+    def test_reasoning_only_tool_verifier_approval_does_not_force_json_repair_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                feedback_responses=[
+                    "<think>The command is correctly targeted and bounded for this validation. I will approve it.</think>"
+                ],
+            )
+            agent.initialize()
+
+            review = agent._tool_call_verification_phase(
+                [["bash", "./watch_log.sh", "--help"]],
+                source="implementation",
+                context={"purpose": "validate help output"},
+            )
+
+            self.assertEqual(review["status"], "approved")
+            self.assertEqual(review["commands"][0]["decision"], "approved")
+            self.assertTrue(review["inferred_from_malformed_response"])
+            self.assertEqual(len(agent.feedback_client.calls), 1)
+
+    def test_tool_verifier_off_contract_rework_blocks_unlisted_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                feedback_responses=[
+                    json.dumps({
+                        "status": "needs_rework",
+                        "summary": "validate.py would hang because it runs an infinite watcher with subprocess.run.",
+                        "required_changes": ["Use Popen and terminate the watcher after assertions."],
+                    })
+                ],
+            )
+            agent.initialize()
+
+            results = agent._run_verified_commands(
+                [["python3", "validate.py"]],
+                source="implementation",
+                context={"purpose": "run generated validation"},
+            )
+
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0]["blocked_by_tool_verifier"])
+            self.assertEqual(results[0]["returncode"], 126)
+            self.assertIn("validate.py would hang", results[0]["stderr"])
+            self.assertEqual(len(agent.feedback_client.calls), 1)
+
     def test_reasoning_only_tool_call_block_does_not_force_json_repair_loop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2475,6 +3352,42 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual([item["decision"] for item in review["commands"]], ["blocked", "blocked"])
             self.assertTrue(review["inferred_from_malformed_response"])
             self.assertEqual(len(agent.feedback_client.calls), 1)
+
+    def test_reasoning_only_validation_tool_block_uses_json_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            repaired_review = {
+                "status": "approved",
+                "summary": "The reviewer-owned validation command is bounded and matches the plan.",
+                "commands": [
+                    {
+                        "index": 0,
+                        "decision": "approved",
+                        "risk_level": "low",
+                        "reason": "It only prints the calculated value for this validation-only step.",
+                    }
+                ],
+            }
+            agent = load_test_agent(
+                root,
+                workspace,
+                feedback_responses=[
+                    "<think>The command does not create ANSWER.txt, so I will block this command.</think>",
+                    json.dumps(repaired_review),
+                ],
+            )
+            agent.initialize()
+
+            review = agent._tool_call_verification_phase(
+                [["python", "-c", "print(24)"]],
+                source="step_feedback_validation",
+                context={"purpose": "reviewer-owned validation command"},
+            )
+
+            self.assertEqual(review["status"], "approved")
+            self.assertEqual(review["commands"][0]["decision"], "approved")
+            self.assertEqual(len(agent.feedback_client.calls), 2)
 
     def test_reasoning_only_feedback_rejection_uses_json_repair_not_generic_rework(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2550,6 +3463,23 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             repair_prompt = agent.impl_client.calls[-1]["messages"][-1]["content"]
             self.assertLess(len(repair_prompt), 5000)
             self.assertIn("[long-token-truncated]", repair_prompt)
+
+    def test_structured_token_caps_reserve_room_after_reasoning_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            model = replace(
+                agent.config.implementation_model,
+                max_tokens=8192,
+                reasoning_budget_tokens=4096,
+            )
+            runtime = replace(agent.config.runtime, feedback_response_max_tokens=4096)
+            agent.config = replace(agent.config, implementation_model=model, runtime=runtime)
+
+            self.assertEqual(agent._implementation_payload_tokens(), 8192)
+            self.assertEqual(agent._structured_control_tokens(), 6144)
+            self.assertEqual(agent._feedback_response_tokens(agent.config.implementation_model), 8192)
 
     def test_plan_review_rejects_malformed_shell_test_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2889,6 +3819,133 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
             self.assertEqual(review["status"], "needs_rework")
             self.assertTrue(any("ended with status skipped_with_note" in item for item in review["deterministic_evidence_findings"]))
+
+    def test_implementation_loop_keeps_skipped_step_as_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Skipped implementation should not resolve")
+            step = {
+                "id": "S1",
+                "title": "Do risky work",
+                "description": "A step that cannot be proven.",
+                "depends_on": [],
+                "acceptance_criteria": ["proof exists"],
+                "validation_commands": [],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            agent._implementation_pass = types.MethodType(lambda self, current, attempt: {"commands": []}, agent)
+            agent._step_review_pass = types.MethodType(
+                lambda self, current, attempt, implementation, review_mode: {
+                    "status": "skipped_with_note",
+                    "summary": "Compromise was explicitly recorded.",
+                    "required_changes": [],
+                },
+                agent,
+            )
+
+            result = agent._implementation_loop_for_step(step)
+
+            self.assertEqual(result["status"], "skipped_with_note")
+            self.assertEqual(step["status"], "skipped_with_note")
+            self.assertIsNone(agent._next_pending_step())
+
+    def test_run_stops_before_implementation_when_plan_validation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent._web_research_phase = types.MethodType(lambda self: {"status": "skipped"}, agent)
+            agent._analysis_phase = types.MethodType(lambda self, **kwargs: {"status": "resolved"}, agent)
+            agent._requirements_refinement_phase = types.MethodType(lambda self, **kwargs: {"status": "resolved"}, agent)
+            agent._plan_validation_phase = types.MethodType(
+                lambda self: {
+                    "status": "cannot_resolve",
+                    "resolution": {"note": "Plan validation command stayed malformed."},
+                    "iterations": [],
+                },
+                agent,
+            )
+            agent._implementation_loop_for_step = types.MethodType(
+                lambda self, step: (_ for _ in ()).throw(AssertionError("implementation should not run")),
+                agent,
+            )
+            agent._final_review_phase = types.MethodType(
+                lambda self, steps: (_ for _ in ()).throw(AssertionError("final review should not run")),
+                agent,
+            )
+
+            summary = agent.run()
+
+            self.assertEqual(summary["final_status"], "cannot_resolve")
+            self.assertEqual(summary["steps"][0]["step_id"], "plan_phase")
+            self.assertIn("malformed", summary["steps"][0]["last_review_summary"])
+
+    def test_run_blocks_dependent_step_after_failed_prerequisite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent._web_research_phase = types.MethodType(lambda self: {"status": "skipped"}, agent)
+            agent._analysis_phase = types.MethodType(lambda self, **kwargs: {"status": "resolved"}, agent)
+            agent._requirements_refinement_phase = types.MethodType(lambda self, **kwargs: {"status": "resolved"}, agent)
+
+            def plan_validation(self: FeedbackLoopAgent) -> dict[str, Any]:
+                self.requirements = base_requirements("Dependency gating")
+                self.plan_steps = [
+                    {
+                        "id": "S1",
+                        "title": "Prerequisite",
+                        "description": "Create the core artifact.",
+                        "depends_on": [],
+                        "acceptance_criteria": ["core exists"],
+                        "validation_commands": [["test", "-f", "core.txt"]],
+                        "status": "pending",
+                    },
+                    {
+                        "id": "S2",
+                        "title": "Dependent validation",
+                        "description": "Validate the core artifact.",
+                        "depends_on": ["S1"],
+                        "acceptance_criteria": ["validation passed"],
+                        "validation_commands": [["test", "-f", "validation.txt"]],
+                        "status": "pending",
+                    },
+                ]
+                self._write_requirements_doc()
+                self._write_plan_doc()
+                return {"status": "resolved", "iterations": []}
+
+            calls: list[str] = []
+
+            def implementation_loop(self: FeedbackLoopAgent, step: dict[str, Any]) -> dict[str, Any]:
+                calls.append(str(step["id"]))
+                if step["id"] == "S1":
+                    step["status"] = "cannot_resolve"
+                    return {"step_id": "S1", "status": "cannot_resolve", "attempts": []}
+                raise AssertionError("dependent step should not run after failed prerequisite")
+
+            agent._plan_validation_phase = types.MethodType(plan_validation, agent)
+            agent._implementation_loop_for_step = types.MethodType(implementation_loop, agent)
+            agent._final_review_phase = types.MethodType(
+                lambda self, steps: {"status": "cannot_resolve", "summary": "failed", "iterations": []},
+                agent,
+            )
+            agent._approach_review_phase = types.MethodType(
+                lambda self, attempt, steps, final: {"status": "resolved", "summary": "no retry"},
+                agent,
+            )
+
+            summary = agent.run()
+
+            self.assertEqual(calls, ["S1"])
+            self.assertEqual(summary["steps"][1]["step_id"], "S2")
+            self.assertEqual(summary["steps"][1]["status"], "cannot_resolve")
+            self.assertEqual(summary["steps"][1]["blocked_by_dependency"]["dependency"], "S1")
 
     def test_final_review_still_rejects_stale_plan_when_accepted_validation_now_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

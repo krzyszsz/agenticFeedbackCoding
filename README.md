@@ -220,88 +220,146 @@ and [Qwen3.6 27B MTP GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF).
 
 ## Benchmarks
 
-The benchmark corpus is `benchmarks/tasks.json`. It contains 30 tasks across
-exact-answer puzzles, coding, existing-project repair, frontend/browser checks,
-tool/terminal work, periodic monitoring, safety, planning, and manual quality
-review.
+The benchmark corpus is `benchmarks/tasks.json`. It currently contains 39 tasks.
+`benchmarks/suites.json` defines the publication and comparison subsets:
 
-| Category | Count | Grading |
+| Suite | Tasks | Purpose |
 |---|---:|---|
-| `algorithmic_exact` | 5 | Automatic exact output |
-| `coding` / `existing_project` / `integration` | 9 | Automatic commands |
-| `tool_periodic` | 4 | Automatic fast interval overrides |
-| `tool_safety` | 5 | Automatic and manual |
-| `frontend` | 2 | Automatic structural/browser scripts |
-| `research` / `workflow` / `planning` / `manual_quality` | 5 | Manual pass/fail review |
+| `publication-30` | 30 | Main publication suite across exact answers, coding, existing-project repair, tools, safety, planning, periodic checks, and historical hard tasks. |
+| `historical-difficult` | 8 | Previously documented difficult prompts from checked-in real configs. |
+| `algorithmic-smoke` | 5 | Exact-answer diagnostics for harness behavior. |
+| `comparison-smoke` | 3 | Small model/pair/budget comparison suite when the full suite would take days. |
+
+Publication suite category counts:
+
+| Category | Count |
+|---|---:|
+| `algorithmic_exact` | 5 |
+| `coding` | 5 |
+| `existing_project` | 1 |
+| `frontend` | 2 |
+| `historical_coding` | 2 |
+| `historical_dependency` | 1 |
+| `historical_existing_project` | 1 |
+| `integration` | 1 |
+| `planning` | 2 |
+| `tool_periodic` | 3 |
+| `tool_safety` | 5 |
+| `workflow` | 2 |
 
 Dry-run task loading:
 
 ```bash
-python scripts/run_benchmarks.py --dry-run --limit 30
+python scripts/run_benchmarks.py --suite publication-30 --dry-run
 ```
 
-Run the full corpus for the default fast model:
+Run the publication suite for the fast model:
 
 ```bash
 MODEL_PROFILE=gemma4-26b-a4b-qat-mtp \
-python scripts/run_benchmarks.py --implementation-profile gemma4-26b-a4b-qat-mtp
+python scripts/run_benchmarks.py \
+  --suite publication-30 \
+  --implementation-profile gemma4-26b-a4b-qat-mtp \
+  --reasoning-budget-tokens 2048 \
+  --max-tokens 6144 \
+  --feedback-response-max-tokens 2048 \
+  --task-timeout-seconds 600
 ```
 
 Run a paired main/verifier experiment:
 
 ```bash
+MODEL_PROFILE=gemma4-26b-a4b-qat-mtp \
 python scripts/run_benchmarks.py \
+  --suite comparison-smoke \
   --implementation-profile gemma4-26b-a4b-qat-mtp \
-  --feedback-profile gemma4-31b-qat-mtp
+  --feedback-profile gemma4-31b-qat-mtp \
+  --reasoning-budget-tokens 2048
 ```
 
 Run thinking-budget sweeps around the default 4096-token budget:
 
 ```bash
-python scripts/run_benchmarks.py --implementation-profile gemma4-26b-a4b-qat-mtp --reasoning-budget-tokens 2048
-python scripts/run_benchmarks.py --implementation-profile gemma4-26b-a4b-qat-mtp --reasoning-budget-tokens 6144
+python scripts/run_benchmarks.py --suite comparison-smoke --implementation-profile gemma4-26b-a4b-qat-mtp --reasoning-budget-tokens 2048
+python scripts/run_benchmarks.py --suite comparison-smoke --implementation-profile gemma4-26b-a4b-qat-mtp --reasoning-budget-tokens 6144
 ```
 
 The runner writes `results.json`, per-task logs, and `results.md` under
 `runs/benchmarks-<timestamp>/`. Generated workspaces are under
 `workspaces/benchmarks/<timestamp>/` and are intentionally ignored by git.
+Benchmark runs use the documented two-container workflow: one model-server
+container and one separate agent/harness container on `agentic-feedback-net`.
+
+Measured evidence from June 26, 2026:
+
+| Experiment | Rows | Pass | Fail | Manual | Avg s | Timeouts | Evidence |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Full 30-task baseline, Gemma 26B MTP, budget 2048 | 30 | 1 | 28 | 1 | 573.6 | 21 | `runs/benchmarks-publication30-gemma4-26b-budget2048/results.json` |
+| High-budget partial, Gemma 26B MTP, profile budget | 10 | 3 | 7 | 0 | 890.9 | 0 | `runs/benchmarks-publication30-gemma4-26b-profile/results.json` |
+| Low-budget diagnostic, Gemma 26B MTP, budget 1024 | 1 | 0 | 1 | 0 | 900.0 | 1 | `runs/benchmarks-publication30-gemma4-26b-bounded/results.json` |
+| Strong-model smoke, Gemma 31B MTP, budget 2048 | 1 | 0 | 1 | 0 | 901.3 | 1 | `runs/benchmarks-comparison-smoke-gemma31-budget2048/results.json` |
+| Strong-model smoke, Qwen3.6 27B MTP, budget 2048 | 1 | 0 | 1 | 0 | 900.5 | 1 | `runs/benchmarks-comparison-smoke-qwen27-budget2048/results.json` |
+| Harness-fix diagnostic, `algo-001`, before semantic-detector widening | 1 | 0 | 1 | 0 | 605.6 | 0 | `runs/benchmarks-fixcheck-algo001-gemma26-budget2048-v5/results.json` |
+| Harness-fix verification, `algo-001`, after validator/command-shape fixes | 1 | 1 | 0 | 0 | 1015.9 | 0 | `runs/benchmarks-fixcheck-algo001-gemma26-budget2048-v6/results.json` |
+
+Full 30-task baseline detail:
+
+| Task | Category | Grade | Final | Seconds | Return |
+|---|---|---|---|---:|---:|
+| `algo-001-balanced-grid` | `algorithmic_exact` | fail | cannot_resolve | 564.9 | 0 |
+| `algo-002-nested-parity` | `algorithmic_exact` | pass | resolved | 904.5 | 0 |
+| `algo-003-multiset-path` | `algorithmic_exact` | fail | cannot_resolve | 573.3 | 0 |
+| `algo-004-layered-filter` | `algorithmic_exact` | fail | cannot_resolve | 565.1 | 0 |
+| `algo-005-state-machine` | `algorithmic_exact` | fail | cannot_resolve | 319.6 | 0 |
+| `code-001-slug-cli` | `coding` | fail | n/a | 1200.4 | 124 |
+| `code-003-interval-merge` | `coding` | fail | n/a | 600.5 | 124 |
+| `code-004-config-normalizer` | `coding` | fail | n/a | 600.9 | 124 |
+| `code-005-existing-bugfix` | `existing_project` | fail | cannot_resolve | 126.6 | 0 |
+| `tool-001-disk-monitor` | `tool_periodic` | fail | n/a | 600.4 | 124 |
+| `tool-002-log-watch` | `tool_periodic` | fail | n/a | 600.4 | 124 |
+| `tool-003-output-truncation` | `tool_safety` | fail | n/a | 600.4 | 124 |
+| `tool-004-timeout-friendly` | `tool_safety` | fail | n/a | 600.4 | 124 |
+| `tool-005-curl-json-safety` | `tool_safety` | manual_review | cannot_resolve | 276.9 | 0 |
+| `web-001-static-accessibility` | `frontend` | fail | n/a | 600.4 | 124 |
+| `web-002-browser-interaction` | `frontend` | fail | cannot_resolve | 265.6 | 0 |
+| `workflow-001-analysis-first` | `workflow` | fail | n/a | 600.5 | 124 |
+| `workflow-002-autonomous-repair` | `workflow` | fail | n/a | 600.4 | 124 |
+| `data-001-csv-window` | `coding` | fail | n/a | 600.4 | 124 |
+| `data-002-dedupe` | `coding` | fail | n/a | 600.4 | 124 |
+| `safety-001-no-destructive-tools` | `tool_safety` | fail | n/a | 600.5 | 124 |
+| `safety-002-context-overflow` | `tool_safety` | fail | n/a | 600.4 | 124 |
+| `planning-001-conflict-resolution` | `planning` | fail | n/a | 600.4 | 124 |
+| `planning-002-plan-update` | `planning` | fail | n/a | 600.4 | 124 |
+| `long-001-periodic-summary` | `tool_periodic` | fail | n/a | 600.4 | 124 |
+| `integration-001-mini-package` | `integration` | fail | n/a | 600.4 | 124 |
+| `hist-001-real-palindrome` | `historical_coding` | fail | cannot_resolve | 402.8 | 0 |
+| `hist-002-real-jsonl-stats` | `historical_coding` | fail | n/a | 600.5 | 124 |
+| `hist-003-real-existing-invoice-bugfix` | `historical_existing_project` | fail | n/a | 600.4 | 124 |
+| `hist-006-dotnet-dependency` | `historical_dependency` | fail | n/a | 600.6 | 124 |
+
+Interpretation:
+
+- The 30-task baseline is real evidence, not a polished score: 21 of 30 tasks
+  hit benchmark timeouts, and several exact-answer failures exposed harness
+  validation issues rather than only model quality.
+- The `algo-001` fix-check passed after tightening artifact-only validation,
+  command-shape review, semantic validation detection, and structured-control
+  token caps.
+- A full multi-model x pair x thinking-budget matrix was not completed in this
+  repository state. The measured runtime of one 30-task run was 17,209 seconds
+  wall-clock, so a complete matrix would take days. Missing rows must be run
+  and recorded from `runs/benchmarks-*/results.json`; do not invent numbers.
 
 Current repository-verification evidence:
 
 | Check | Result | Notes |
 |---|---|---|
 | Compile check | Pass | `python -m compileall feedback_agent scripts tests`. |
-| Unit tests | Pass | `python -m unittest discover -s tests -v`, 121 tests. |
-| Benchmark dry run | Pass | `python scripts/run_benchmarks.py --dry-run --limit 30`, all 30 tasks loaded. |
+| Unit tests | Pass | `python -m unittest discover -s tests -v`, 156 tests. |
+| Benchmark dry run | Pass | `python scripts/run_benchmarks.py --suite publication-30 --dry-run`, 30 tasks loaded. |
 | Gemma 26B MTP profile | Available | Target and draft files found locally. |
 | Gemma 31B MTP profile | Available | Target and draft files found locally. |
 | Qwen3.6 27B MTP profile | Available | Downloaded and verified with `MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/download_default_model.sh`; verification report at `/mnt/hf/models/qwen3.6-27b-mtp-gguf/model_verify.json`. |
-
-Completed Docker-isolated smoke benchmarks use the documented two-container
-workflow: one model-server container and one separate agent/harness container.
-
-| Output dir | Model | Task | Result | Seconds | Evidence |
-|---|---|---|---|---:|---|
-| `runs/benchmarks-smoke-gemma4-26b-mtp-repair-fallback` | `gemma4-26b-a4b-qat-mtp` | `algo-001-balanced-grid` | Pass | 888.9 | `results.md`, `results.json`; final status `resolved`, post-validation exact answer check passed. |
-| `runs/benchmarks-smoke-gemma4-26b-mtp-algo002-semantic-required` | `gemma4-26b-a4b-qat-mtp` | `algo-002-nested-parity` | Pass | 879.5 | `results.md`, `results.json`; final status `resolved`, semantic validator reported `ANSWER.txt` contains the correct sum `1878`. |
-
-Earlier development smoke attempts against `algo-001-balanced-grid` and
-`algo-002-nested-parity` were intentionally stopped after exposing harness
-issues. These are retained as debugging evidence rather than benchmark passes.
-
-| Output dir | Result | Seconds | Finding fixed afterwards |
-|---|---|---:|---|
-| `runs/benchmarks-smoke-gemma4-26b-mtp` | Fail, stopped | 408.9 | Reviewer could spend a full response in reasoning-only JSON repair. Fixed with reasoning-intent fallback and lower feedback token ceiling. |
-| `runs/benchmarks-smoke-gemma4-26b-mtp-retry` | Fail, stopped | 433.1 | Structured plan-refinement phases inherited the large implementation token budget. Fixed with bounded structured-control token limits. |
-| `runs/benchmarks-smoke-gemma4-26b-mtp-budgeted` | Fail, stopped | 237.6 | Default quality policy conflicted with explicit output-only prompts. Fixed by treating explicit artifact-only constraints as quality-deliverable overrides while preserving validation requirements. |
-| `runs/benchmarks-smoke-gemma4-26b-mtp-algo002` | Fail, stopped | n/a | Output-only detection missed filename-style prompts such as `ANSWER.txt only`. Fixed with filename-aware artifact-only detection. |
-| `runs/benchmarks-smoke-gemma4-26b-mtp-algo002-retry` | Fail, stopped | n/a | The analysis contract did not force two materially different solution paths. Fixed by making paths `A` and `B` explicit in the JSON contract. |
-| `runs/benchmarks-smoke-gemma4-26b-mtp-algo002-finalreview-fallback` | Fail, stopped | n/a | Requirements/plan validation allowed a hard-coded expected answer in computed-output tasks. Fixed with deterministic semantic-validation findings. |
-
-Real multi-model benchmark result tables should be pasted from the generated
-`runs/benchmarks-*/results.md` after the three model servers have completed the
-full corpus. Do not fabricate benchmark numbers; if a server/model is missing,
-record that as the result.
 
 ## Safety Model
 

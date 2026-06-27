@@ -173,7 +173,14 @@ if [ "$docker_enabled" = "1" ] && [ "${AGENT_IN_CONTAINER:-0}" != "1" ]; then
       user_args=(--user "$docker_user")
       ;;
   esac
-  "${docker_cmd[@]}" run --rm "${network_args[@]}" --security-opt label=disable \
+  container_identity_args=()
+  if [ -n "${AGENT_CONTAINER_NAME:-}" ]; then
+    container_identity_args+=(--name "$AGENT_CONTAINER_NAME")
+  fi
+  if [ -n "${AGENT_CONTAINER_LABEL:-}" ]; then
+    container_identity_args+=(--label "$AGENT_CONTAINER_LABEL")
+  fi
+  "${docker_cmd[@]}" run --rm "${container_identity_args[@]}" "${network_args[@]}" --security-opt label=disable \
     "${user_args[@]}" \
     "${env_args[@]}" \
     -v "$workspace:/workspace/project" \

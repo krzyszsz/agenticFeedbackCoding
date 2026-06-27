@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from .bounds import estimate_tokens
 from .config import AgentConfig
 from .conversation import Conversation, Turn
 
@@ -20,9 +21,16 @@ def maybe_compact(
     if not cfg.enabled:
         return False
     limit = int((context_window or config.implementation_model.context_window) * cfg.threshold_ratio)
+    if cfg.max_uncompacted_tokens > 0:
+        limit = min(limit, cfg.max_uncompacted_tokens)
     if not force and conversation.estimated_tokens() + max(0, incoming_tokens) < limit:
         return False
-    old_turns = conversation.turns[:-cfg.keep_recent_turns]
+    keep_recent_turns = _bounded_recent_turn_count(
+        conversation.turns,
+        cfg.keep_recent_turns,
+        cfg.recent_turns_max_tokens,
+    )
+    old_turns = conversation.turns[:-keep_recent_turns] if keep_recent_turns else conversation.turns
     source = "\n\n".join(f"{t.role}: {t.content}" for t in old_turns)
     initial_context = initial_request_context(conversation.turns)
     prompt = (
@@ -58,8 +66,29 @@ def maybe_compact(
         cleaned = f"{cleaned}\n\n{control_state}"
     if pinned_context:
         cleaned = f"{cleaned}\n\nPINNED_WORKFLOW_STATE:\n{pinned_context}"
-    conversation.replace_with_memory(cleaned, cfg.keep_recent_turns)
+    conversation.replace_with_memory(cleaned, keep_recent_turns)
     return True
+
+
+def _bounded_recent_turn_count(turns: list[Turn], max_turns: int, max_tokens: int) -> int:
+    """Keep recent verbatim context useful without carrying huge tool payloads forever."""
+    if max_turns <= 0 or not turns:
+        return 0
+    if max_tokens <= 0:
+        return min(max_turns, len(turns))
+    total = 0
+    keep = 0
+    for turn in reversed(turns):
+        turn_tokens = estimate_tokens(turn.content)
+        if keep >= max_turns:
+            break
+        if keep > 0 and total + turn_tokens > max_tokens:
+            break
+        total += turn_tokens
+        keep += 1
+        if total >= max_tokens:
+            break
+    return keep
 
 
 def initial_request_context(turns: list[Turn], *, limit: int = 8000) -> str:

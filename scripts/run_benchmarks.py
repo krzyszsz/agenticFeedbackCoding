@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
+import signal
 import subprocess
 import sys
 import time
@@ -15,7 +17,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from feedback_agent.config import DEFAULT_CONFIG, _deep_merge
-from feedback_agent.model_profiles import resolve_profile
+from feedback_agent.model_profiles import ModelProfile, resolve_profile
 from feedback_agent.workspace import run_commands, write_files
 
 
@@ -24,13 +26,41 @@ def load_tasks(path: Path) -> list[dict[str, Any]]:
     return list(data["tasks"])
 
 
+def load_suite_ids(path: Path, suite: str | None) -> list[str]:
+    if not suite:
+        return []
+    if not path.exists():
+        raise SystemExit(f"Benchmark suite file does not exist: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    suites = data.get("suites", {})
+    if suite not in suites:
+        known = ", ".join(sorted(suites))
+        raise SystemExit(f"Unknown benchmark suite '{suite}'. Known suites: {known}")
+    entry = suites[suite]
+    task_ids = entry.get("task_ids") if isinstance(entry, dict) else entry
+    if not isinstance(task_ids, list) or not all(isinstance(item, str) for item in task_ids):
+        raise SystemExit(f"Benchmark suite '{suite}' must define a list of task_ids.")
+    return task_ids
+
+
 def select_tasks(tasks: list[dict[str, Any]], ids: list[str], limit: int | None) -> list[dict[str, Any]]:
     if ids:
-        wanted = set(ids)
-        tasks = [task for task in tasks if task["id"] in wanted]
-        missing = wanted - {task["id"] for task in tasks}
+        by_id = {task["id"]: task for task in tasks}
+        selected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        missing: set[str] = set()
+        for task_id in ids:
+            if task_id in seen:
+                continue
+            seen.add(task_id)
+            task = by_id.get(task_id)
+            if task is None:
+                missing.add(task_id)
+            else:
+                selected.append(task)
         if missing:
             raise SystemExit(f"Unknown benchmark task id(s): {', '.join(sorted(missing))}")
+        tasks = selected
     if limit is not None:
         tasks = tasks[:limit]
     return tasks
@@ -45,6 +75,8 @@ def benchmark_config(
     feedback_profile: str | None,
     docker_isolation: bool,
     reasoning_budget_tokens: int | None,
+    max_tokens: int,
+    feedback_response_max_tokens: int,
 ) -> dict[str, Any]:
     impl = resolve_profile(implementation_profile)
     feedback = resolve_profile(feedback_profile) if feedback_profile else None
@@ -54,7 +86,7 @@ def benchmark_config(
         "api_key": "not-needed",
         "model": "local-gguf",
         "context_window": impl.context_window,
-        "max_tokens": 32768,
+        "max_tokens": max_tokens,
         "temperature": 0.2,
         "request_timeout_seconds": 21600,
         "retry_attempts": 20,
@@ -62,6 +94,7 @@ def benchmark_config(
         "request_heartbeat_seconds": 30,
         "preserve_reasoning": True,
         "reasoning_budget_tokens": reasoning_budget_tokens or impl.reasoning_budget_tokens,
+        "send_reasoning_budget": True,
     }
     data: dict[str, Any] = {
         "implementation_model": model_cfg,
@@ -74,6 +107,7 @@ def benchmark_config(
             "print_transcript": True,
             "live_turn_max_chars": 20000,
             "final_summary": "compact",
+            "feedback_response_max_tokens": feedback_response_max_tokens,
         },
         "mcp_tools": {
             "terminal": True,
@@ -88,6 +122,8 @@ def benchmark_config(
             "prompt": task["prompt"],
         },
     }
+    if task.get("web_research", False):
+        data["web_research"] = {"enabled": True}
     if feedback:
         data["feedback_model"] = {
             **model_cfg,
@@ -96,6 +132,8 @@ def benchmark_config(
             "context_window": feedback.context_window,
             "reasoning_budget_tokens": reasoning_budget_tokens or feedback.reasoning_budget_tokens,
         }
+    if task.get("config_overrides"):
+        data = _deep_merge(data, task["config_overrides"])
     return _deep_merge(DEFAULT_CONFIG, data)
 
 
@@ -111,23 +149,77 @@ def seed_workspace(workspace: Path, task: dict[str, Any]) -> None:
         write_files(workspace, setup_files)
 
 
-def run_harness(repo_root: Path, config_path: Path, *, implementation_profile: str, feedback_profile: str | None) -> tuple[int, float, str]:
+def _docker_model_url(profile: ModelProfile) -> str:
+    return f"http://{profile.container_name}:{profile.port}/v1"
+
+
+def run_harness(
+    repo_root: Path,
+    config_path: Path,
+    *,
+    implementation_profile: str,
+    feedback_profile: str | None,
+    timeout_seconds: int | None,
+) -> tuple[int, float, str]:
+    safe_stem = re.sub(r"[^a-zA-Z0-9_.-]+", "-", config_path.stem).strip("-")[:40] or "task"
+    container_name = f"agentic-bench-{safe_stem}-{os.getpid()}-{int(time.time() * 1000) % 1000000}"
     env = {
         **os.environ,
         "MODEL_PROFILE": implementation_profile,
+        "AGENT_CONTAINER_NAME": container_name,
+        "AGENT_CONTAINER_LABEL": "agentic-feedback-benchmark=1",
     }
     if feedback_profile:
+        feedback = resolve_profile(feedback_profile)
         env["FEEDBACK_MODEL_PROFILE"] = feedback_profile
+        env.setdefault("AGENT_FEEDBACK_BASE_URL", _docker_model_url(feedback))
     start = time.monotonic()
-    proc = subprocess.run(
-        ["bash", "scripts/run_agent.sh", "--config", str(config_path)],
-        cwd=repo_root,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
-    )
-    return proc.returncode, time.monotonic() - start, proc.stdout
+    proc: subprocess.Popen[str] | None = None
+    try:
+        proc = subprocess.Popen(
+            ["bash", "scripts/run_agent.sh", "--config", str(config_path)],
+            cwd=repo_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+        stdout, _stderr = proc.communicate(timeout=timeout_seconds)
+        return proc.returncode, time.monotonic() - start, stdout or ""
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                proc.terminate()
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                cwd=repo_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+            )
+            try:
+                more, _stderr = proc.communicate(timeout=5)
+                output += more or ""
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    proc.kill()
+                more, _stderr = proc.communicate(timeout=5)
+                output += more or ""
+        output += f"\n[BENCHMARK_TIMEOUT] harness task exceeded {timeout_seconds} seconds and was stopped.\n"
+        return 124, time.monotonic() - start, output
 
 
 def grade_task(workspace: Path, task: dict[str, Any]) -> dict[str, Any]:
@@ -165,6 +257,64 @@ def summarize_result(result: dict[str, Any]) -> dict[str, Any]:
         "final_review_status": (summary.get("final_review") or {}).get("status"),
         "approach_review_status": (summary.get("approach_review") or {}).get("status"),
     }
+
+
+def result_matches_run(
+    result: dict[str, Any],
+    *,
+    task_id: str,
+    implementation_profile: str,
+    feedback_profile: str | None,
+    reasoning_budget_tokens: int | None,
+    max_tokens: int | None = None,
+    feedback_response_max_tokens: int | None = None,
+) -> bool:
+    matches = (
+        result.get("task_id") == task_id
+        and result.get("implementation_profile") == implementation_profile
+        and result.get("feedback_profile") == feedback_profile
+        and result.get("reasoning_budget_tokens") == reasoning_budget_tokens
+    )
+    if max_tokens is not None:
+        matches = matches and result.get("max_tokens") == max_tokens
+    if feedback_response_max_tokens is not None:
+        matches = matches and result.get("feedback_response_max_tokens") == feedback_response_max_tokens
+    return matches
+
+
+def load_resume_results(
+    output_dir: Path,
+    *,
+    selected_tasks: list[dict[str, Any]],
+    implementation_profile: str,
+    feedback_profile: str | None,
+    reasoning_budget_tokens: int | None,
+    max_tokens: int,
+    feedback_response_max_tokens: int,
+) -> list[dict[str, Any]]:
+    results_path = output_dir / "results.json"
+    if not results_path.exists():
+        return []
+    try:
+        existing = json.loads(results_path.read_text(encoding="utf-8")).get("results", [])
+    except json.JSONDecodeError:
+        return []
+    selected_ids = {task["id"] for task in selected_tasks}
+    return [
+        result
+        for result in existing
+        if isinstance(result, dict)
+        and result.get("task_id") in selected_ids
+        and result_matches_run(
+            result,
+            task_id=str(result.get("task_id")),
+            implementation_profile=implementation_profile,
+            feedback_profile=feedback_profile,
+            reasoning_budget_tokens=reasoning_budget_tokens,
+            max_tokens=max_tokens,
+            feedback_response_max_tokens=feedback_response_max_tokens,
+        )
+    ]
 
 
 def markdown_table(results: list[dict[str, Any]]) -> str:
@@ -212,29 +362,63 @@ def summary_table(results: list[dict[str, Any]]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the agenticFeedbackCoding benchmark corpus.")
     parser.add_argument("--tasks", default="benchmarks/tasks.json")
+    parser.add_argument("--suites", default="benchmarks/suites.json")
+    parser.add_argument("--suite")
     parser.add_argument("--implementation-profile", default="gemma4-26b-a4b-qat-mtp")
     parser.add_argument("--feedback-profile")
     parser.add_argument("--reasoning-budget-tokens", type=int)
+    parser.add_argument("--max-tokens", type=int, default=8192)
+    parser.add_argument("--feedback-response-max-tokens", type=int, default=4096)
     parser.add_argument("--task-id", action="append", default=[])
     parser.add_argument("--limit", type=int)
     parser.add_argument("--output-dir", default="")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--task-timeout-seconds", type=int, default=0)
     parser.add_argument("--docker-isolation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     repo_root = REPO_ROOT
-    tasks = select_tasks(load_tasks(repo_root / args.tasks), args.task_id, args.limit)
+    suite_ids = load_suite_ids(repo_root / args.suites, args.suite)
+    tasks = select_tasks(load_tasks(repo_root / args.tasks), [*suite_ids, *args.task_id], args.limit)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_dir = Path(args.output_dir) if args.output_dir else repo_root / "runs" / f"benchmarks-{stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    results: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = load_resume_results(
+        output_dir,
+        selected_tasks=tasks,
+        implementation_profile=args.implementation_profile,
+        feedback_profile=args.feedback_profile,
+        reasoning_budget_tokens=args.reasoning_budget_tokens,
+        max_tokens=args.max_tokens,
+        feedback_response_max_tokens=args.feedback_response_max_tokens,
+    ) if args.resume else []
     if args.dry_run:
         for task in tasks:
             print(f"{task['id']}\t{task['category']}\t{task.get('grading', 'manual')}\t{task['title']}")
         return 0
 
     for task in tasks:
+        existing_result = next(
+            (
+                result
+                for result in results
+                if result_matches_run(
+                    result,
+                    task_id=task["id"],
+                    implementation_profile=args.implementation_profile,
+                    feedback_profile=args.feedback_profile,
+                    reasoning_budget_tokens=args.reasoning_budget_tokens,
+                    max_tokens=args.max_tokens,
+                    feedback_response_max_tokens=args.feedback_response_max_tokens,
+                )
+            ),
+            None,
+        )
+        if existing_result is not None:
+            print(f"{task['id']}: skipped existing {existing_result['grade']} in {existing_result.get('elapsed_seconds', 0):.1f}s")
+            continue
         workspace = repo_root / "workspaces" / "benchmarks" / stamp / task["id"]
         seed_workspace(workspace, task)
         config_path = output_dir / f"{task['id']}.json"
@@ -246,6 +430,8 @@ def main() -> int:
             feedback_profile=args.feedback_profile,
             docker_isolation=args.docker_isolation,
             reasoning_budget_tokens=args.reasoning_budget_tokens,
+            max_tokens=args.max_tokens,
+            feedback_response_max_tokens=args.feedback_response_max_tokens,
         )
         write_config(config_path, cfg)
         returncode, elapsed, output = run_harness(
@@ -253,6 +439,7 @@ def main() -> int:
             config_path,
             implementation_profile=args.implementation_profile,
             feedback_profile=args.feedback_profile,
+            timeout_seconds=args.task_timeout_seconds or None,
         )
         (output_dir / f"{task['id']}.log").write_text(output, encoding="utf-8")
         grade = grade_task(workspace, task)
@@ -264,6 +451,8 @@ def main() -> int:
             "implementation_profile": args.implementation_profile,
             "feedback_profile": args.feedback_profile,
             "reasoning_budget_tokens": args.reasoning_budget_tokens,
+            "max_tokens": args.max_tokens,
+            "feedback_response_max_tokens": args.feedback_response_max_tokens,
             "workspace": str(workspace),
             "returncode": returncode,
             "elapsed_seconds": elapsed,

@@ -89,6 +89,8 @@ def run_bounded_process(
     selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
     selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
     deadline = time.monotonic() + timeout_seconds
+    killed_process_group = False
+    force_close_deadline: float | None = None
 
     def absorb(stream_name: str, data: bytes) -> None:
         byte_counts[stream_name] += len(data)
@@ -97,15 +99,41 @@ def run_bounded_process(
         if len(buffer) > output_limit_bytes:
             del buffer[: len(buffer) - output_limit_bytes]
 
-    while selector.get_map():
-        if proc.poll() is None and time.monotonic() >= deadline:
-            timed_out = True
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError:
+    def kill_process_group(sig: int) -> None:
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            if proc.poll() is None:
                 proc.kill()
+
+    def cleanup_process_group() -> None:
+        """Clean up descendants left behind by shells or validation scripts.
+
+        Agent-generated commands often start background processes for tests.
+        Even when the direct child exits, those descendants can keep running in
+        the same process group. Validation commands are expected to be
+        self-contained, so the harness cleans up the group after collecting the
+        parent result.
+        """
+        kill_process_group(signal.SIGTERM)
+        time.sleep(0.05)
+        kill_process_group(signal.SIGKILL)
+
+    while selector.get_map():
+        now = time.monotonic()
+        if not killed_process_group and now >= deadline:
+            timed_out = True
+            killed_process_group = True
+            force_close_deadline = now + 1.0
+            kill_process_group(signal.SIGKILL)
+        if force_close_deadline is not None and now >= force_close_deadline:
+            for key in list(selector.get_map().values()):
+                stream = key.fileobj
+                selector.unregister(stream)
+                stream.close()
+            break
         events = selector.select(timeout=0.05)
         if not events and proc.poll() is not None:
             # Give EOF notifications a chance to drain both pipes.
@@ -119,7 +147,13 @@ def run_bounded_process(
                 selector.unregister(stream)
                 stream.close()
 
-    returncode = proc.wait(timeout=1)
+    try:
+        returncode = proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill_process_group(signal.SIGKILL)
+        returncode = proc.wait(timeout=1)
+    cleanup_process_group()
     stdout = buffers["stdout"].decode("utf-8", errors="replace")
     stderr = buffers["stderr"].decode("utf-8", errors="replace")
     stdout_truncated = byte_counts["stdout"] > output_limit_bytes

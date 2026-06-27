@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import shlex
 from typing import Any
 
 from .bounds import clamp_text, estimate_tokens
 from .compaction import maybe_compact
 from .config import AgentConfig
 from .conversation import Conversation
-from .git_tools import commit_all, ensure_git_repo, git_evidence, reset_to_ref
+from .git_tools import HARNESS_ONLY_PATHS, commit_all, ensure_git_repo, git_evidence, reset_to_ref
 from .llm import OpenAICompatClient
 from .web_research import compact_research_for_prompt, research_to_markdown, run_web_research
 from .workspace import (
@@ -23,6 +24,35 @@ from .workspace import (
     write_plan_doc,
     write_requirements_doc,
 )
+
+
+def _strip_visible_reasoning_for_transcript(text: str) -> str:
+    """Keep durable chat memory focused on final structured content.
+
+    Some local models emit visible `<think>` blocks even when asked for strict
+    JSON. The current phase still receives and parses the raw response, but
+    later phases should not inherit hidden-work scratch pads or benchmark-answer
+    leakage as durable context.
+    """
+    stripped = re.sub(r"<think\b[^>]*>.*?</think>\s*", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    if stripped != text.strip():
+        if stripped:
+            return "[visible reasoning omitted from durable chat memory]\n" + stripped
+        return "[visible reasoning omitted from durable chat memory]"
+    return text
+
+
+def _normalize_workspace_path_text(path: object) -> str:
+    """Normalize relative workspace paths without corrupting dotfiles."""
+    normalized = Path(str(path)).as_posix()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _trim_reference_delimiters(text: object) -> str:
+    """Trim surrounding prose/Markdown punctuation without corrupting `./foo`."""
+    return str(text).strip().lstrip("`'\"([{").rstrip("`'\"),.;:]}")
 
 
 ANALYSIS_CONTRACT = """
@@ -165,16 +195,22 @@ make good decisions later; avoid filler and repetition, but do not omit importan
 requirements just to make the response shorter.
 Do not emit chat-template or fake tool-call markers such as <|channel>,
 <tool_call>, call:ls_tool, or similar. This harness cannot execute those
-markers; it only runs commands listed inside the parsed JSON `commands` fields
-after the response is complete. Start with `{`, return one JSON object, and stop
+markers; validation happens through the parsed JSON `validation_commands` fields
+after planning is accepted. Start with `{`, return one JSON object, and stop
 immediately after the matching closing `}`. Use as much detail as the task
 needs, but avoid padding, repetition, or speculative tool-call syntax.
 Commands may be argv lists or {"cmd": ["python", "script.py"], "timeout_seconds": 7200}
 when one specific tool call legitimately needs longer than the default timeout.
-Avoid embedding Python source, f-strings, braces, list comprehensions, or other
-quote-heavy snippets inside JSON command strings during planning. Prefer simple
-argv checks such as ["test", "-f", "README.md"]. For complex validation, add a
-plan step that creates a validation script and then run ["python", "validate.py"].
+Do not use string-valued command fields such as {"cmd": "python script.py"};
+use argv arrays so quoting and arguments can be verified before execution.
+Avoid embedding quote-heavy Python source, f-strings, braces, list
+comprehensions, or other brittle snippets inside JSON command strings during
+planning when the task allows helper validation files. Prefer simple argv
+checks such as ["test", "-f", "README.md"]. For complex validation, add a plan
+step that creates a validation script and then run ["python", "validate.py"].
+For artifact-only requests, helper files inside the workspace may be forbidden;
+in that case use simple inline commands or temporary files outside the
+workspace.
 Do not use `python -m py_compile .` or point `py_compile` at a directory; use
 `python -m compileall <dir>` or a small validation script when validating a
 whole package.
@@ -215,9 +251,12 @@ Do not repeat the full requirements unless that detail is needed to make the
 plan clear. Validation commands must terminate and assert behavior. Do not use
 `python -m http.server` by itself; wrap any server startup inside a script that
 performs checks and exits.
-Do not embed inline Python source in JSON command strings. Prefer simple argv
-checks such as ["test", "-f", "index.html"], or run a generated validation
-script such as ["python", "validate.py"].
+Do not embed quote-heavy inline Python source in JSON command strings when the
+task allows helper validation files. Prefer simple argv checks such as
+["test", "-f", "index.html"], or run a generated validation script such as
+["python", "validate.py"]. For artifact-only requests, helper files inside the
+workspace may be forbidden; in that case use simple inline commands or temporary
+files outside the workspace.
 Do not use `python -m py_compile .` or any directory argument with
 `py_compile`; use `python -m compileall <dir>` or a generated validation script
 for package-wide syntax checks.
@@ -225,6 +264,8 @@ If a step intentionally expects a non-zero result, including a partial bug-fix
 step where failure logs should now show only logic errors, use a command object
 with `expected_returncode` or a wrapper script that returns 0 only when that
 specific expected failure is observed.
+Do not use string-valued command fields such as {"cmd": "python script.py"};
+use argv arrays so quoting and arguments can be verified before execution.
 Do not emit chat-template or fake tool-call markers such as <|channel>,
 <tool_call>, call:ls_tool, or similar. This harness cannot execute those
 markers; it only runs commands listed inside the parsed JSON `validation_commands`
@@ -423,6 +464,21 @@ class FeedbackLoopAgent:
             "or docs/*.md instead."
         )
 
+    def _artifact_only_guidance(self) -> str:
+        if not self._explicit_artifact_only_constraint():
+            return ""
+        allowed = sorted(self._artifact_only_allowed_paths())
+        allowed_text = ", ".join(allowed) if allowed else "the explicitly requested final artifact only"
+        return (
+            "ARTIFACT_ONLY_CONSTRAINT:\n"
+            f"The user explicitly limited workspace deliverables to {allowed_text}. "
+            "Do not create helper source files, validation scripts, README files, or other project artifacts in the "
+            "workspace unless they are explicitly named by the user. Use inline commands, commands that create "
+            "temporary files outside the workspace, or reviewer-owned validation evidence to verify the artifact. "
+            "When inline semantic validation needs iteration, prefer expression-style checks such as `sum(... for ... "
+            "if ...)` or a multiline shell command instead of one-line compound `for`/`if` Python blocks."
+        )
+
     def _split_model_writable_files(self, files: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
         """Keep implementation turns from overwriting harness-owned state.
 
@@ -431,12 +487,16 @@ class FeedbackLoopAgent:
         payloads should not replace them with project-local guesses. Blocking
         here is safer than hoping every local model obeys the prompt forever.
         """
-        blocked = {Path(name).as_posix() for name in self._harness_doc_names()}
+        blocked = {_normalize_workspace_path_text(name) for name in self._harness_doc_names()}
+        artifact_allowed = self._artifact_only_allowed_paths()
         allowed: list[dict[str, Any]] = []
         skipped: list[str] = []
         for item in files:
-            rel = Path(str(item.get("path", ""))).as_posix()
+            rel = _normalize_workspace_path_text(item.get("path", ""))
             if rel in blocked:
+                skipped.append(rel)
+                continue
+            if self._explicit_artifact_only_constraint() and not self._artifact_path_is_allowed(rel, artifact_allowed):
                 skipped.append(rel)
                 continue
             allowed.append(item)
@@ -581,7 +641,10 @@ class FeedbackLoopAgent:
         )
         self.conversation.append("user", content)
         raw = self.impl_client.chat(self.conversation.messages(), max_tokens=max_tokens)
-        self.conversation.append("assistant", "IMPLEMENTATION_AGENT_RESPONSE:\n" + raw)
+        self.conversation.append(
+            "assistant",
+            "IMPLEMENTATION_AGENT_RESPONSE:\n" + _strip_visible_reasoning_for_transcript(raw),
+        )
         maybe_compact(
             self.conversation,
             self.config,
@@ -619,7 +682,10 @@ class FeedbackLoopAgent:
             max_tokens=response_tokens,
             temperature=temperature,
         )
-        self.conversation.append("user", "FEEDBACK_AGENT_RESPONSE:\n" + raw)
+        self.conversation.append(
+            "user",
+            "FEEDBACK_AGENT_RESPONSE:\n" + _strip_visible_reasoning_for_transcript(raw),
+        )
         maybe_compact(
             self.conversation,
             self.config,
@@ -665,7 +731,10 @@ class FeedbackLoopAgent:
             max_tokens=response_tokens,
             temperature=temperature,
         )
-        self.conversation.append("user", "FEEDBACK_AGENT_RESPONSE:\n" + raw)
+        self.conversation.append(
+            "user",
+            "FEEDBACK_AGENT_RESPONSE:\n" + _strip_visible_reasoning_for_transcript(raw),
+        )
         maybe_compact(
             self.conversation,
             self.config,
@@ -686,9 +755,9 @@ class FeedbackLoopAgent:
         configured = self.config.runtime.feedback_response_max_tokens
         if configured <= 0:
             return feedback_cfg.max_tokens
-        return max(512, min(feedback_cfg.max_tokens, configured))
+        return self._tokens_with_reasoning_room(feedback_cfg, configured, minimum=512)
 
-    def _structured_control_tokens(self, ceiling: int = 4096) -> int:
+    def _structured_control_tokens(self, ceiling: int = 2048) -> int:
         """Bound non-file-generation JSON phases.
 
         Analysis, requirements, and plan-refinement turns are orchestration
@@ -696,7 +765,27 @@ class FeedbackLoopAgent:
         but they should not inherit the large implementation payload ceiling
         reserved for generated files.
         """
-        return max(2048, min(self.config.implementation_model.max_tokens, ceiling))
+        return self._tokens_with_reasoning_room(self.config.implementation_model, ceiling, minimum=1024)
+
+    def _implementation_payload_tokens(self) -> int:
+        """Bound implementation JSON payloads enough to avoid runaway reasoning."""
+        return self._tokens_with_reasoning_room(self.config.implementation_model, 4096, minimum=2048)
+
+    def _tokens_with_reasoning_room(self, model_cfg, answer_tokens: int, *, minimum: int) -> int:
+        """Reserve output room for a reasoning budget plus final structured JSON.
+
+        Several local reasoning models count visible or server-side reasoning
+        against the same response token ceiling used for the final JSON object.
+        If the harness caps a structured turn at exactly the reasoning budget,
+        the model can exhaust the whole response with `<think>` text and never
+        emit parseable JSON. The cap still honors the model's configured maximum.
+        """
+        answer_budget = max(minimum, int(answer_tokens))
+        reasoning_budget = 0
+        if getattr(model_cfg, "reasoning_budget_tokens", None) is not None:
+            reasoning_budget = max(0, int(model_cfg.reasoning_budget_tokens or 0))
+        target = answer_budget + reasoning_budget if reasoning_budget else answer_budget
+        return max(minimum, min(int(model_cfg.max_tokens), target))
 
     def _extract_json_or_retry(
         self,
@@ -729,6 +818,13 @@ class FeedbackLoopAgent:
                 step_limit_text = f" Prefer at most {step_limit} steps if that remains verifiable."
             else:
                 step_limit_text = ""
+            artifact_repair_text = ""
+            if self._explicit_artifact_only_constraint():
+                artifact_repair_text = (
+                    " For artifact-only prompts, do not propose helper files or generated validation scripts "
+                    "inside the workspace unless the user explicitly named those files. Prefer simple expression-style "
+                    "validation commands, multiline shell commands, or temporary files outside the workspace."
+                )
             repair_prompt = (
                 f"{phase}_JSON_REPAIR\n"
                 f"The previous response could not be parsed as JSON: {exc}\n"
@@ -746,7 +842,9 @@ class FeedbackLoopAgent:
                 "f-strings, braces, list comprehensions, and quote-heavy snippets in JSON command strings; "
                 "prefer simple argv checks or a generated validation script. Per-attempt file limits are "
                 "not plan-step limits. For expected failure-path checks, use expected_returncode or a "
-                "wrapper assertion that verifies the non-zero code and error text." + step_limit_text + "\n\n"
+                "wrapper assertion that verifies the non-zero code and error text."
+                + artifact_repair_text
+                + step_limit_text + "\n\n"
                 f"Required contract:\n{contract}\n\n"
                 f"Previous response tail for recovery:\n{tail}"
             )
@@ -755,7 +853,11 @@ class FeedbackLoopAgent:
             else:
                 repaired = self._implementation_chat(
                     repair_prompt,
-                    max_tokens=max(2048, min(self.config.implementation_model.max_tokens, 6144)),
+                    max_tokens=self._tokens_with_reasoning_room(
+                        self.config.implementation_model,
+                        6144,
+                        minimum=2048,
+                    ),
                 )
             try:
                 return extract_json_object(repaired)
@@ -771,11 +873,20 @@ class FeedbackLoopAgent:
                     "or fake tool-call markers. Keep the structure practical and parseable: distinct plan "
                     "steps, clear requirements, explicit assumptions, and simple validation commands. "
                     "Use only simple validation commands such as [\"test\", \"-f\", \"index.html\"] "
-                    "or [\"python\", \"validate.py\"]. Do not use inline python -c. "
+                    "or [\"python\", \"validate.py\"] when helper files are allowed. Do not use inline python -c "
+                    "unless it is a simple expression-style command that does not require compound blocks. "
+                    + artifact_repair_text + " "
                     "JSON starts with { and ends with }.\n\n"
                     f"Required contract:\n{contract}"
                 )
-                repaired_minimal = self._implementation_chat(last_chance_prompt, max_tokens=4096)
+                repaired_minimal = self._implementation_chat(
+                    last_chance_prompt,
+                    max_tokens=self._tokens_with_reasoning_room(
+                        self.config.implementation_model,
+                        4096,
+                        minimum=2048,
+                    ),
+                )
                 return extract_json_object(repaired_minimal)
 
     def _feedback_reasoning_intent_fallback(
@@ -1005,20 +1116,41 @@ class FeedbackLoopAgent:
         for approach_attempt in range(1, self.config.loop.max_approach_reattempts + 1):
             self._append_plan_note(f"[approach {approach_attempt}] starting analysis and planning pass.")
             analysis_result = self._analysis_phase(extra_context=retry_context, approach_attempt=approach_attempt)
-            req_result = self._requirements_refinement_phase(extra_context=retry_context)
-            plan_result = self._plan_validation_phase()
-            if approach_attempt == 1:
+            phase_blocker = self._blocking_phase_step("analysis", analysis_result)
+            if phase_blocker is None:
+                req_result = self._requirements_refinement_phase(extra_context=retry_context)
+                phase_blocker = self._blocking_phase_step("requirements", req_result)
+            else:
+                req_result = {}
+            if phase_blocker is None:
+                plan_result = self._plan_validation_phase()
+                phase_blocker = self._blocking_phase_step("plan", plan_result)
+            else:
+                plan_result = {}
+            if approach_attempt == 1 and phase_blocker is None:
                 git_baseline = self._git_baseline_commit()
             step_results = []
-            while True:
-                step = self._next_pending_step()
-                if step is None:
-                    break
-                step_results.append(self._implementation_loop_for_step(step))
-                self._write_plan_doc()
-                if step_results[-1]["status"] == "cannot_resolve" and self.config.resolution_policy.stop_on_cannot_resolve:
-                    break
-            final_review = self._final_review_phase(step_results)
+            if phase_blocker is not None:
+                step_results = [phase_blocker]
+                final_review = {
+                    "status": "cannot_resolve",
+                    "summary": phase_blocker.get("last_review_summary", "A critical pre-implementation phase failed."),
+                    "iterations": [],
+                }
+            else:
+                while True:
+                    step = self._next_pending_step()
+                    if step is None:
+                        break
+                    dependency_blocker = self._dependency_blocker_for_step(step)
+                    if dependency_blocker is not None:
+                        step_results.append(self._blocked_dependency_step_result(step, dependency_blocker))
+                    else:
+                        step_results.append(self._implementation_loop_for_step(step))
+                    self._write_plan_doc()
+                    if step_results[-1]["status"] == "cannot_resolve" and self.config.resolution_policy.stop_on_cannot_resolve:
+                        break
+                final_review = self._final_review_phase(step_results)
             approach_review = self._approach_review_phase(approach_attempt, step_results, final_review)
             self.approach_history.append({
                 "approach_attempt": approach_attempt,
@@ -1070,6 +1202,30 @@ class FeedbackLoopAgent:
         }
         (self.state_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         return summary
+
+    def _blocking_phase_step(self, phase: str, result: dict[str, Any]) -> dict[str, Any] | None:
+        """Represent a failed critical gate as a non-implementation step result.
+
+        Analysis, requirements, and plan validation are gates. If any of them
+        exhausts retries or otherwise fails, the harness should report that
+        failure instead of drifting into implementation with stale or invalid
+        control state.
+        """
+        if self._status(result) == "resolved":
+            return None
+        resolution = result.get("resolution") if isinstance(result.get("resolution"), dict) else {}
+        summary = (
+            str(resolution.get("note") or "")
+            or str((result.get("iterations") or [{}])[-1].get("review", {}).get("summary") or "")
+            or f"{phase} phase did not resolve."
+        )
+        return {
+            "step_id": f"{phase}_phase",
+            "status": "cannot_resolve",
+            "attempts": [],
+            "phase_result": result,
+            "last_review_summary": summary,
+        }
 
     def _web_research_phase(self) -> dict[str, Any]:
         """Fetch external research when the user explicitly asks for it.
@@ -1125,7 +1281,7 @@ class FeedbackLoopAgent:
                 f"Extra context from prior approach review: {extra_context or 'none'}\n\n"
                 f"{ANALYSIS_CONTRACT}"
             )
-            raw = self._implementation_chat(prompt, max_tokens=self._structured_control_tokens(6144))
+            raw = self._implementation_chat(prompt, max_tokens=self._structured_control_tokens())
             try:
                 latest = self._extract_json_or_retry(
                     raw,
@@ -1250,6 +1406,7 @@ class FeedbackLoopAgent:
                 f"{self._default_quality_instruction()}\n"
                 f"{self._execution_environment_guidance()}\n"
                 f"{self._harness_state_file_guidance()}\n"
+                f"{self._artifact_only_guidance()}\n"
                 f"Problem analysis summary: {self._analysis_summary_for_prompt()}\n"
                 "Use the recommended path from the analysis as the first planning direction, but preserve fallback "
                 "triggers and open unknowns. If planning reveals the recommended path is wrong, record that and "
@@ -1260,9 +1417,9 @@ class FeedbackLoopAgent:
                 "If web research is skipped or disabled, record available-knowledge notes instead and do not invent URLs.\n"
                 "Challenge yourself before returning: Are the analysis, requirements, assumptions, and plan comprehensive "
                 "and adequate for the problem domain? If not, fix them before emitting JSON.\n"
-                f"Extra context: {extra_context or 'none'}\n\n{REQUIREMENTS_CONTRACT}"
+                f"Extra context: {extra_context or 'none'}\n\n{REQUIREMENTS_CONTRACT}\n{self._artifact_only_guidance()}"
             )
-            raw = self._implementation_chat(prompt, max_tokens=self._structured_control_tokens(6144))
+            raw = self._implementation_chat(prompt, max_tokens=self._structured_control_tokens())
             try:
                 latest = self._extract_json_or_retry(
                     raw,
@@ -1316,7 +1473,20 @@ class FeedbackLoopAgent:
             requirements=requirements,
             plan=normalize_plan_steps(requirements.get("plan", [])) if isinstance(requirements, dict) else [],
         )
-        deterministic_findings = environment_findings + computed_answer_findings
+        previous_requirements = self.requirements
+        previous_plan_steps = self.plan_steps
+        try:
+            if isinstance(requirements, dict):
+                self.requirements = requirements
+                self.plan_steps = normalize_plan_steps(requirements.get("plan", []))
+            plan_structural_findings = self._plan_structural_findings()
+        finally:
+            self.requirements = previous_requirements
+            self.plan_steps = previous_plan_steps
+        deterministic_findings = []
+        for item in [*environment_findings, *computed_answer_findings, *plan_structural_findings]:
+            if item not in deterministic_findings:
+                deterministic_findings.append(item)
         prompt = {
             "phase": "REQUIREMENTS_REVIEW_PHASE",
             "iteration": index,
@@ -1406,6 +1576,7 @@ class FeedbackLoopAgent:
                 "each step has validation commands or an explicit non-command validation method",
                 "validation commands terminate and assert behavior instead of starting a server forever",
                 "computed-answer artifact tasks use semantic validation that recomputes or independently checks the answer, not only file existence or numeric format",
+                "artifact-only prompts do not introduce helper files or validation scripts as workspace deliverables",
                 "browser/UI steps have executable browser evidence such as Playwright, screenshots, or a validation report when web interaction tools are enabled",
                 "browser/UI plans match the agent container tools; Python Playwright is available, but Node/npm/npx/@playwright/test are not available unless explicitly configured",
                 "project deliverables must not be harness-owned state files such as PLAN.md, REQUIREMENTS.md, or RESEARCH.md",
@@ -1440,6 +1611,7 @@ class FeedbackLoopAgent:
             "or no longer useful? Push back with needs_plan_change if so.\n"
             f"{self._execution_environment_guidance()}\n"
             f"{self._harness_state_file_guidance()}\n"
+            f"{self._artifact_only_guidance()}\n"
             + json.dumps(prompt),
             temperature=0.1,
         )
@@ -1472,7 +1644,8 @@ class FeedbackLoopAgent:
             f"Requirements summary: {self._requirements_summary_for_prompt()}\n"
             f"Current plan: {json.dumps(self.plan_steps)}\n"
             f"Web research evidence: {compact_research_for_prompt(self.web_research_result)}\n"
-            f"Review: {json.dumps(self._compact_review_for_transcript(review))}\n\n{PLAN_REFINEMENT_CONTRACT}"
+            f"Review: {json.dumps(self._compact_review_for_transcript(review))}\n\n"
+            f"{PLAN_REFINEMENT_CONTRACT}\n{self._artifact_only_guidance()}"
         )
         raw = self._implementation_chat(prompt, max_tokens=self._structured_control_tokens())
         try:
@@ -1535,9 +1708,58 @@ class FeedbackLoopAgent:
     def _next_pending_step(self) -> dict[str, Any] | None:
         """Return the next unresolved step from the current, possibly refined plan."""
         for step in self.plan_steps:
-            if str(step.get("status", "pending")).lower() not in {"resolved", "cannot_resolve", "skipped"}:
+            if str(step.get("status", "pending")).lower() not in {
+                "resolved",
+                "cannot_resolve",
+                "skipped",
+                "skipped_with_note",
+            }:
                 return step
         return None
+
+    def _dependency_blocker_for_step(self, step: dict[str, Any]) -> dict[str, Any] | None:
+        """Return a blocker when a step cannot run because a prerequisite is unresolved.
+
+        The scheduler may continue after a failed step when configured to do so,
+        but dependency edges must still be authoritative. Running a dependent
+        implementation after its prerequisite failed produces misleading repair
+        loops and can hide the actual failure.
+        """
+        steps_by_id = {str(candidate.get("id")): candidate for candidate in self.plan_steps if candidate.get("id") is not None}
+        for dep in step.get("depends_on", []) or []:
+            dep_id = str(dep)
+            dep_step = steps_by_id.get(dep_id)
+            if dep_step is None:
+                return {
+                    "dependency": dep_id,
+                    "dependency_status": "missing",
+                    "summary": f"Step {step.get('id')} depends on missing step {dep_id}.",
+                }
+            dep_status = str(dep_step.get("status", "pending")).lower()
+            if dep_status in {"resolved", "skipped_with_note"}:
+                continue
+            return {
+                "dependency": dep_id,
+                "dependency_status": dep_status,
+                "summary": (
+                    f"Step {step.get('id')} depends on {dep_id}, but {dep_id} is {dep_status}; "
+                    "the dependent step cannot be executed until its prerequisite is resolved."
+                ),
+            }
+        return None
+
+    def _blocked_dependency_step_result(self, step: dict[str, Any], blocker: dict[str, Any]) -> dict[str, Any]:
+        """Mark a step as blocked by dependency state without calling the model."""
+        step["status"] = "cannot_resolve"
+        summary = str(blocker.get("summary") or "A required dependency was not resolved.")
+        self._append_plan_note(f"[{step['id']}] cannot resolve due to dependency: {summary}")
+        self._write_plan_doc()
+        return {
+            "step_id": step["id"],
+            "status": "cannot_resolve",
+            "blocked_by_dependency": blocker,
+            "attempts": [],
+        }
 
     def _implementation_loop_for_step(self, step: dict[str, Any]) -> dict:
         """Run bounded implement/review attempts for one validated plan step."""
@@ -1557,12 +1779,17 @@ class FeedbackLoopAgent:
             summary = str(review.get("summary", ""))
             same_error_count = same_error_count + 1 if summary == last_summary else 1
             last_summary = summary
-            if status in {"resolved", "resolved_with_compromise", "skipped_with_note"}:
+            if status in {"resolved", "resolved_with_compromise"}:
                 step["status"] = "resolved"
                 self._append_plan_note(f"[{step['id']}] resolved: {summary}")
                 self._write_plan_doc()
                 attempts[-1]["git_commit"] = self._git_commit_completed_step(step)
                 return {"step_id": step["id"], "status": "resolved", "attempts": attempts}
+            if status == "skipped_with_note":
+                step["status"] = "skipped_with_note"
+                self._append_plan_note(f"[{step['id']}] skipped with note: {summary}")
+                self._write_plan_doc()
+                return {"step_id": step["id"], "status": "skipped_with_note", "attempts": attempts}
             if status == "needs_plan_change":
                 self._plan_refinement_pass(attempt, review)
                 step = self._current_step_by_id(step["id"]) or step
@@ -1613,6 +1840,7 @@ class FeedbackLoopAgent:
             "when the feedback request specifically requires substantive plan content changes.\n"
             f"Do not include harness-owned state files in the files payload: "
             f"{', '.join(sorted(self._harness_doc_names()))}. The harness creates and updates those files.\n"
+            f"{self._artifact_only_guidance()}\n"
             "If the current plan step asks for one of those harness-owned files as a project deliverable, request "
             "needs_plan_change instead of trying to satisfy that conflicting instruction.\n"
             "Do not implement future plan steps early. If the current step is setup, structure, or research, create "
@@ -1628,7 +1856,7 @@ class FeedbackLoopAgent:
             f"Requirements summary: {self._requirements_summary_for_prompt()}\n"
             f"Validated plan step ids: {[step.get('id') for step in self.plan_steps]}\n"
             f"Workflow state context:\n{self._workflow_state_for_prompt(step)}\n"
-            f"Current step: {json.dumps(step)}\n\n{IMPLEMENTATION_CONTRACT}"
+            f"Current step: {json.dumps(step)}\n\n{IMPLEMENTATION_CONTRACT}\n{self._artifact_only_guidance()}"
         )
         if self._looks_like_browser_step(step):
             prompt += "\n" + self._browser_validation_guidance()
@@ -1638,7 +1866,7 @@ class FeedbackLoopAgent:
                 f"Use this fetched research evidence and cite source URLs in ARCHITECTURE.md or the relevant deliverable: "
                 f"{compact_research_for_prompt(self.web_research_result)}\n"
             )
-        raw = self._implementation_chat(prompt)
+        raw = self._implementation_chat(prompt, max_tokens=self._implementation_payload_tokens())
         try:
             payload = self._extract_json_or_retry(
                 raw,
@@ -2173,7 +2401,7 @@ class FeedbackLoopAgent:
         limit = self.config.context_compaction.transcript_review_max_chars
         if len(as_json) <= limit:
             return compact
-        return {
+        truncated = {
             "status": compact.get("status"),
             "needs_rework": compact.get("needs_rework"),
             "summary": compact.get("summary"),
@@ -2181,8 +2409,23 @@ class FeedbackLoopAgent:
             "deterministic_evidence_findings": self._clip_list_for_transcript(
                 compact.get("deterministic_evidence_findings", [])
             ),
-            "review_truncation_note": clamp_text(as_json, limit, marker="review transcript payload truncated"),
+            "review_truncation_note": "Review transcript payload was compacted to fit the live chat budget.",
         }
+        if "feedback_tool_evidence_summary" in compact:
+            truncated["feedback_tool_evidence_summary"] = self._clip_nested_for_transcript(
+                compact["feedback_tool_evidence_summary"],
+                string_limit=700,
+                list_limit=5,
+            )
+        truncated_json = json.dumps(truncated, ensure_ascii=False)
+        if len(truncated_json) <= limit:
+            return truncated
+        truncated["review_truncation_note"] = clamp_text(
+            truncated_json,
+            max(1000, limit // 3),
+            marker="review transcript payload truncated",
+        )
+        return truncated
 
     def _compact_review_for_correction(self, review: dict[str, Any]) -> dict[str, Any]:
         """Return only the review decision needed by the next correction turn.
@@ -2216,6 +2459,44 @@ class FeedbackLoopAgent:
             for value in values[:12]
         ]
 
+    def _clip_nested_for_transcript(
+        self,
+        value: Any,
+        *,
+        string_limit: int = 900,
+        list_limit: int = 6,
+        depth: int = 0,
+    ) -> Any:
+        """Recursively trim nested evidence while preserving its shape."""
+        if depth > 5:
+            return "[nested evidence omitted from live transcript]"
+        if isinstance(value, dict):
+            return {
+                str(key): self._clip_nested_for_transcript(
+                    item,
+                    string_limit=string_limit,
+                    list_limit=list_limit,
+                    depth=depth + 1,
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            clipped = [
+                self._clip_nested_for_transcript(
+                    item,
+                    string_limit=string_limit,
+                    list_limit=list_limit,
+                    depth=depth + 1,
+                )
+                for item in value[:list_limit]
+            ]
+            if len(value) > list_limit:
+                clipped.append(f"... {len(value) - list_limit} more item(s) omitted from live transcript")
+            return clipped
+        if isinstance(value, str):
+            return self._prompt_excerpt(value, string_limit)
+        return value
+
     def _final_correction_pass(self, attempt: int, review: dict[str, Any]) -> dict:
         prompt = (
             f"FINAL_PROJECT_CORRECTION_PHASE attempt={attempt}\n"
@@ -2223,11 +2504,13 @@ class FeedbackLoopAgent:
             "Include validation commands and test evidence.\n"
             f"Do not include harness-owned state files in the files payload: "
             f"{', '.join(sorted(self._harness_doc_names()))}. The harness creates and updates those files.\n"
-            f"Review: {json.dumps(self._compact_review_for_correction(review))}\n\n{IMPLEMENTATION_CONTRACT}"
+            f"{self._artifact_only_guidance()}\n"
+            f"Review: {json.dumps(self._compact_review_for_correction(review))}\n\n"
+            f"{IMPLEMENTATION_CONTRACT}\n{self._artifact_only_guidance()}"
         )
         if any(self._looks_like_browser_step(step) for step in self.plan_steps):
             prompt += "\n" + self._browser_validation_guidance()
-        raw = self._implementation_chat(prompt)
+        raw = self._implementation_chat(prompt, max_tokens=self._implementation_payload_tokens())
         payload = self._extract_json_or_retry(
             raw,
             phase="FINAL_PROJECT_CORRECTION_PHASE",
@@ -2287,6 +2570,7 @@ class FeedbackLoopAgent:
                 )
             )
             findings.extend(self._harness_state_file_plan_findings(step))
+            findings.extend(self._artifact_only_plan_findings(step))
             for dep in step.get("depends_on", []):
                 if dep not in seen_ids:
                     findings.append(f"{step_id} depends on {dep}, which has not appeared earlier in the ordered plan.")
@@ -2298,14 +2582,44 @@ class FeedbackLoopAgent:
                 " ".join(first.get("acceptance_criteria", [])),
             ]).lower()
             research_present = any(marker in first_text for marker in ("research", "patterns", "knowledge", "investigate"))
-            structure_present = any(marker in first_text for marker in ("structure", "architecture", "dependencies", "module"))
+            structure_present = any(
+                marker in first_text
+                for marker in (
+                    "structure",
+                    "architecture",
+                    "dependencies",
+                    "module",
+                    "design",
+                    "strategy",
+                    "layout",
+                    "scaffold",
+                    "files",
+                    "deliverables",
+                )
+            )
             # Existing-project repair work often starts with architecture mapping
             # rather than a greenfield "plan the structure" step. Treat mapping
             # or dependency analysis as satisfying the planning intent: the agent
             # has to inspect the current shape before changing it.
             planning_present = any(
                 marker in first_text
-                for marker in ("plan", "order", "mapping", "map", "architecture", "dependencies", "assessment", "assess")
+                for marker in (
+                    "plan",
+                    "order",
+                    "mapping",
+                    "map",
+                    "architecture",
+                    "dependencies",
+                    "assessment",
+                    "assess",
+                    "design",
+                    "strategy",
+                    "approach",
+                    "layout",
+                    "scaffold",
+                    "document",
+                    "notes",
+                )
             )
             if not planning_present and structure_present:
                 # Greenfield plans often express the planning action as
@@ -2433,6 +2747,39 @@ class FeedbackLoopAgent:
                 )
         return findings
 
+    def _artifact_only_plan_findings(self, step: dict[str, Any]) -> list[str]:
+        """Reject plans that violate explicit single-artifact output requests."""
+        if not self._explicit_artifact_only_constraint():
+            return []
+        allowed = self._artifact_only_allowed_paths()
+        text = json.dumps(
+            {
+                "title": step.get("title", ""),
+                "description": step.get("description", ""),
+                "acceptance_criteria": step.get("acceptance_criteria", []),
+                "validation_commands": step.get("validation_commands", []),
+            },
+            sort_keys=True,
+        )
+        disallowed = sorted(
+            ref
+            for ref in self._file_references_in_text(text)
+            if not self._artifact_path_is_allowed(ref, allowed)
+            and ref not in {Path(name).as_posix() for name in self._harness_doc_names()}
+            and not self._artifact_reference_is_temporary(ref, text)
+        )
+        if not disallowed:
+            return []
+        step_id = str(step.get("id") or "step")
+        allowed_text = ", ".join(sorted(allowed)) if allowed else "only the explicitly requested artifact"
+        return [
+            (
+                f"{step_id} mentions extra workspace artifact(s) {', '.join(disallowed)} even though the "
+                f"user limited deliverables to {allowed_text}. Use inline validation commands or temporary files "
+                "outside the workspace instead of creating helper project files."
+            )
+        ]
+
     def _validation_command_findings(
         self,
         step: dict[str, Any],
@@ -2449,7 +2796,26 @@ class FeedbackLoopAgent:
                     findings.append(
                         f"{step_id} uses manual_test metadata in validation_commands; replace it with an executable script/report command."
                     )
-                raw_parts = [str(part) for part in (command.get("cmd") or command.get("command") or [])]
+                command_value = command.get("cmd") or command.get("command") or []
+                if isinstance(command_value, str):
+                    findings.append(
+                        f"{step_id} validation command object uses a string-valued cmd. "
+                        "Use an argv list such as {\"cmd\": [\"python\", \"-c\", \"...\"]} so quoting and arguments can be verified."
+                    )
+                    try:
+                        raw_parts = shlex.split(command_value)
+                    except ValueError:
+                        raw_parts = [command_value]
+                else:
+                    raw_parts = [str(part) for part in command_value]
+            elif isinstance(command, str):
+                findings.append(
+                    f"{step_id} validation command is a string. Use an argv list so quoting and arguments can be verified."
+                )
+                try:
+                    raw_parts = shlex.split(command)
+                except ValueError:
+                    raw_parts = [command]
             else:
                 raw_parts = [str(part) for part in command]
             parts = [part.lower() for part in raw_parts]
@@ -2480,14 +2846,28 @@ class FeedbackLoopAgent:
                 )
             if self._looks_like_invalid_inline_python_compound_command(parts):
                 findings.append(
-                    f"{step_id} validation uses a one-line `python -c` try/except block, which Python cannot parse. "
-                    "Replace it with a generated validation script or a multiline command."
+                    f"{step_id} validation uses a one-line `python -c` compound block that Python cannot parse. "
+                    "Replace it with a simpler expression, a multiline shell command, or a generated validation script "
+                    "when the task allows helper files."
+                )
+            inline_python_syntax_error = self._inline_python_static_syntax_error(raw_parts)
+            if inline_python_syntax_error:
+                findings.append(
+                    f"{step_id} validation contains inline Python that fails a static syntax check: "
+                    f"{inline_python_syntax_error}. Replace it with valid inline Python, a multiline shell command, "
+                    "or a generated validation script when the task allows helper files."
                 )
             if self._looks_like_unwrapped_expected_failure_validation(step, command, parts):
                 findings.append(
                     f"{step_id} validation appears to test an expected failure path without declaring expected_returncode "
                     "or wrapping the exception assertion. Replace it with a command object using expected_returncode, "
                     "or a small wrapper command/script that exits 0 only when the expected error occurs."
+                )
+            if self._validation_command_appears_to_mutate_artifact(raw_parts):
+                findings.append(
+                    f"{step_id} validation appears to write or mutate the explicitly requested artifact. "
+                    "Validation commands must assert the artifact's state after implementation; create or update "
+                    "the artifact in the implementation payload or implementation commands instead."
                 )
             if (
                 self._computed_answer_prompt_requires_semantic_validation()
@@ -2508,6 +2888,68 @@ class FeedbackLoopAgent:
                         "an explicit bounded dependency/setup step for the requested stack."
                     )
         return findings
+
+    def _validation_command_appears_to_mutate_artifact(self, raw_parts: list[str]) -> bool:
+        """Detect artifact-only validation commands that create the deliverable.
+
+        Validation commands are allowed to write temporary evidence in broader
+        project tasks, but when the user explicitly asked for one final artifact
+        the plan must not smuggle artifact creation into validation. A command
+        that writes a validator into /tmp and reads the artifact is fine; only
+        actual writes to the requested artifact should be blocked here.
+        """
+        if not self._explicit_artifact_only_constraint():
+            return False
+        allowed = {path.lower() for path in self._artifact_only_allowed_paths()}
+        if not allowed:
+            return False
+        text = " ".join(raw_parts)
+        lower = text.lower()
+        if not any(path in lower for path in allowed):
+            return False
+        for path in allowed:
+            if re.search(rf"open\s*\([^)]*{re.escape(path)}[^)]*,[^)]*['\"][wax+]", lower):
+                return True
+            path_expr = rf"(?:pathlib\.)?path\s*\(\s*['\"](?:\./)?{re.escape(path)}['\"]\s*\)"
+            if re.search(path_expr + r"\s*\.\s*(?:write_text|write_bytes)\s*\(", lower):
+                return True
+            if re.search(rf"['\"](?:\./)?{re.escape(path)}['\"]\s*\)\s*\.\s*(?:write_text|write_bytes)\s*\(", lower):
+                return True
+            if self._shell_command_writes_artifact(raw_parts, path):
+                return True
+        return False
+
+    def _shell_command_writes_artifact(self, raw_parts: list[str], allowed_path: str) -> bool:
+        """Return True when shell-style mutation targets the workspace artifact."""
+        shell_texts: list[str] = []
+        if len(raw_parts) >= 3 and Path(raw_parts[0]).name in {"bash", "sh"} and raw_parts[1] in {"-c", "-lc"}:
+            shell_texts.append(raw_parts[2])
+        else:
+            shell_texts.append(" ".join(raw_parts))
+
+        for text in shell_texts:
+            lower = text.lower()
+            if self._shell_redirection_targets_artifact(lower, allowed_path):
+                return True
+            if re.search(rf"(?:^|[;&|]\s*)tee(?:\s+-a)?\s+(?:\./)?{re.escape(allowed_path)}(?:\s|$)", lower):
+                return True
+            if re.search(rf"(?:^|[;&]\s*)(?:touch|truncate)\b[^;&|]*\s(?:\./)?{re.escape(allowed_path)}(?:\s|$)", lower):
+                return True
+            if re.search(rf"(?:^|[;&]\s*)(?:cp|mv)\b[^;&|]*\s(?:\./)?{re.escape(allowed_path)}(?:\s|$)", lower):
+                return True
+            if re.search(rf"(?:^|[;&]\s*)(?:sed\s+-i|perl\s+-pi)\b[^;&|]*\s(?:\./)?{re.escape(allowed_path)}(?:\s|$)", lower):
+                return True
+        return False
+
+    def _shell_redirection_targets_artifact(self, lower_shell_text: str, allowed_path: str) -> bool:
+        for match in re.finditer(r"(?:^|\s)(?:>|>>)\s*([^;&|]+)", lower_shell_text):
+            target = match.group(1).strip().strip("'\"")
+            # Redirection targets can include descriptor syntax such as 2>file;
+            # this helper is only concerned with direct workspace artifact paths.
+            target = re.sub(r"^\d+", "", target).strip()
+            if target in {allowed_path, f"./{allowed_path}"}:
+                return True
+        return False
 
     def _computed_answer_prompt_requires_semantic_validation(self) -> bool:
         """Detect answer-only computed artifacts without solving the task.
@@ -2564,7 +3006,8 @@ class FeedbackLoopAgent:
         if plan_to_check and not self._computed_answer_plan_has_semantic_validation(plan_to_check):
             findings.append(
                 "Computed-answer validation plan does not explicitly require semantic validation. "
-                "It must say that a validator recomputes, enumerates, or independently checks the requested calculation."
+                "It must say that a validator recomputes, enumerates, or independently checks the requested calculation "
+                "and compares the artifact to that recomputed value."
             )
         hardcoded_patterns = (
             r"\bexpected(?:\s+(?:answer|value|sum|integer|result))?\s*(?:is|=|:)?\s*\(?\d{2,}\)?",
@@ -2574,29 +3017,10 @@ class FeedbackLoopAgent:
         )
         if not any(re.search(pattern, text) for pattern in hardcoded_patterns):
             return findings
-        semantic_markers = (
-            "recompute",
-            "recomputed",
-            "recomputing",
-            "independent",
-            "independently",
-            "enumerate",
-            "enumeration",
-            "brute force",
-            "cross-check",
-            "cross check",
-            "derive expected",
-            "for n in range",
-            "itertools",
-            "product(",
-            "permutations(",
-            "sum(",
-        )
-        if any(marker in text for marker in semantic_markers):
-            return findings
         findings.append(
             "Computed-answer validation appears to hard-code an expected numeric answer. "
-            "Replace it with semantic validation that recomputes or independently enumerates the requested calculation."
+            "Replace it with semantic validation that recomputes or independently enumerates the requested calculation "
+            "and compares the artifact to the recomputed value without embedding the final numeric answer in the plan."
         )
         return findings
 
@@ -2608,6 +3032,9 @@ class FeedbackLoopAgent:
             "recomputed",
             "recomputing",
             "recalculate",
+            "re-calculate",
+            "recalculation",
+            "re-calculation",
             "re-calculates",
             "re-calculated",
             "independent",
@@ -2623,19 +3050,48 @@ class FeedbackLoopAgent:
             "product(",
             "permutations(",
             "sum(",
+            "count=0",
+            "count = 0",
+            "for s in",
+        )
+        artifact_markers = ("answer.txt", "artifact", "output file")
+        comparison_markers = (
+            "assert",
+            "==",
+            "!=",
+            "sys.exit",
+            "exit(0 if",
+            "cmp ",
+            "diff ",
+        )
+        artifact_access_markers = (
+            "read_text",
+            "open(",
+            "cat answer.txt",
+            "answer.txt').read",
+            'answer.txt").read',
         )
         for step in plan:
-            text = json.dumps(
+            step_text = json.dumps(
                 {
                     "title": step.get("title", ""),
                     "description": step.get("description", ""),
                     "acceptance_criteria": step.get("acceptance_criteria", []),
-                    "validation_commands": step.get("validation_commands", []),
                 },
                 sort_keys=True,
             ).lower()
-            if any(marker in text for marker in semantic_markers):
-                return True
+            commands = step.get("validation_commands", [])
+            for command in commands:
+                command_text = json.dumps(command, sort_keys=True).lower()
+                combined_text = f"{step_text} {command_text}"
+                if not any(marker in combined_text for marker in semantic_markers):
+                    continue
+                if not any(marker in command_text for marker in artifact_markers):
+                    continue
+                if not any(marker in command_text for marker in artifact_access_markers):
+                    continue
+                if any(marker in command_text for marker in comparison_markers):
+                    return True
         return False
 
     def _looks_like_shape_only_answer_validation(self, step: dict[str, Any], raw_parts: list[str]) -> bool:
@@ -2711,17 +3167,57 @@ class FeedbackLoopAgent:
         return False
 
     def _looks_like_invalid_inline_python_compound_command(self, parts: list[str]) -> bool:
-        """Catch `python -c "try: ...; except ..."` before a real run wastes time.
+        """Catch malformed one-line `python -c` compound statements.
 
-        Python accepts some one-line compound statements, but `try/except`
-        needs a real block layout. Local models often propose it as a compact
-        negative-path assertion; asking for a generated validation script is
-        clearer and portable across shells.
+        Python accepts some one-line compound statements, but not compound
+        blocks after a semicolon (`x=0; for ...`) or nested directly after a
+        colon (`for ...: if ...`). Local models often produce those when trying
+        to keep validation inline for artifact-only tasks.
         """
         if len(parts) < 3 or not (parts[0].endswith("python") and parts[1] == "-c"):
             return False
         code = parts[2]
-        return "try:" in code and "except" in code and "\n" not in code
+        if "\n" in code:
+            return False
+        return (
+            ("try:" in code and "except" in code)
+            or re.search(r";\s*(?:for|if|while|try|with|def|class)\b", code) is not None
+            or re.search(r":\s*(?:if|for|while|try|with|def|class)\b", code) is not None
+        )
+
+    def _inline_python_static_syntax_error(self, parts: list[str]) -> str | None:
+        """Return a concise syntax error for direct or shell-wrapped Python."""
+        for source, code in self._iter_inline_python_snippets(parts):
+            if not code.strip() or code.strip().startswith("$"):
+                continue
+            try:
+                compile(code, "<inline-python>", "exec")
+            except SyntaxError as exc:
+                location = ""
+                if exc.lineno is not None:
+                    location = f" at line {exc.lineno}"
+                    if exc.offset is not None:
+                        location += f", column {exc.offset}"
+                return f"{source}: {exc.msg}{location}"
+        return None
+
+    def _iter_inline_python_snippets(self, parts: list[str]) -> list[tuple[str, str]]:
+        snippets: list[tuple[str, str]] = []
+        if len(parts) >= 3 and self._is_python_executable_name(parts[0]) and parts[1] == "-c":
+            snippets.append(("python -c", parts[2]))
+        if len(parts) >= 3 and Path(parts[0]).name in {"bash", "sh"} and parts[1] in {"-c", "-lc"}:
+            try:
+                shell_parts = shlex.split(parts[2])
+            except ValueError:
+                return snippets
+            for pos, token in enumerate(shell_parts[:-2]):
+                if self._is_python_executable_name(token) and shell_parts[pos + 1] == "-c":
+                    snippets.append(("shell-wrapped python -c", shell_parts[pos + 2]))
+        return snippets
+
+    def _is_python_executable_name(self, value: str) -> bool:
+        name = Path(value).name
+        return name == "python" or name.startswith("python")
 
     def _looks_like_unwrapped_expected_failure_validation(
         self,
@@ -3080,6 +3576,80 @@ class FeedbackLoopAgent:
         ]
         return any(re.search(pattern, prompt) for pattern in patterns)
 
+    def _artifact_only_allowed_paths(self) -> set[str]:
+        """Return explicitly named workspace artifacts allowed by an output-only prompt."""
+        if not self._explicit_artifact_only_constraint():
+            return set()
+        prompt = self.config.project_design.prompt
+        allowed: set[str] = set()
+        for match in re.finditer(r"\b(?:create|write|produce|output|return|put)\b\s+([A-Za-z0-9_.\-/]+\.[A-Za-z0-9_.-]+)\s+only\b", prompt, flags=re.IGNORECASE):
+            allowed.add(_normalize_workspace_path_text(_trim_reference_delimiters(match.group(1))))
+        for match in re.finditer(r"\bin\s+([A-Za-z0-9_.\-/]+\.[A-Za-z0-9_.-]+)\b", prompt, flags=re.IGNORECASE):
+            allowed.add(_normalize_workspace_path_text(_trim_reference_delimiters(match.group(1))))
+        for ref in self._file_references_in_text(prompt):
+            allowed.add(ref)
+        harness_docs = {_normalize_workspace_path_text(name) for name in self._harness_doc_names()}
+        return {path for path in allowed if path and path not in harness_docs}
+
+    def _file_references_in_text(self, text: str) -> set[str]:
+        """Extract conservative filename-like references from prose or JSON."""
+        file_suffixes = {
+            ".cfg",
+            ".cs",
+            ".csproj",
+            ".css",
+            ".csv",
+            ".gpx",
+            ".gitkeep",
+            ".html",
+            ".ini",
+            ".jpeg",
+            ".jpg",
+            ".js",
+            ".json",
+            ".jsonl",
+            ".log",
+            ".md",
+            ".out",
+            ".png",
+            ".py",
+            ".sh",
+            ".sln",
+            ".svg",
+            ".toml",
+            ".ts",
+            ".txt",
+            ".xml",
+            ".yaml",
+            ".yml",
+        }
+        refs: set[str] = set()
+        for match in re.finditer(
+            r"(?<![A-Za-z0-9_./-])((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9][A-Za-z0-9_.-]*\.[A-Za-z0-9][A-Za-z0-9_.-]*)(?![A-Za-z0-9_/-])",
+            text,
+        ):
+            ref = _trim_reference_delimiters(match.group(1))
+            if not ref:
+                continue
+            if Path(ref).suffix.lower() not in file_suffixes:
+                continue
+            refs.add(_normalize_workspace_path_text(ref))
+        return refs
+
+    def _artifact_path_is_allowed(self, path: str, allowed: set[str] | None = None) -> bool:
+        allowed_paths = allowed if allowed is not None else self._artifact_only_allowed_paths()
+        normalized = _normalize_workspace_path_text(path)
+        return normalized in allowed_paths
+
+    def _artifact_reference_is_temporary(self, ref: str, text: str) -> bool:
+        normalized = _normalize_workspace_path_text(ref)
+        return (
+            f"/tmp/{normalized}" in text
+            or f"tmp/{normalized}" in text
+            or f"temp/{normalized}" in text.lower()
+            or "temporary files outside the workspace" in text.lower()
+        )
+
     def _has_completed_research(self) -> bool:
         return self.web_research_result.get("status") in {"completed", "partial"} and bool(self._research_source_urls())
 
@@ -3303,6 +3873,23 @@ class FeedbackLoopAgent:
         context: dict[str, Any],
     ) -> dict[str, Any]:
         deterministic = self._deterministic_tool_call_findings(commands)
+        if deterministic:
+            review = self._normalize_tool_verification(
+                {
+                    "status": "blocked",
+                    "summary": "Deterministic tool-call safety checks blocked one or more commands before model review.",
+                    "commands": [],
+                    "deterministic_only": True,
+                },
+                commands,
+                deterministic,
+            )
+            self.conversation.append(
+                "user",
+                "TOOL_CALL_VERIFICATION_RESULT:\n"
+                + json.dumps(self._compact_tool_verification_for_transcript(review), indent=2),
+            )
+            return review
         prompt = {
             "phase": "TOOL_CALL_VERIFICATION_PHASE",
             "source": source,
@@ -3346,7 +3933,7 @@ class FeedbackLoopAgent:
         try:
             review = extract_json_object(raw)
         except Exception as initial_exc:
-            inferred = self._tool_verification_reasoning_fallback(raw, commands, initial_exc)
+            inferred = self._tool_verification_reasoning_fallback(raw, commands, initial_exc, source=source)
             if inferred is not None:
                 review = inferred
             else:
@@ -3385,6 +3972,8 @@ class FeedbackLoopAgent:
         raw: str,
         commands: list[Any],
         parse_error: Exception,
+        *,
+        source: str,
     ) -> dict[str, Any] | None:
         """Infer clear tool-verifier intent from reasoning-only output.
 
@@ -3419,13 +4008,44 @@ class FeedbackLoopAgent:
         approve_markers = (
             "i will approve",
             "i'll approve",
+            "i approve",
+            "will approve",
             "approved",
+            "approve this command",
             "safe to run",
             "correctly targeted",
+            "bounded",
         )
-        if not any(marker in text for marker in block_markers):
+        has_block = any(marker in text for marker in block_markers)
+        has_approval = any(marker in text for marker in approve_markers)
+        contrast_markers = (" but ", " however ", " except ", " although ", " unsafe ", " wrong ")
+        if has_approval and not has_block and not any(marker in text for marker in contrast_markers):
+            return {
+                "status": "approved",
+                "summary": (
+                    "Tool verifier emitted reasoning-only output with clear approval intent; "
+                    "harness inferred approved tool calls from the reviewer text."
+                ),
+                "commands": [
+                    {
+                        "index": index,
+                        "decision": "approved",
+                        "risk_level": "low",
+                        "reason": (
+                            "Verifier reasoning indicated the command was bounded and correctly targeted "
+                            "for the current step."
+                        ),
+                    }
+                    for index, _command in enumerate(commands)
+                ],
+                "inferred_from_malformed_response": True,
+                "parse_error": str(parse_error),
+            }
+        if source == "step_feedback_validation":
             return None
-        if any(marker in text for marker in approve_markers) and not any(marker in text for marker in ("but", "however", "except")):
+        if not has_block:
+            return None
+        if has_approval and not any(marker in text for marker in ("but", "however", "except")):
             return None
         return {
             "status": "blocked",
@@ -3456,6 +4076,10 @@ class FeedbackLoopAgent:
         deterministic: list[dict[str, Any]],
     ) -> dict[str, Any]:
         review = dict(review)
+        review_status = str(review.get("status") or "").strip().lower()
+        approved_like_statuses = {"", "approved", "resolved", "resolved_with_compromise", "skipped_with_note"}
+        default_to_blocked = bool(review.get("needs_rework")) or review_status not in approved_like_statuses
+        default_reason = str(review.get("summary") or "Verifier did not explicitly approve this command.")
         existing = {
             int(item.get("index", -1)): dict(item)
             for item in review.get("commands", [])
@@ -3467,7 +4091,22 @@ class FeedbackLoopAgent:
         normalized = []
         any_blocked = False
         for index, command in enumerate(commands):
-            item = existing.get(index, {"index": index, "decision": "approved", "risk_level": "low", "reason": "No verifier concern."})
+            if index in existing:
+                item = existing[index]
+            elif default_to_blocked:
+                item = {
+                    "index": index,
+                    "decision": "blocked",
+                    "risk_level": "medium",
+                    "reason": default_reason,
+                }
+            else:
+                item = {
+                    "index": index,
+                    "decision": "approved",
+                    "risk_level": "low",
+                    "reason": "No verifier concern.",
+                }
             reasons = [str(item.get("reason") or "")]
             if deterministic_by_index.get(index):
                 item["decision"] = "blocked"
@@ -3550,6 +4189,16 @@ class FeedbackLoopAgent:
                 findings.extend(self._path_sensitive_tool_findings(index, executable, parts))
             if executable == "curl":
                 findings.extend(self._curl_payload_findings(index, parts))
+            inline_python_syntax_error = self._inline_python_static_syntax_error(parts)
+            if inline_python_syntax_error:
+                findings.append({
+                    "index": index,
+                    "risk_level": "medium",
+                    "reason": (
+                        "Inline Python command fails static syntax check before execution: "
+                        + inline_python_syntax_error
+                    ),
+                })
             if executable in {"bash", "sh"} and len(parts) >= 3 and parts[1] in {"-c", "-lc"}:
                 script = parts[2]
                 if any(token in script for token in (" dd ", " mkfs", " fdisk", " parted", " wipefs")):
@@ -3846,9 +4495,9 @@ class FeedbackLoopAgent:
         skipped_harness_files = implementation.get("skipped_harness_files", [])
         if skipped_harness_files:
             findings.append(
-                "Implementation attempted to overwrite harness-owned state files; these writes were blocked: "
+                "Implementation attempted to write files blocked by harness-owned state or artifact-only policy: "
                 + ", ".join(str(path) for path in skipped_harness_files)
-                + ". Please keep project deliverables in project files and use plan_note for progress."
+                + ". Please keep project deliverables within the allowed workspace artifacts and use plan_note for progress."
             )
         expected_validation = bool(step.get("validation_commands"))
         if expected_validation and not feedback_results:
@@ -3914,13 +4563,18 @@ class FeedbackLoopAgent:
         command = result.get("command") or []
         command_text = " ".join(str(part) for part in command)
         stderr = str(result.get("stderr") or "")
+        lower_stderr = stderr.lower()
         return (
             "python -c" in command_text
             and 'File "<string>"' in stderr
             and "SyntaxError" in stderr
         ) or (
+            "python -c" in command_text
+            and result.get("blocked_by_tool_verifier")
+            and "static syntax check" in lower_stderr
+        ) or (
             "python -m py_compile" in command_text
-            and "is a directory" in stderr.lower()
+            and "is a directory" in lower_stderr
         )
 
     def _validation_result_integrity_findings(
@@ -4080,7 +4734,31 @@ class FeedbackLoopAgent:
                 allow_planned_future_refs=False,
             )
         )
+        findings.extend(self._artifact_only_workspace_findings(feedback_tool_evidence or {}))
         return findings
+
+    def _artifact_only_workspace_findings(self, feedback_tool_evidence: dict[str, Any]) -> list[str]:
+        if not self._explicit_artifact_only_constraint():
+            return []
+        allowed = self._artifact_only_allowed_paths()
+        harness_docs = {_normalize_workspace_path_text(name) for name in self._harness_doc_names()}
+        harness_runtime_paths = {_normalize_workspace_path_text(name) for name in HARNESS_ONLY_PATHS}
+        extras: list[str] = []
+        for item in feedback_tool_evidence.get("workspace_files", []) or []:
+            path = _normalize_workspace_path_text(item.get("path", ""))
+            if not path or path.startswith(".agent_state/") or path in harness_docs or path in harness_runtime_paths:
+                continue
+            if not self._artifact_path_is_allowed(path, allowed):
+                extras.append(path)
+        if not extras:
+            return []
+        allowed_text = ", ".join(sorted(allowed)) if allowed else "only the explicitly requested artifact"
+        return [
+            (
+                f"Artifact-only prompt allows {allowed_text}, but the workspace contains extra project artifact(s): "
+                + ", ".join(sorted(extras))
+            )
+        ]
 
     def _skipped_step_is_superseded_by_final_evidence(
         self,
@@ -4180,7 +4858,9 @@ class FeedbackLoopAgent:
             content = str(item.get("content") or "")
             # Paths such as invoice_calc/discounts.py or src/pages/index.html.
             for match in re.finditer(r"(?<![A-Za-z0-9+.-]://)(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+", content):
-                ref = match.group(0).strip("`'\"),.;:]}")
+                raw_ref = _trim_reference_delimiters(match.group(0))
+                explicit_relative_ref = raw_ref.startswith("./")
+                ref = _normalize_workspace_path_text(raw_ref)
                 if not ref or ref.startswith(ignore_prefixes):
                     continue
                 if match.start() > 0 and content[match.start() - 1] in {"$", "~"}:
@@ -4195,7 +4875,11 @@ class FeedbackLoopAgent:
                     # Avoid treating `localhost:8080/game/index.html` as a
                     # local path beginning with the port number.
                     continue
-                if "." in ref.split("/", 1)[0] and ref.split("/", 1)[0] not in existing_dirs:
+                if ref in existing_files or ref in existing_dirs:
+                    continue
+                if ref in planned_refs:
+                    continue
+                if "." in ref.split("/", 1)[0] and ref.split("/", 1)[0] not in existing_dirs and not explicit_relative_ref:
                     # Domain-looking references such as example.com/file are
                     # external, not generated workspace paths.
                     continue
@@ -4205,10 +4889,6 @@ class FeedbackLoopAgent:
                 # considered valid only when they already exist.
                 basename = ref.rsplit("/", 1)[-1]
                 if "." not in basename and ref not in existing_dirs:
-                    continue
-                if ref in existing_files or ref in existing_dirs:
-                    continue
-                if ref in planned_refs:
                     continue
                 # Skip paths that are clearly external/package-ish rather than
                 # generated workspace artifacts.
@@ -4224,7 +4904,7 @@ class FeedbackLoopAgent:
         text = json.dumps(self.plan_steps, sort_keys=True)
         refs: set[str] = set()
         for match in re.finditer(r"(?<![A-Za-z0-9+.-]://)(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+", text):
-            ref = match.group(0).strip("`'\"),.;:]}")
+            ref = _normalize_workspace_path_text(_trim_reference_delimiters(match.group(0)))
             if not ref or ref.split("/", 1)[0].isdigit():
                 continue
             if match.start() > 0 and text[match.start() - 1] in {"$", "~"}:
@@ -4298,7 +4978,10 @@ class FeedbackLoopAgent:
     def _fallback_resolution(self, scope: str, review: dict[str, Any]) -> dict[str, str]:
         """Choose a bounded outcome when retries stop making progress."""
         summary = review.get("summary", "No final review summary.") if review else "No review was produced."
-        if self.config.resolution_policy.allow_skip_with_note:
+        if scope == "analysis" or scope == "plan" or scope == "final review" or scope.startswith("step "):
+            status = "cannot_resolve"
+            note = f"Bounded retries exhausted for {scope}; cannot resolve. Last review: {summary}"
+        elif self.config.resolution_policy.allow_skip_with_note:
             status = "skipped_with_note"
             note = f"Bounded retries exhausted for {scope}; skipped with note. Last review: {summary}"
         elif self.config.resolution_policy.allow_requirement_dilution:

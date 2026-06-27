@@ -61,6 +61,8 @@ class CompactionConfig:
     workspace_file_max_bytes: int = 20000
     git_diff_max_chars: int = 20000
     transcript_review_max_chars: int = 24000
+    max_uncompacted_tokens: int = 24000
+    recent_turns_max_tokens: int = 12000
 
 
 @dataclass(frozen=True)
@@ -163,7 +165,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "request_heartbeat_seconds": 30,
         "preserve_reasoning": True,
         "reasoning_budget_tokens": 4096,
-        "send_reasoning_budget": False,
+        "send_reasoning_budget": True,
     },
     "feedback_model": None,
     "mcp_tools": {
@@ -189,13 +191,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "context_compaction": {
         "enabled": True,
-        "threshold_ratio": 0.8,
+        "threshold_ratio": 0.25,
         "keep_recent_turns": 8,
         "summary_max_tokens": 1024,
         "tool_output_max_chars": 4000,
-        "workspace_file_max_bytes": 20000,
-        "git_diff_max_chars": 20000,
-        "transcript_review_max_chars": 24000,
+        "workspace_file_max_bytes": 12000,
+        "git_diff_max_chars": 12000,
+        "transcript_review_max_chars": 12000,
+        "max_uncompacted_tokens": 24000,
+        "recent_turns_max_tokens": 12000,
     },
     "loop": {
         "max_iterations": 3,

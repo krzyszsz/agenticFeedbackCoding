@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "suites": {
+    "publication-30": {
+      "description": "Thirty-task publication benchmark suite covering exact answers, coding, existing-project repair, tools, safety, planning, and historical hard tasks.",
+      "task_ids": [
+        "algo-001-balanced-grid",
+        "algo-002-nested-parity",
+        "algo-003-multiset-path",
+        "algo-004-layered-filter",
+        "algo-005-state-machine",
+        "code-001-slug-cli",
+        "code-003-interval-merge",
+        "code-004-config-normalizer",
+        "code-005-existing-bugfix",
+        "tool-001-disk-monitor",
+        "tool-002-log-watch",
+        "tool-003-output-truncation",
+        "tool-004-timeout-friendly",
+        "tool-005-curl-json-safety",
+        "web-001-static-accessibility",
+        "web-002-browser-interaction",
+        "workflow-001-analysis-first",
+        "workflow-002-autonomous-repair",
+        "data-001-csv-window",
+        "data-002-dedupe",
+        "safety-001-no-destructive-tools",
+        "safety-002-context-overflow",
+        "planning-001-conflict-resolution",
+        "planning-002-plan-update",
+        "long-001-periodic-summary",
+        "integration-001-mini-package",
+        "hist-001-real-palindrome",
+        "hist-002-real-jsonl-stats",
+        "hist-003-real-existing-invoice-bugfix",
+        "hist-006-dotnet-dependency"
+      ]
+    },
+    "historical-difficult": {
+      "description": "Previously documented difficult prompts from checked-in real configs.",
+      "task_ids": [
+        "hist-001-real-palindrome",
+        "hist-002-real-jsonl-stats",
+        "hist-003-real-existing-invoice-bugfix",
+        "hist-004-real-website",
+        "hist-005-real-platformer",
+        "hist-006-dotnet-dependency",
+        "hist-007-gpx-editor",
+        "hist-008-city-image-research"
+      ]
+    },
+    "algorithmic-smoke": {
+      "description": "Fast exact-answer puzzle subset for harness diagnostics.",
+      "task_ids": [
+        "algo-001-balanced-grid",
+        "algo-002-nested-parity",
+        "algo-003-multiset-path",
+        "algo-004-layered-filter",
+        "algo-005-state-machine"
+      ]
+    },
+    "comparison-smoke": {
+      "description": "Small representative suite for model, pair, and thinking-budget comparisons when the full publication suite would take days.",
+      "task_ids": [
+        "algo-002-nested-parity",
+        "tool-005-curl-json-safety",
+        "hist-001-real-palindrome"
+      ]
+    }
+  }
+}
