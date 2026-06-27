@@ -56,7 +56,8 @@ flowchart LR
 
 ## Quick Start
 
-Clone the repo, start the local model server, then run a real benchmark through Docker:
+Clone the repo, start the local model server, then give the harness a short
+command-line prompt:
 
 ```bash
 # Ubuntu host prerequisites if you do not already have them:
@@ -64,10 +65,28 @@ Clone the repo, start the local model server, then run a real benchmark through 
 git clone https://github.com/krzyszsz/agenticFeedbackCoding.git
 cd agenticFeedbackCoding
 MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/start_default_model_server.sh
-bash scripts/build_and_run.sh --config config.real-palindrome.json
+
+MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/build_and_run.sh \
+  --config config.minimal.json \
+  --workspace workspaces/my-project \
+  --prompt "Build a small Python CLI with tests and a README."
 ```
 
-That run starts the model server on the `agentic-feedback-net` Docker network, builds the agent container, mounts only the configured workspace, asks the local model to build the project, and stores the full transcript plus review evidence under `workspaces/real-palindrome/.agent_state/`.
+If the model server is already running, only the second command is needed.
+`--workspace` selects the host-visible output folder and `--prompt` replaces the
+prompt from the config for that run. Use `--prompt-file prompt.txt` for a longer
+brief.
+
+That run uses the standard two-container path: the model server runs on the
+`agentic-feedback-net` Docker network, the agent container mounts only the
+configured workspace, and the full transcript plus review evidence is written
+under `workspaces/my-project/.agent_state/`.
+
+For a checked benchmark instead of an ad hoc prompt, run:
+
+```bash
+bash scripts/build_and_run.sh --config config.real-palindrome.json
+```
 
 The live transcript is printed while the run is active, so a long job should visibly move through requirements, plan review, implementation attempts, and feedback. While a model call is in flight, the terminal also prints a heartbeat with elapsed time and a lightweight REST health check. Those heartbeat lines are human-facing only; they are not written into the reusable agent transcripts under `.agent_state/`. The final terminal output is compact by default; the full evidence is written under `.agent_state/`.
 
@@ -145,6 +164,11 @@ bash scripts/build_and_run.sh \
 
 For longer prompts, keep the prompt in the JSON file. The command-line override
 is a convenience, not a replacement for versioned task configs.
+
+This command-line form is intentionally simple, but the run is not a one-shot
+file writer. Even small prompts still pass through analysis, requirements,
+plan validation, implementation, tool-call verification, reviewer-owned
+validation, final review, and approach review.
 
 `command_timeout_seconds` is only the default timeout for one terminal command. It is not the model response timeout. If a generated test or build step needs longer, the agent can request it per command:
 
@@ -290,7 +314,7 @@ The runner writes `results.json`, per-task logs, and `results.md` under
 Benchmark runs use the documented two-container workflow: one model-server
 container and one separate agent/harness container on `agentic-feedback-net`.
 
-Measured evidence from June 26, 2026:
+Measured evidence from June 26-27, 2026:
 
 | Experiment | Rows | Pass | Fail | Manual | Avg s | Timeouts | Evidence |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -301,6 +325,7 @@ Measured evidence from June 26, 2026:
 | Strong-model smoke, Qwen3.6 27B MTP, budget 2048 | 1 | 0 | 1 | 0 | 900.5 | 1 | `runs/benchmarks-comparison-smoke-qwen27-budget2048/results.json` |
 | Harness-fix diagnostic, `algo-001`, before semantic-detector widening | 1 | 0 | 1 | 0 | 605.6 | 0 | `runs/benchmarks-fixcheck-algo001-gemma26-budget2048-v5/results.json` |
 | Harness-fix verification, `algo-001`, after validator/command-shape fixes | 1 | 1 | 0 | 0 | 1015.9 | 0 | `runs/benchmarks-fixcheck-algo001-gemma26-budget2048-v6/results.json` |
+| Prompt-override smoke, Gemma 26B MTP | 1 | 1 | 0 | 0 | n/a | 0 | `workspaces/quick-prompt-smoke/.agent_state/summary.json` |
 
 Full 30-task baseline detail:
 
@@ -345,6 +370,16 @@ Interpretation:
 - The `algo-001` fix-check passed after tightening artifact-only validation,
   command-shape review, semantic validation detection, and structured-control
   token caps.
+- The feedback and repair loops do work as an evidence scaffold: recorded runs
+  show them approving or blocking tool calls, forcing stronger validation,
+  catching shallow evidence, and preserving repair history for later attempts.
+  They do not yet prove a broad problem-solving lift over a no-feedback
+  baseline.
+- The current effectiveness signal is mixed. Simple and focused tasks can pass
+  end-to-end, including the June 27 prompt-override Docker smoke test, but the
+  broader local-model publication run is dominated by timeouts. A rigorous
+  improvement claim needs an A/B run with feedback enabled and disabled under
+  the same model, suite, and time budget.
 - A full multi-model x pair x thinking-budget matrix was not completed in this
   repository state. The measured runtime of one 30-task run was 17,209 seconds
   wall-clock, so a complete matrix would take days. Missing rows must be run
@@ -357,6 +392,7 @@ Current repository-verification evidence:
 | Compile check | Pass | `python -m compileall feedback_agent scripts tests`. |
 | Unit tests | Pass | `python -m unittest discover -s tests -v`, 156 tests. |
 | Benchmark dry run | Pass | `python scripts/run_benchmarks.py --suite publication-30 --dry-run`, 30 tasks loaded. |
+| Prompt override through Docker | Pass | `MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/build_and_run.sh --config config.minimal.json --workspace workspaces/quick-prompt-smoke --prompt "Create HELLO.txt only. It must contain exactly the text: hello"` resolved with final and approach reviews passing; `HELLO.txt` was exactly 5 bytes. |
 | Gemma 26B MTP profile | Available | Target and draft files found locally. |
 | Gemma 31B MTP profile | Available | Target and draft files found locally. |
 | Qwen3.6 27B MTP profile | Available | Downloaded and verified with `MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/download_default_model.sh`; verification report at `/mnt/hf/models/qwen3.6-27b-mtp-gguf/model_verify.json`. |
