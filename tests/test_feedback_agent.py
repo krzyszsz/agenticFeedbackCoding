@@ -2073,7 +2073,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("appears to write or mutate", text)
             self.assertIn("one-line `python -c` compound block", text)
 
-    def test_only_as_domain_fact_does_not_override_default_quality_policy(self) -> None:
+    def test_simple_helper_prompt_uses_proportional_quality_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
@@ -2083,8 +2083,339 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                 prompt="Build a counting helper where A is the only vowel in the alphabet.",
             )
 
-            self.assertTrue(agent._default_quality_policy_applies())
+            self.assertFalse(agent._default_quality_policy_applies())
             self.assertFalse(agent._explicit_artifact_only_constraint())
+
+    def test_negative_readme_mention_does_not_trigger_quality_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create huge_output.py that can print a configurable number of lines and "
+                    "validate_huge_output.py that runs it with a bounded line count and asserts "
+                    "the output format. Do not rely on dumping huge output into README."
+                ),
+            )
+
+            self.assertFalse(agent._default_quality_policy_applies())
+            self.assertEqual(
+                agent._default_quality_policy_reason(),
+                "bounded utility/script prompt without requested extra quality deliverables",
+            )
+
+    def test_bounded_plan_rejects_redundant_final_verification_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create huge_output.py that can print a configurable number of lines and "
+                    "validate_huge_output.py that runs it with a bounded line count and asserts "
+                    "the output format. Do not rely on dumping huge output into README."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Bounded utility")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Implement scripts",
+                    "description": "Create huge_output.py and validate_huge_output.py.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["Both scripts work."],
+                    "validation_commands": [["python", "validate_huge_output.py", "--count", "1000"]],
+                    "status": "pending",
+                },
+                {
+                    "id": "S2",
+                    "title": "Final Verification",
+                    "description": "Run a comprehensive check of error cases and success cases.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["Success and error cases pass."],
+                    "validation_commands": [["python", "validate_huge_output.py", "--count", "1000"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertIn("standalone final verification/QA step", "\n".join(findings))
+
+    def test_requested_verifier_file_step_is_not_treated_as_redundant_qa(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create huge_output.py that can print a configurable number of lines and "
+                    "validate_huge_output.py that runs it with a bounded line count and asserts "
+                    "the output format."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Bounded utility")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Implement huge_output.py",
+                    "description": "Create the output generator.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["Generator prints requested lines."],
+                    "validation_commands": [["python", "huge_output.py", "--lines", "3"]],
+                    "status": "pending",
+                },
+                {
+                    "id": "S2",
+                    "title": "Implement validate_huge_output.py",
+                    "description": "Create validate_huge_output.py to validate streamed output.",
+                    "depends_on": ["S1"],
+                    "acceptance_criteria": ["validate_huge_output.py validates output."],
+                    "validation_commands": [["python", "validate_huge_output.py", "--count", "1000"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("standalone final verification/QA step", "\n".join(findings))
+
+    def test_bounded_plan_rejects_unrequested_test_suite_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create huge_output.py that can print a configurable number of lines and "
+                    "validate_huge_output.py that runs it with a bounded line count and asserts "
+                    "the output format."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Bounded utility")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Implement generator and validator",
+                    "description": "Create huge_output.py, validate_huge_output.py, and test_suite.py.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["test_suite.py verifies success and failure modes."],
+                    "validation_commands": [["python", "test_suite.py"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            text = "\n".join(findings)
+            self.assertIn("unrequested test deliverable", text)
+            self.assertIn("test_suite.py", text)
+
+    def test_explicit_test_request_allows_test_suite_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create huge_output.py and validate_huge_output.py. Include tests in test_suite.py."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Bounded utility")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Implement generator, validator, and tests",
+                    "description": "Create huge_output.py, validate_huge_output.py, and test_suite.py.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["test_suite.py verifies success and failure modes."],
+                    "validation_commands": [["python", "test_suite.py"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("unrequested test deliverable", "\n".join(findings))
+
+    def test_prompt_implied_direct_script_invocation_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create huge_output.py that can print a configurable number of lines and "
+                    "validate_huge_output.py that runs it with a bounded line count and asserts "
+                    "the output format."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Bounded utility")
+            agent.requirements["refined_requirements"] = [
+                "validate_huge_output.py must accept a command and count argument.",
+            ]
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Implement generator and validator",
+                    "description": "Create the scripts.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["Validator works."],
+                    "validation_commands": [["python", "validate_huge_output.py", "5000"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            text = "\n".join(findings)
+            self.assertIn("validate_huge_output.py", text)
+            self.assertIn("direct invocation", text)
+
+    def test_configurable_script_argument_does_not_force_direct_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt="Create huge_output.py that can print a configurable number of lines.",
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Bounded utility")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Implement generator",
+                    "description": "Create huge_output.py.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["Generator accepts a count."],
+                    "validation_commands": [["python", "huge_output.py", "5"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("direct invocation", "\n".join(findings))
+
+    def test_provided_input_cli_does_not_force_direct_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Build a Python CLI tool named palindrome.py that checks whether one provided "
+                    "string is a palindrome."
+                ),
+            )
+            agent.initialize()
+            agent.requirements = base_requirements("Input-taking CLI")
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Implement CLI",
+                    "description": "Create palindrome.py.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["CLI accepts one string argument."],
+                    "validation_commands": [["python", "palindrome.py", "race car"]],
+                    "status": "pending",
+                },
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("direct invocation", "\n".join(findings))
+
+    def test_validation_command_rejects_unsupported_stdout_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S1",
+                "title": "CLI checks",
+                "description": "Check exact CLI output.",
+                "validation_commands": [
+                    {
+                        "cmd": ["python", "palindrome.py", "race car"],
+                        "expected_output": "true",
+                    }
+                ],
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            text = "\n".join(findings)
+            self.assertIn("unsupported assertion metadata", text)
+            self.assertIn("expected_output", text)
+
+    def test_explicit_tests_and_readme_trigger_quality_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Build a tiny Python CLI slugify.py. It should print the slug. "
+                    "Include tests and README."
+                ),
+            )
+
+            self.assertTrue(agent._default_quality_policy_applies())
+            self.assertEqual(
+                agent._default_quality_policy_reason(),
+                "prompt requests quality deliverables or project-level scope",
+            )
+            self.assertFalse(agent._default_quality_policy_requires_research_structure_step())
+
+    def test_short_design_notes_prompt_does_not_force_research_structure_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Build a Python CLI tool named palindrome.py. Include reusable core function, "
+                    "unittest coverage, README documentation, and a short design notes file. "
+                    "Keep it complete, well structured, and easy to validate."
+                ),
+            )
+
+            self.assertTrue(agent._default_quality_policy_applies())
+            self.assertFalse(agent._default_quality_policy_requires_research_structure_step())
+
+    def test_explicit_architecture_prompt_requires_research_structure_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Build a browser platformer and document the project structure, architecture, "
+                    "and separation of concerns before implementation."
+                ),
+            )
+
+            self.assertTrue(agent._default_quality_policy_applies())
+            self.assertTrue(agent._default_quality_policy_requires_research_structure_step())
 
     def test_prompt_contracts_warn_against_unrequested_api_overconstraint(self) -> None:
         contract_text = "\n".join([
@@ -2366,6 +2697,31 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
             self.assertTrue(agent._approach_review_requests_retry(review))
             self.assertEqual(review["recommended_next_approach"], "Watch the log again from the last checkpoint.")
+
+    def test_approach_review_cannot_keep_failed_workflow_as_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            keep_failed_review = {
+                "status": "resolved",
+                "needs_rework": False,
+                "summary": "Keep the current approach.",
+                "decision": "keep_result",
+                "evidence_reviewed": ["final review"],
+            }
+            agent = load_test_agent(root, workspace, feedback_responses=[json.dumps(keep_failed_review)])
+            agent.initialize()
+
+            review = agent._approach_review_phase(
+                1,
+                [{"step_id": "requirements_phase", "status": "cannot_resolve"}],
+                {"status": "cannot_resolve", "iterations": []},
+            )
+
+            self.assertEqual(review["status"], "try_another_approach")
+            self.assertEqual(review["decision"], "retry_with_new_approach")
+            self.assertTrue(agent._approach_review_requests_retry(review))
+            self.assertIn("cannot_resolve", review["summary"])
 
     def test_research_structure_skeleton_step_satisfies_quality_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -267,34 +267,40 @@ longer timeouts up to `runtime.max_command_timeout_seconds` when the model can
 justify them.
 
 For the June 27, 2026 comparison below, the old 600-second per-task benchmark
-limit was raised to 6000 seconds. That is the important setup detail: three of
-the successful harness rows took longer than 600 seconds, so the old timeout
-would have reported false benchmark failures before the repair loop finished.
+limit was raised to 6000 seconds. That is the important setup detail: successful
+harness rows can take several minutes because they run analysis, requirements
+review, plan validation, tool-call verification, implementation repair, final
+review, and approach review.
+
+Latest focused regression run after the June 27 harness fixes:
 
 | Scenario | Model/profile | Settings | Completed tasks | Pass | Fail | Total wall time | Median task | Evidence |
 |---|---|---|---:|---:|---:|---:|---:|---|
-| No guardrail, single-shot | `gemma4-26b-a4b-qat-mtp` | one model response, same external grader, budget 2048 | 5 | 5 | 0 | 281.9s | 55.6s | `runs/extended-guardrail-comparison-20260627/results.json` |
-| Harness, modest thinking | `gemma4-26b-a4b-qat-mtp` | full analysis/plan/review/repair workflow, budget 2048, task timeout 6000s | 5 | 3 | 2 | 4411.0s | 782.4s | `runs/extended-guardrail-comparison-20260627/results.json` |
-| Harness, dense high-thinking warmup | `qwen3.6-27b-mtp` | budget 8192, task timeout 6000s | 1 attempted | 0 | 1 | 1313.9s before abort | n/a | Aborted warmup in same `results.json`; not counted as a completed suite comparison. |
+| No guardrail, single-shot | `gemma4-26b-a4b-qat-mtp` | one model response, same external grader, budget 2048 | 5 | 3 | 2 | 255.5s | 52.3s | `runs/no-leak-extended5-single-shot-20260627/results.json` |
+| Harness, modest thinking | `gemma4-26b-a4b-qat-mtp` | full workflow, budget 2048, task timeout 6000s | 5 | 5 | 0 | 2868.1s | 450.1s | `runs/no-leak-extended5-harness-20260627/results.json` |
 
-Per-task detail for the completed Gemma comparison:
+Per-task detail:
 
 | Task | Single-shot Gemma | Harness Gemma | Harness observation |
 |---|---:|---:|---|
-| `algo-002-nested-parity` | pass, 46.3s | pass, 782.4s | Extended timeout was required; harness completed the analysis/planning/review flow and resolved the task. |
-| `code-001-slug-cli` | pass, 54.4s | pass, 1607.3s | Repair loops handled stale validation, command-shape issues, and CLI validation details. |
-| `code-003-interval-merge` | pass, 60.7s | pass, 1356.9s | Requirements review caught unrequested public-API overconstraint and validation false positives. |
-| `tool-003-output-truncation` | pass, 55.6s | fail, 323.6s | The run exposed silent subprocess-output and stale-reviewer-validation issues that were later patched. |
-| `hist-001-real-palindrome` | pass, 65.0s | fail, 340.9s | The fast-model harness did not recover in the recorded pass. |
+| `algo-002-nested-parity` | fail, 38.8s | pass, 986.9s | Single-shot wrote `1428`; the harness rejected implementation-in-validation, caught the missing artifact, repaired, and passed external grading. |
+| `code-001-slug-cli` | pass, 52.3s | pass, 573.8s | Harness requirements review forced better subprocess diagnostics, then accepted a compact vertical-slice implementation. |
+| `code-003-interval-merge` | pass, 52.3s | pass, 411.5s | Harness kept the module task compact and verified tests/docs without extra architecture steps. |
+| `tool-003-output-truncation` | fail, 53.2s | pass, 450.1s | Single-shot validator failed by checking `process.returncode` before `wait()`; the harness produced a streaming validator that passed. |
+| `hist-001-real-palindrome` | pass, 58.9s | pass, 445.7s | Harness preserved the required CLI input argument and no longer forces a duplicate architecture step for a short design-notes file. |
 
 Interpretation:
 
-- This run does not prove a broad pass-rate improvement. On this five-task
-  suite, the single-shot Gemma baseline passed 5/5 and the harness Gemma run
-  passed 3/5.
-- It does show the cost and purpose of the harness: the successful harness rows
-  needed 13-27 minutes each because they performed analysis, planning,
-  pushback, command verification, repair, and final review.
+- This focused regression run does show a net positive on the tasks that exposed
+  the previous harness problems: pass rate improved from 3/5 single-shot to 5/5
+  with the harness, at roughly 11.2x wall-clock cost.
+- The harness improvements were generic: proportional quality policy, no
+  task-specific prompt answers, command-shape diagnostics, direct script
+  invocation preservation, and final-status handling. They are not benchmark
+  hard-codes.
+- The old bad result was real. The previous `runs/extended-guardrail-comparison-20260627/results.json`
+  harness row passed 3/5 in 4411.0s while the then-current single-shot row
+  passed 5/5 in 281.9s. That run exposed the bugs fixed here.
 - The Qwen dense 8192-token warmup was intentionally stopped after one
   attempted task because it was already slower than 21 minutes and wrote the
   wrong answer (`1828` instead of `1878`) before any repair loop completed.
@@ -304,6 +310,9 @@ Interpretation:
   agent image before running Docker benchmarks:
   `docker build -t agentic-feedback-coding:local .`. Otherwise the runner may
   use an older local image even though the host checkout has newer Python code.
+- The full `publication-30` suite has not been rerun after these latest fixes.
+  Treat the 30-task table below as pre-fix historical evidence, not as the
+  current expected pass rate.
 
 Publication suite category counts:
 
@@ -378,7 +387,7 @@ Measured evidence from June 26-27, 2026:
 | Harness-fix verification, `algo-001`, after validator/command-shape fixes | 1 | 1 | 0 | 0 | 1015.9 | 0 | `runs/benchmarks-fixcheck-algo001-gemma26-budget2048-v6/results.json` |
 | Prompt-override smoke, Gemma 26B MTP | 1 | 1 | 0 | 0 | n/a | 0 | `workspaces/quick-prompt-smoke/.agent_state/summary.json` |
 
-Full 30-task baseline detail:
+Pre-fix full 30-task baseline detail:
 
 | Task | Category | Grade | Final | Seconds | Return |
 |---|---|---|---|---:|---:|
@@ -441,7 +450,8 @@ Current repository-verification evidence:
 | Check | Result | Notes |
 |---|---|---|
 | Compile check | Pass | `python -m compileall feedback_agent scripts tests`. |
-| Unit tests | Pass | `python -m unittest discover -s tests -v`, 171 tests. |
+| Unit tests | Pass | `python -m unittest discover -s tests -v`, 184 tests. |
+| Focused A/B benchmark | Pass | `extended-comparison-5` with Gemma 26B MTP: single-shot 3/5 in 255.5s, harness 5/5 in 2868.1s; see `runs/no-leak-extended5-*-20260627/results.json`. |
 | Benchmark dry run | Pass | `python scripts/run_benchmarks.py --suite publication-30 --dry-run`, 30 tasks loaded. |
 | Prompt override through Docker | Pass | `MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/build_and_run.sh --config config.minimal.json --workspace workspaces/quick-prompt-smoke --prompt "Create HELLO.txt only. It must contain exactly the text: hello"` resolved with final and approach reviews passing; `HELLO.txt` was exactly 5 bytes. |
 | Gemma 26B MTP profile | Available | Target and draft files found locally. |

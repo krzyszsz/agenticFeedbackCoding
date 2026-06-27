@@ -198,6 +198,18 @@ steps instead of creating many tiny steps. Every step must remain independently
 verifiable. Include enough detail for the implementation and feedback agents to
 make good decisions later; avoid filler and repetition, but do not omit important
 requirements just to make the response shorter.
+For bounded utility, script, function, exact-artifact, or small bug-fix tasks,
+prefer a compact vertical-slice plan: create the requested deliverable(s) and
+attach terminating validation commands to that implementation step. Do not add a
+standalone "final verification", "QA", "review", or "run all tests" step when it
+only reruns checks that can be attached to the implementation step; the harness
+already performs reviewer-owned step review and final review.
+Preserve the natural public invocation of named scripts. If the user says a
+script "runs", "validates", or "checks" a bounded scenario and does not specify
+mandatory arguments, make `python script.py` or `bash script.sh` perform that
+bounded default. Optional arguments or environment overrides are fine, but do
+not turn the script into a generic wrapper that requires unrelated positional
+arguments unless the prompt asks for that.
 Do not invent narrow public API details that the user did not specify. In
 particular, do not force a return container/record type, serialization format,
 file layout, or CLI behavior just because one implementation path is convenient.
@@ -216,8 +228,13 @@ use argv arrays so quoting and arguments can be verified before execution.
 Avoid embedding quote-heavy Python source, f-strings, braces, list
 comprehensions, or other brittle snippets inside JSON command strings during
 planning when the task allows helper validation files. Prefer simple argv
-checks such as ["test", "-f", "README.md"]. For complex validation, add a plan
+checks such as ["test", "-f", "README.md"] or {"cmd": ["bash", "-lc",
+"test -s ANSWER.txt"]}. For complex validation, add a plan
 step that creates a validation script and then run ["python", "validate.py"].
+Never write shell-wrapped inline Python as ["bash", "-c", "python", "-c",
+"..."] or as `bash -c python -c ...`; if shell wrapping is truly needed, the
+entire shell script must be the single third argv element, e.g.
+["bash", "-lc", "python - <<'PY'\nprint('ok')\nPY"].
 For artifact-only requests, helper files inside the workspace may be forbidden;
 in that case use simple inline commands or temporary files outside the
 workspace.
@@ -265,6 +282,14 @@ Do not repeat the full requirements unless that detail is needed to make the
 plan clear. Validation commands must terminate and assert behavior. Do not use
 `python -m http.server` by itself; wrap any server startup inside a script that
 performs checks and exits.
+For bounded tasks, merge pure final-verification or QA-only work into the
+implementation step's validation commands unless the user explicitly requested a
+separate testing deliverable or there is a real dependency that prevents a
+single validated vertical slice.
+Preserve named script invocation surfaces: when a prompt describes a script as
+running or validating a bounded default and does not name required arguments,
+the plan should validate the no-argument invocation as well as any optional
+override flags.
 Do not resolve ambiguous API details by narrowing them to an unrequested type or
 format. If the user did not specify the exact return representation, preserve the
 prompt examples and caller-visible input conventions in the plan, or add a
@@ -272,8 +297,11 @@ validation script that checks semantic behavior without unnecessary
 representation constraints.
 Do not embed quote-heavy inline Python source in JSON command strings when the
 task allows helper validation files. Prefer simple argv checks such as
-["test", "-f", "index.html"], or run a generated validation script such as
-["python", "validate.py"]. For artifact-only requests, helper files inside the
+["test", "-f", "index.html"], {"cmd": ["bash", "-lc", "test -s ANSWER.txt"]},
+or run a generated validation script such as ["python", "validate.py"]. Never
+write shell-wrapped inline Python as ["bash", "-c", "python", "-c", "..."] or
+as `bash -c python -c ...`; if shell wrapping is truly needed, the entire shell
+script must be the single third argv element. For artifact-only requests, helper files inside the
 workspace may be forbidden; in that case use simple inline commands or temporary
 files outside the workspace.
 Do not use `python -m py_compile .` or any directory argument with
@@ -1460,6 +1488,13 @@ class FeedbackLoopAgent:
                 "If the user's requested step count conflicts with verifiable implementation, record "
                 "that conflict as an assumption and choose a practical feasible verifiable plan. "
                 "Do not reinterpret per-attempt file-count guidance as a one-file-per-plan-step rule.\n"
+                "For bounded utility, script, function, exact-artifact, or small bug-fix tasks, prefer a "
+                "compact vertical-slice plan where requested deliverables and their terminating validation "
+                "commands are handled in the same implementation step. Do not add standalone final-verification "
+                "or QA-only steps that merely rerun checks the harness can perform during step/final review.\n"
+                "Preserve named script public invocation: if the prompt describes a script as running or "
+                "validating a bounded default and does not specify mandatory arguments, require a useful "
+                "no-argument invocation plus optional overrides instead of mandatory positional arguments.\n"
                 f"{self._default_quality_instruction()}\n"
                 f"{self._execution_environment_guidance()}\n"
                 f"{self._harness_state_file_guidance()}\n"
@@ -1531,6 +1566,10 @@ class FeedbackLoopAgent:
             plan=normalize_plan_steps(requirements.get("plan", [])) if isinstance(requirements, dict) else [],
         )
         public_api_findings = self._public_api_overconstraint_findings(requirements)
+        script_invocation_findings = self._script_direct_invocation_findings(
+            requirements=requirements,
+            plan=normalize_plan_steps(requirements.get("plan", [])) if isinstance(requirements, dict) else [],
+        )
         previous_requirements = self.requirements
         previous_plan_steps = self.plan_steps
         try:
@@ -1542,7 +1581,13 @@ class FeedbackLoopAgent:
             self.requirements = previous_requirements
             self.plan_steps = previous_plan_steps
         deterministic_findings = []
-        for item in [*environment_findings, *computed_answer_findings, *public_api_findings, *plan_structural_findings]:
+        for item in [
+            *environment_findings,
+            *computed_answer_findings,
+            *public_api_findings,
+            *script_invocation_findings,
+            *plan_structural_findings,
+        ]:
             if item not in deterministic_findings:
                 deterministic_findings.append(item)
         prompt = {
@@ -1570,9 +1615,9 @@ class FeedbackLoopAgent:
             "If constraints conflict, request a clear compromise instead of repeatedly enforcing both sides "
             "of an impossible constraint. Per-attempt output-size guidance is not a plan-step limit.\n"
             "If default quality policy applies, reject requirements that omit project structure, tests, documentation, "
-            "or the initial research/structure planning step. If default_quality_policy.applies is false because "
-            "the user explicitly constrained deliverables to one output/artifact, do not require extra project files; "
-            "require validation evidence that respects the artifact constraint instead.\n"
+            "or the initial research/structure planning step. If default_quality_policy.applies is false, do not "
+            "invent extra project files, documentation, tests, or research steps that the user did not ask for; "
+            "require direct validation evidence that respects the user's requested scope instead.\n"
             "Apply execution_environment strictly. If deterministic_environment_findings is non-empty, request a "
             "requirements or plan correction instead of accepting incompatible assumptions.\n"
             "If deterministic_requirements_findings is non-empty, request correction instead of accepting the "
@@ -1633,6 +1678,161 @@ class FeedbackLoopAgent:
             ]
         return []
 
+    def _script_direct_invocation_findings(
+        self,
+        *,
+        requirements: dict[str, Any],
+        plan: list[dict[str, Any]],
+    ) -> list[str]:
+        """Preserve prompt-implied direct script entrypoints.
+
+        This is intentionally a narrow heuristic. It does not try to infer every
+        CLI contract. It catches the common drift where a prompt says "create
+        validate_x.py that runs/checks a bounded scenario" and the plan changes
+        that into a generic script requiring positional arguments, so the named
+        script is no longer useful when invoked directly.
+        """
+        prompt = self.config.project_design.prompt
+        direct_scripts = [
+            script for script in self._prompt_named_scripts(prompt)
+            if self._prompt_implies_direct_script_run(prompt, script)
+        ]
+        if not direct_scripts:
+            return []
+        requirements_text = json.dumps(requirements, sort_keys=True).lower()
+        findings: list[str] = []
+        for script in direct_scripts:
+            lowered_script = script.lower()
+            if self._requirements_make_script_args_mandatory(requirements_text, lowered_script):
+                findings.append(
+                    f"{script} is described in the prompt as a bounded script action, but the requirements appear "
+                    "to make positional arguments mandatory. Preserve a useful direct invocation with sensible "
+                    "defaults and make extra controls optional unless the user asked for required arguments."
+                )
+            if plan and not self._plan_validates_direct_script_invocation(plan, script):
+                findings.append(
+                    f"The plan does not validate the prompt-implied direct invocation of {script}. Add a bounded "
+                    f"validation command such as {self._direct_script_command_example(script)} and keep any extra "
+                    "arguments optional unless the user asked for mandatory arguments."
+                )
+        return findings
+
+    @staticmethod
+    def _prompt_named_scripts(prompt: str) -> list[str]:
+        scripts: list[str] = []
+        for match in re.finditer(r"\b[\w.-]+\.(?:py|sh)\b", prompt):
+            script = match.group(0)
+            if script not in scripts:
+                scripts.append(script)
+        return scripts
+
+    @staticmethod
+    def _prompt_implies_direct_script_run(prompt: str, script: str) -> bool:
+        lowered = prompt.lower()
+        script_lower = script.lower()
+        idx = lowered.find(script_lower)
+        if idx < 0:
+            return False
+        before_window = lowered[max(0, idx - 80): idx]
+        after_window = lowered[idx + len(script_lower): idx + len(script_lower) + 180]
+        window = before_window + script_lower + after_window
+        action_markers = (
+            " that runs",
+            " that validates",
+            " that checks",
+            " should run",
+            " should validate",
+            " should check",
+            " runs it",
+            " validates it",
+            " checks it",
+        )
+        if not any(marker in window for marker in action_markers):
+            return False
+        mandatory_markers = (
+            "argument",
+            "arguments",
+            "positional",
+            "required",
+            "required arg",
+            "accept",
+            "takes",
+            "take a",
+            "option",
+            "flag",
+            "parameter",
+            "configurable",
+            "environment override",
+            "env override",
+            "provided ",
+            "input ",
+            "input string",
+            "file path",
+            "path ",
+        )
+        return not any(marker in after_window for marker in mandatory_markers)
+
+    @staticmethod
+    def _requirements_make_script_args_mandatory(requirements_text: str, script: str) -> bool:
+        escaped = re.escape(script)
+        patterns = (
+            rf"{escaped}[^.:\n]{{0,120}}\bmust accept\b",
+            rf"{escaped}[^.:\n]{{0,120}}\bmust take\b",
+            rf"{escaped}[^.:\n]{{0,120}}\brequires?\b[^.:\n]{{0,60}}\b(argument|arguments|positional|command|count)\b",
+            rf"{escaped}[^.:\n]{{0,120}}\baccepts?\b[^.:\n]{{0,60}}\b(argument|arguments|positional|command|count)\b",
+        )
+        return any(re.search(pattern, requirements_text) for pattern in patterns)
+
+    def _plan_validates_direct_script_invocation(self, plan: list[dict[str, Any]], script: str) -> bool:
+        for step in plan:
+            for command in step.get("validation_commands", []) or []:
+                argv = self._command_argv_for_static_check(command)
+                if self._argv_is_direct_script_invocation(argv, script):
+                    return True
+        return False
+
+    @staticmethod
+    def _command_argv_for_static_check(command: Any) -> list[str]:
+        if isinstance(command, dict):
+            command = command.get("cmd", command.get("command", []))
+        if isinstance(command, list):
+            return [str(item) for item in command]
+        if isinstance(command, str):
+            try:
+                return shlex.split(command)
+            except ValueError:
+                return []
+        return []
+
+    @staticmethod
+    def _argv_is_direct_script_invocation(argv: list[str], script: str) -> bool:
+        if not argv:
+            return False
+        script_positions = [idx for idx, item in enumerate(argv) if Path(item).name == script]
+        if not script_positions:
+            return False
+        script_index = script_positions[0]
+        if script.endswith(".py"):
+            if script_index == 0:
+                return len(argv) == 1
+            if Path(argv[0]).name.startswith("python") and script_index == 1:
+                return len(argv) == 2
+            return False
+        if script.endswith(".sh"):
+            if script_index == 0:
+                return len(argv) == 1
+            if Path(argv[0]).name in {"bash", "sh"} and script_index == 1:
+                return len(argv) == 2
+        return False
+
+    @staticmethod
+    def _direct_script_command_example(script: str) -> list[str]:
+        if script.endswith(".py"):
+            return ["python", script]
+        if script.endswith(".sh"):
+            return ["bash", script]
+        return [script]
+
     def _plan_validation_phase(self) -> dict:
         """Block implementation until the ordered plan is executable and checkable."""
         iterations: list[dict[str, Any]] = []
@@ -1677,6 +1877,9 @@ class FeedbackLoopAgent:
                 "planning_confirmation says the plan is feasible, clear, and verifiable",
                 "the reviewer can name exactly how each step will be verified later",
                 "when default quality policy applies, the first step researches needed patterns/knowledge and plans project structure before feature implementation",
+                "when default quality policy does not apply, the plan avoids unrequested documentation, tests, and research steps while still validating the requested deliverables",
+                "bounded tasks do not add standalone final-verification or QA-only steps that duplicate step validation and final review",
+                "named scripts keep the prompt-implied direct invocation surface unless mandatory arguments were requested",
                 "when web research evidence exists, the plan requires generated notes to cite and apply researched source URLs",
             ],
             "expected_json": {
@@ -1702,6 +1905,10 @@ class FeedbackLoopAgent:
             "Challenge the plan before accepting it: Are the analysis and planning comprehensive and adequate "
             "to the request and domain? Does any step need to be updated because it is impossible, stale, "
             "or no longer useful? Push back with needs_plan_change if so.\n"
+            "For bounded tasks, push back on standalone final-verification or QA-only steps that only duplicate "
+            "validation commands; ask to attach those checks to the implementation step instead.\n"
+            "Push back when a plan makes a prompt-implied direct script invocation require mandatory arguments "
+            "without the user asking for that CLI surface.\n"
             f"{self._execution_environment_guidance()}\n"
             f"{self._harness_state_file_guidance()}\n"
             f"{self._artifact_only_guidance()}\n"
@@ -1732,6 +1939,11 @@ class FeedbackLoopAgent:
             "Return the plan/refined planning confirmation contract below; do not repeat "
             "the full requirements list unless those details are needed for clarity. Validation commands must be scripts/commands that exit and "
             "assert behavior. Do not use python -m http.server by itself.\n"
+            "For bounded tasks, remove standalone final-verification or QA-only steps when their checks can be "
+            "attached to the relevant implementation step; keep separate steps only for real dependencies or "
+            "explicit user-requested deliverables.\n"
+            "Preserve named script invocation surfaces: if the prompt implied `python script.py` should run a "
+            "bounded default, include that direct invocation in validation and make extra knobs optional.\n"
             f"{self._execution_environment_guidance()}\n"
             f"{self._harness_state_file_guidance()}\n"
             f"Requirements summary: {self._requirements_summary_for_prompt()}\n"
@@ -2175,6 +2387,16 @@ class FeedbackLoopAgent:
         if decision == "retry_with_new_approach" and self._status(review) == "resolved":
             review["status"] = "try_another_approach"
             review["needs_rework"] = True
+        final_status = self._final_status(step_results, final_review)
+        if final_status != "resolved" and self._status(review) == "resolved" and decision in {"", "keep_result"}:
+            review["status"] = "try_another_approach"
+            review["needs_rework"] = True
+            review["decision"] = "retry_with_new_approach"
+            review["summary"] = (
+                "The approach cannot be kept as resolved because the workflow final status is "
+                f"{final_status}. Re-run analysis and planning using the recorded failure evidence."
+            )
+            review.setdefault("evidence_reviewed", []).append(f"final_status={final_status}")
         if self._status(review) == "try_another_approach" and not review.get("recommended_next_approach"):
             review["recommended_next_approach"] = "Re-run analysis and planning from the recorded gaps."
         self._append_plan_note(f"[approach review {approach_attempt}] {review.get('summary', 'no summary')}")
@@ -2667,7 +2889,7 @@ class FeedbackLoopAgent:
             for dep in step.get("depends_on", []):
                 if dep not in seen_ids:
                     findings.append(f"{step_id} depends on {dep}, which has not appeared earlier in the ordered plan.")
-        if self._default_quality_policy_applies() and self.config.quality_policy.require_research_and_structure_step:
+        if self._default_quality_policy_requires_research_structure_step():
             first = self.plan_steps[0]
             first_text = " ".join([
                 str(first.get("title", "")),
@@ -2739,6 +2961,9 @@ class FeedbackLoopAgent:
                 findings.append(
                     "Web research evidence exists, so the first research/structure step must require citing and applying source URLs."
                 )
+        findings.extend(self._redundant_final_verification_step_findings())
+        findings.extend(self._unrequested_test_deliverable_findings())
+        findings.extend(self._script_direct_invocation_findings(requirements=self.requirements, plan=self.plan_steps))
         findings.extend(self._environment_assumption_findings(requirements=self.requirements, plan=self.plan_steps))
         findings.extend(self._computed_answer_validation_findings(requirements=self.requirements, plan=self.plan_steps))
         confirmation = self.requirements.get("planning_confirmation") if isinstance(self.requirements, dict) else None
@@ -2750,6 +2975,123 @@ class FeedbackLoopAgent:
                     findings.append(f"planning_confirmation.{key} is not true.")
             if not confirmation.get("verification_strategy"):
                 findings.append("planning_confirmation.verification_strategy is empty.")
+        return findings
+
+    def _redundant_final_verification_step_findings(self) -> list[str]:
+        """Reject pure duplicate final-check steps for bounded tasks.
+
+        Step and final review already rerun validation evidence. For small,
+        bounded prompts a separate "final verification" step often costs a full
+        implementation/review loop without adding a deliverable. Keep this
+        generic and conservative: only flag non-quality-scope prompts and only
+        when the step text is clearly a final QA/review/check step rather than a
+        requested verifier artifact.
+        """
+        if self._default_quality_policy_applies() or len(self.plan_steps) < 2:
+            return []
+        if self._explicit_artifact_only_constraint():
+            return []
+        findings: list[str] = []
+        for step in self.plan_steps[1:]:
+            text = " ".join([
+                str(step.get("id", "")),
+                str(step.get("title", "")),
+                str(step.get("description", "")),
+                " ".join(str(item) for item in step.get("acceptance_criteria", []) or []),
+            ]).lower()
+            if not self._looks_like_redundant_final_verification_text(text):
+                continue
+            if self._step_mentions_requested_deliverable(step):
+                continue
+            findings.append(
+                f"{step.get('id', '<missing>')} appears to be a standalone final verification/QA step for a bounded task. "
+                "Merge those terminating validation commands into the relevant implementation step unless the user "
+                "explicitly requested a separate testing deliverable or there is a real dependency."
+            )
+        return findings
+
+    @staticmethod
+    def _looks_like_redundant_final_verification_text(text: str) -> bool:
+        final_markers = (
+            "final verification",
+            "final validation",
+            "final check",
+            "final review",
+            "comprehensive check",
+            "qa",
+            "quality assurance",
+            "run all tests",
+            "rerun tests",
+            "integration verification",
+            "verify everything",
+        )
+        if any(marker in text for marker in final_markers):
+            return True
+        return (
+            any(marker in text for marker in ("verify", "validate", "test", "check"))
+            and not any(marker in text for marker in ("implement", "create", "build", "write", "fix", "add"))
+        )
+
+    def _step_mentions_requested_deliverable(self, step: dict[str, Any]) -> bool:
+        """Allow separate steps that create user-requested verifier/test artifacts."""
+        prompt = self.config.project_design.prompt.lower()
+        step_text = " ".join([
+            str(step.get("title", "")),
+            str(step.get("description", "")),
+            " ".join(str(item) for item in step.get("acceptance_criteria", []) or []),
+        ]).lower()
+        for filename in re.findall(r"\b[\w.-]+\.(?:py|js|ts|html|css|json|md|txt|sh|yml|yaml)\b", step_text):
+            if filename in prompt:
+                return True
+        requested_test_markers = (
+            "include tests",
+            "add tests",
+            "write tests",
+            "test suite",
+            "unit tests",
+            "pytest",
+            "unittest",
+        )
+        return any(marker in prompt for marker in requested_test_markers) and any(
+            marker in step_text for marker in ("test", "tests", "pytest", "unittest")
+        )
+
+    def _unrequested_test_deliverable_findings(self) -> list[str]:
+        """Keep bounded prompts from growing unrequested project test suites."""
+        if self._default_quality_policy_applies():
+            return []
+        prompt = self.config.project_design.prompt.lower()
+        requested_test_markers = (
+            "include tests",
+            "add tests",
+            "write tests",
+            "test suite",
+            "unit tests",
+            "pytest",
+            "unittest",
+            "spec file",
+        )
+        if any(marker in prompt for marker in requested_test_markers):
+            return []
+        findings: list[str] = []
+        for step in self.plan_steps:
+            text = " ".join([
+                str(step.get("title", "")),
+                str(step.get("description", "")),
+                " ".join(str(item) for item in step.get("acceptance_criteria", []) or []),
+                json.dumps(step.get("validation_commands", []), ensure_ascii=False),
+            ]).lower()
+            unrequested = []
+            for filename in re.findall(r"\b[\w.-]*(?:test|spec)[\w.-]*\.(?:py|js|ts|sh)\b", text):
+                if filename not in prompt:
+                    unrequested.append(filename)
+            if unrequested:
+                findings.append(
+                    f"{step.get('id', '<missing>')} introduces unrequested test deliverable(s) "
+                    f"{sorted(set(unrequested))} while proportional quality policy is off. "
+                    "Use bounded validation commands or reviewer-owned validation instead, unless the user asks "
+                    "for tests or names that file."
+                )
         return findings
 
     def _configured_plan_step_limit(self) -> tuple[int | None, bool]:
@@ -2889,6 +3231,24 @@ class FeedbackLoopAgent:
                     findings.append(
                         f"{step_id} uses manual_test metadata in validation_commands; replace it with an executable script/report command."
                     )
+                unsupported_assertion_keys = sorted(
+                    key
+                    for key in command
+                    if key
+                    in {
+                        "expected_output",
+                        "expected_stdout",
+                        "stdout_equals",
+                        "stdout_contains",
+                        "stderr_contains",
+                    }
+                )
+                if unsupported_assertion_keys:
+                    findings.append(
+                        f"{step_id} validation command uses unsupported assertion metadata "
+                        f"{unsupported_assertion_keys}. The harness only enforces return codes; wrap stdout/stderr "
+                        "checks in an executable command or validation script that exits non-zero on mismatch."
+                    )
                 command_value = command.get("cmd") or command.get("command") or []
                 if isinstance(command_value, str):
                     findings.append(
@@ -2940,8 +3300,9 @@ class FeedbackLoopAgent:
             if self._looks_like_invalid_inline_python_compound_command(parts):
                 findings.append(
                     f"{step_id} validation uses a one-line `python -c` compound block that Python cannot parse. "
-                    "Replace it with a simpler expression, a multiline shell command, or a generated validation script "
-                    "when the task allows helper files."
+                    "Replace it with a simple argv check, a generated validation script when helper files are allowed, "
+                    "or a correctly wrapped multiline shell command such as {\"cmd\": [\"bash\", \"-lc\", "
+                    "\"test -s ANSWER.txt\"]}."
                 )
             if self._looks_like_silent_subprocess_capture_validation(parts):
                 findings.append(
@@ -2953,8 +3314,10 @@ class FeedbackLoopAgent:
             if inline_python_syntax_error:
                 findings.append(
                     f"{step_id} validation contains inline Python that fails a static syntax check: "
-                    f"{inline_python_syntax_error}. Replace it with valid inline Python, a multiline shell command, "
-                    "or a generated validation script when the task allows helper files."
+                    f"{inline_python_syntax_error}. Replace it with a simple argv check, a generated validation script "
+                    "when helper files are allowed, or a correctly wrapped multiline shell command such as {\"cmd\": "
+                    "[\"bash\", \"-lc\", \"test -s ANSWER.txt\"]}. Never use "
+                    "`bash -c python -c ...` or split the shell script across argv elements."
                 )
             if self._looks_like_unwrapped_expected_failure_validation(step, command, parts):
                 findings.append(
@@ -3637,33 +4000,57 @@ class FeedbackLoopAgent:
 
     def _default_quality_policy_payload(self) -> dict[str, Any]:
         explicit_artifact_only = self._explicit_artifact_only_constraint()
+        applies = self._default_quality_policy_applies()
         return {
-            "applies": self._default_quality_policy_applies(),
+            "applies": applies,
+            "requires_research_structure_step": self._default_quality_policy_requires_research_structure_step(),
             "explicit_artifact_only_constraint": explicit_artifact_only,
+            "reason": self._default_quality_policy_reason(),
             "assumed_requirement": (
-                "Unless the user explicitly says otherwise, code should be well structured, well tested, "
-                "well documented, and the first implementation step or first part of the first step should research "
-                "required patterns/knowledge, plan project structure, and update the remaining plan if structure "
-                "changes the task order. Explicit user constraints such as outputting one named artifact only override "
-                "additional documentation or test deliverables, but do not remove the need for validation evidence. "
-                "Cited source URLs are required only when web research fetched sources."
+                "Use proportional quality policy. When the prompt explicitly asks for tests, documentation, design "
+                "notes, structure, or a project/app/library-level build, require those requested deliverables. "
+                "Only require a separate initial research/structure planning step when the prompt asks for "
+                "explicit research, architecture, project-structure planning, or broader application-level scope. "
+                "For bounded utility/script tasks that do not ask for extra "
+                "deliverables, do not invent documentation, tests, or research files; keep the plan small and require "
+                "direct validation evidence. Explicit output-only constraints override extra deliverables but never "
+                "remove the need for validation evidence. Cited source URLs are required only when web research "
+                "fetched sources."
             ),
         }
 
     def _default_quality_instruction(self) -> str:
         if not self._default_quality_policy_applies():
+            if self._explicit_artifact_only_constraint():
+                return (
+                    "Use proportional quality policy for this output-only prompt: do not add unrequested "
+                    "documentation, tests, research notes, architecture files, helper files, or scaffold steps. "
+                    "Keep the requirements and plan focused on the explicitly requested deliverable(s), while still "
+                    "using clear validation commands/evidence that prove those deliverables are correct."
+                )
             return (
-                "The user prompt appears to override default extra deliverables or code-quality assumptions. "
-                "Record that override explicitly, do not add files that violate an output-only constraint, and still "
-                "plan validation commands/evidence that prove the requested artifact is correct."
+                "Use proportional quality policy for this prompt: do not add unrequested documentation, tests, "
+                "research notes, architecture files, or scaffold steps. Keep the requirements and plan focused on "
+                "the deliverables the user actually requested, while still using clear structure and validation "
+                "commands/evidence that prove those deliverables are correct."
             )
         return (
-            "Default quality policy applies unless the user explicitly says otherwise: add a requirement that the project "
-            "is well structured, well tested, and well documented. The first implementation step, or the first part of "
-            "the first step when the user requests very few steps, must: "
-            "A) research on the web or from available knowledge any required patterns/knowledge, and "
-            "B) plan the project structure/architecture and rewrite the remaining plan if that structure changes task order. "
-            "Only require cited source URLs when web research actually fetched source URLs; otherwise require available-knowledge notes."
+            "Proportional quality policy applies because the prompt requests quality deliverables or project-level "
+            "work: include the requested structure, tests, documentation, and design/research notes as appropriate. "
+            + (
+                "The first implementation step, or the first part of the first step when the user requests very few "
+                "steps, must: A) research on the web or from available knowledge any required patterns/knowledge, "
+                "and B) plan the project structure/architecture and rewrite the remaining plan if that structure "
+                "changes task order. "
+                if self._default_quality_policy_requires_research_structure_step()
+                else
+                "Do not add a separate research/architecture step merely because tests or README documentation were "
+                "requested; keep bounded tasks compact while still creating the requested tests/docs and validation. "
+            )
+            +
+            "Only require cited source URLs when web research actually fetched source URLs; otherwise require "
+            "available-knowledge notes. A short requested notes file can be produced with the relevant implementation "
+            "step unless the prompt separately asks for research, architecture, or structure planning."
         )
 
     def _default_quality_policy_applies(self) -> bool:
@@ -3682,7 +4069,90 @@ class FeedbackLoopAgent:
             "no documentation",
             "ignore code quality",
         ]
-        return not any(item in prompt for item in overrides)
+        return not any(item in prompt for item in overrides) and self._prompt_requests_quality_scope(prompt)
+
+    def _prompt_requests_quality_scope(self, prompt: str) -> bool:
+        explicit_quality_markers = (
+            "include tests",
+            "include unit tests",
+            "unittest",
+            "test coverage",
+            "readme documentation",
+            "documented",
+            "design notes",
+            "architecture",
+            "well structured",
+            "well-tested",
+            "well tested",
+            "well documented",
+            "easy to validate",
+        )
+        positive_file_markers = (
+            r"\binclude\b[^.?!\n]{0,80}\b(?:readme|documentation|docs?|tests?|unit tests?)\b",
+            r"\bcreate\b[^.?!\n]{0,80}\b(?:readme|documentation|docs?|tests?|unit tests?)\b",
+            r"\badd\b[^.?!\n]{0,80}\b(?:readme|documentation|docs?|tests?|unit tests?)\b",
+            r"\bwith\b[^.?!\n]{0,80}\b(?:readme|documentation|docs?|tests?|unit tests?)\b",
+        )
+        project_scope_markers = (
+            " project",
+            " app",
+            " application",
+            " website",
+            " frontend",
+            " browser",
+            " game",
+            " platformer",
+            " package",
+            " library",
+            " module",
+            " service",
+            " api",
+        )
+        return (
+            any(marker in prompt for marker in explicit_quality_markers)
+            or any(re.search(pattern, prompt) for pattern in positive_file_markers)
+            or any(marker in prompt for marker in project_scope_markers)
+        )
+
+    def _default_quality_policy_requires_research_structure_step(self) -> bool:
+        if not (
+            self.config.quality_policy.require_research_and_structure_step
+            and self._default_quality_policy_applies()
+        ):
+            return False
+        prompt = self.config.project_design.prompt.lower()
+        research_structure_markers = (
+            "architecture",
+            "architectural",
+            "design document",
+            "project structure",
+            "structure overview",
+            "separation of concerns",
+            "research",
+            "professional",
+            "application",
+            "website",
+            "browser",
+            "frontend",
+            "game",
+            "platformer",
+            "service",
+            " api",
+            "package",
+            "library",
+            "existing project",
+        )
+        return any(marker in prompt for marker in research_structure_markers)
+
+    def _default_quality_policy_reason(self) -> str:
+        if not self.config.quality_policy.assume_code_quality_when_unspecified:
+            return "disabled in config"
+        if self._explicit_artifact_only_constraint():
+            return "explicit artifact-only constraint"
+        prompt = self.config.project_design.prompt.lower()
+        if not self._prompt_requests_quality_scope(prompt):
+            return "bounded utility/script prompt without requested extra quality deliverables"
+        return "prompt requests quality deliverables or project-level scope"
 
     def _explicit_artifact_only_constraint(self) -> bool:
         """Detect explicit user constraints that limit deliverables.
