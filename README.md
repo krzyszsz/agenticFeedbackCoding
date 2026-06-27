@@ -253,6 +253,57 @@ The benchmark corpus is `benchmarks/tasks.json`. It currently contains 39 tasks.
 | `historical-difficult` | 8 | Previously documented difficult prompts from checked-in real configs. |
 | `algorithmic-smoke` | 5 | Exact-answer diagnostics for harness behavior. |
 | `comparison-smoke` | 3 | Small model/pair/budget comparison suite when the full suite would take days. |
+| `extended-comparison-5` | 5 | Extended-timeout comparison suite for single-shot versus harness runs. |
+
+### Extended Timeout Guardrail Comparison
+
+The benchmark timeout that matters for long harness runs is
+`scripts/run_benchmarks.py --task-timeout-seconds`: it is the outer wall-clock
+limit for one benchmark task, effectively the goal-level timeout for that run.
+It is separate from `runtime.command_timeout_seconds`, which defaults terminal
+commands to 120 seconds, and from `implementation_model.request_timeout_seconds`,
+which bounds one model HTTP request. Individual terminal commands can request
+longer timeouts up to `runtime.max_command_timeout_seconds` when the model can
+justify them.
+
+For the June 27, 2026 comparison below, the old 600-second per-task benchmark
+limit was raised to 6000 seconds. That is the important setup detail: three of
+the successful harness rows took longer than 600 seconds, so the old timeout
+would have reported false benchmark failures before the repair loop finished.
+
+| Scenario | Model/profile | Settings | Completed tasks | Pass | Fail | Total wall time | Median task | Evidence |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| No guardrail, single-shot | `gemma4-26b-a4b-qat-mtp` | one model response, same external grader, budget 2048 | 5 | 5 | 0 | 281.9s | 55.6s | `runs/extended-guardrail-comparison-20260627/results.json` |
+| Harness, modest thinking | `gemma4-26b-a4b-qat-mtp` | full analysis/plan/review/repair workflow, budget 2048, task timeout 6000s | 5 | 3 | 2 | 4411.0s | 782.4s | `runs/extended-guardrail-comparison-20260627/results.json` |
+| Harness, dense high-thinking warmup | `qwen3.6-27b-mtp` | budget 8192, task timeout 6000s | 1 attempted | 0 | 1 | 1313.9s before abort | n/a | Aborted warmup in same `results.json`; not counted as a completed suite comparison. |
+
+Per-task detail for the completed Gemma comparison:
+
+| Task | Single-shot Gemma | Harness Gemma | Harness observation |
+|---|---:|---:|---|
+| `algo-002-nested-parity` | pass, 46.3s | pass, 782.4s | Extended timeout was required; harness completed the analysis/planning/review flow and resolved the task. |
+| `code-001-slug-cli` | pass, 54.4s | pass, 1607.3s | Repair loops handled stale validation, command-shape issues, and CLI validation details. |
+| `code-003-interval-merge` | pass, 60.7s | pass, 1356.9s | Requirements review caught unrequested public-API overconstraint and validation false positives. |
+| `tool-003-output-truncation` | pass, 55.6s | fail, 323.6s | The run exposed silent subprocess-output and stale-reviewer-validation issues that were later patched. |
+| `hist-001-real-palindrome` | pass, 65.0s | fail, 340.9s | The fast-model harness did not recover in the recorded pass. |
+
+Interpretation:
+
+- This run does not prove a broad pass-rate improvement. On this five-task
+  suite, the single-shot Gemma baseline passed 5/5 and the harness Gemma run
+  passed 3/5.
+- It does show the cost and purpose of the harness: the successful harness rows
+  needed 13-27 minutes each because they performed analysis, planning,
+  pushback, command verification, repair, and final review.
+- The Qwen dense 8192-token warmup was intentionally stopped after one
+  attempted task because it was already slower than 21 minutes and wrote the
+  wrong answer (`1828` instead of `1878`) before any repair loop completed.
+  That setting is not currently a sensible full-suite default on this local
+  server without reserving hours per task.
+- For publication-quality evidence after editing harness code, rebuild the
+  agent image before running Docker benchmarks:
+  `docker build -t agentic-feedback-coding:local .`. Otherwise the runner may
+  use an older local image even though the host checkout has newer Python code.
 
 Publication suite category counts:
 
@@ -285,9 +336,9 @@ python scripts/run_benchmarks.py \
   --suite publication-30 \
   --implementation-profile gemma4-26b-a4b-qat-mtp \
   --reasoning-budget-tokens 2048 \
-  --max-tokens 6144 \
-  --feedback-response-max-tokens 2048 \
-  --task-timeout-seconds 600
+  --max-tokens 8192 \
+  --feedback-response-max-tokens 4096 \
+  --task-timeout-seconds 6000
 ```
 
 Run a paired main/verifier experiment:
@@ -390,7 +441,7 @@ Current repository-verification evidence:
 | Check | Result | Notes |
 |---|---|---|
 | Compile check | Pass | `python -m compileall feedback_agent scripts tests`. |
-| Unit tests | Pass | `python -m unittest discover -s tests -v`, 156 tests. |
+| Unit tests | Pass | `python -m unittest discover -s tests -v`, 171 tests. |
 | Benchmark dry run | Pass | `python scripts/run_benchmarks.py --suite publication-30 --dry-run`, 30 tasks loaded. |
 | Prompt override through Docker | Pass | `MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/build_and_run.sh --config config.minimal.json --workspace workspaces/quick-prompt-smoke --prompt "Create HELLO.txt only. It must contain exactly the text: hello"` resolved with final and approach reviews passing; `HELLO.txt` was exactly 5 bytes. |
 | Gemma 26B MTP profile | Available | Target and draft files found locally. |

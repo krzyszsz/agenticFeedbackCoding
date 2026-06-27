@@ -19,7 +19,7 @@ import urllib.error
 from typing import Any
 
 import scripts.run_benchmarks as run_benchmarks
-from feedback_agent.agent import ANALYSIS_CONTRACT, FeedbackLoopAgent
+from feedback_agent.agent import ANALYSIS_CONTRACT, IMPLEMENTATION_CONTRACT, PLAN_REFINEMENT_CONTRACT, REQUIREMENTS_CONTRACT, FeedbackLoopAgent
 from feedback_agent.compaction import (
     _bounded_recent_turn_count,
     _clean_compaction_memory,
@@ -257,7 +257,136 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(cfg["runtime"]["feedback_response_max_tokens"], 2048)
             self.assertEqual(cfg["runtime"]["docker_user"], "root")
             self.assertEqual(cfg["runtime"]["command_timeout_seconds"], 180)
+            self.assertEqual(cfg["phases"]["requirements_refinement"]["max_iterations"], 4)
+            self.assertEqual(cfg["phases"]["plan_validation"]["max_iterations"], 4)
             self.assertEqual(cfg["phases"]["implementation"]["max_iterations"], 9)
+
+    def test_benchmark_result_matching_separates_direct_and_harness_modes(self) -> None:
+        result = {
+            "run_mode": "single-shot",
+            "task_id": "demo",
+            "implementation_profile": "gemma4-26b-a4b-qat-mtp",
+            "feedback_profile": None,
+            "reasoning_budget_tokens": 2048,
+            "max_tokens": 4096,
+            "feedback_response_max_tokens": 2048,
+        }
+
+        self.assertTrue(run_benchmarks.result_matches_run(
+            result,
+            run_mode="single-shot",
+            task_id="demo",
+            implementation_profile="gemma4-26b-a4b-qat-mtp",
+            feedback_profile=None,
+            reasoning_budget_tokens=2048,
+            max_tokens=4096,
+            feedback_response_max_tokens=2048,
+        ))
+        self.assertFalse(run_benchmarks.result_matches_run(
+            result,
+            run_mode="harness",
+            task_id="demo",
+            implementation_profile="gemma4-26b-a4b-qat-mtp",
+            feedback_profile=None,
+            reasoning_budget_tokens=2048,
+            max_tokens=4096,
+            feedback_response_max_tokens=2048,
+        ))
+
+    def test_benchmark_resume_keeps_results_from_other_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            (output_dir / "results.json").write_text(json.dumps({
+                "results": [
+                    {
+                        "run_mode": "single-shot",
+                        "task_id": "demo",
+                        "implementation_profile": "gemma4-26b-a4b-qat-mtp",
+                        "feedback_profile": None,
+                        "reasoning_budget_tokens": 2048,
+                        "max_tokens": 8192,
+                        "feedback_response_max_tokens": 4096,
+                    },
+                    {
+                        "run_mode": "harness",
+                        "task_id": "demo",
+                        "implementation_profile": "gemma4-26b-a4b-qat-mtp",
+                        "feedback_profile": None,
+                        "reasoning_budget_tokens": 2048,
+                        "max_tokens": 8192,
+                        "feedback_response_max_tokens": 4096,
+                    },
+                ]
+            }), encoding="utf-8")
+
+            results = run_benchmarks.load_resume_results(
+                output_dir,
+                run_mode="harness",
+                selected_tasks=[{"id": "demo"}],
+                implementation_profile="gemma4-26b-a4b-qat-mtp",
+                feedback_profile=None,
+                reasoning_budget_tokens=2048,
+                max_tokens=8192,
+                feedback_response_max_tokens=4096,
+            )
+
+            self.assertEqual({result["run_mode"] for result in results}, {"single-shot", "harness"})
+
+    def test_benchmark_resume_reruns_non_passing_results(self) -> None:
+        self.assertTrue(run_benchmarks.should_skip_existing_result({"grade": "pass"}))
+        self.assertFalse(run_benchmarks.should_skip_existing_result({"grade": "fail"}))
+        self.assertFalse(run_benchmarks.should_skip_existing_result({"grade": "timeout"}))
+        self.assertFalse(run_benchmarks.should_skip_existing_result(None))
+
+    def test_single_shot_benchmark_writes_model_files_without_harness(self) -> None:
+        captured: dict[str, Any] = {}
+
+        class FakeClient:
+            def __init__(self, cfg: Any) -> None:
+                captured["cfg"] = cfg
+
+            def chat(
+                self,
+                messages: list[dict[str, str]],
+                *,
+                max_tokens: int | None = None,
+                temperature: float | None = None,
+            ) -> str:
+                captured["messages"] = messages
+                captured["max_tokens"] = max_tokens
+                captured["temperature"] = temperature
+                return json.dumps({
+                    "files": [{"path": "ANSWER.txt", "content": "ok"}],
+                    "notes": "created answer",
+                    "self_check": ["answer file present"],
+                })
+
+        original_client = run_benchmarks.OpenAICompatClient
+        try:
+            run_benchmarks.OpenAICompatClient = FakeClient  # type: ignore[assignment]
+            with tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                task = {
+                    "id": "demo",
+                    "title": "Demo",
+                    "category": "algorithmic_exact",
+                    "prompt": "Create ANSWER.txt only.",
+                }
+                returncode, _elapsed, output, metadata = run_benchmarks.run_single_shot(
+                    workspace,
+                    task,
+                    implementation_profile="gemma4-26b-a4b-qat-mtp",
+                    reasoning_budget_tokens=2048,
+                    max_tokens=4096,
+                )
+                self.assertEqual(returncode, 0)
+                self.assertEqual((workspace / "ANSWER.txt").read_text(encoding="utf-8"), "ok")
+                self.assertEqual(metadata["files_written"], ["ANSWER.txt"])
+                self.assertIn("SINGLE SHOT RESPONSE", output)
+                self.assertIn("Create ANSWER.txt only.", captured["messages"][1]["content"])
+                self.assertEqual(captured["max_tokens"], 4096)
+        finally:
+            run_benchmarks.OpenAICompatClient = original_client  # type: ignore[assignment]
 
     def test_benchmark_harness_sets_feedback_docker_url_for_pair_runs(self) -> None:
         captured: dict[str, Any] = {}
@@ -1113,6 +1242,47 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("static syntax check", results[0]["stderr"])
             self.assertEqual(agent.feedback_client.calls, [])
 
+    def test_tool_call_verifier_blocks_unwrapped_git_diff_no_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+
+            results = agent._run_verified_commands(
+                [[
+                    "bash",
+                    "-lc",
+                    "python -m pytest tests/test_slugify.py && git diff --no-index /dev/null tests/test_slugify.py",
+                ]],
+                source="implementation",
+                context={"purpose": "prove unwrapped diff evidence is blocked"},
+            )
+
+            self.assertEqual(results[0]["returncode"], 126)
+            self.assertTrue(results[0]["blocked_by_tool_verifier"])
+            self.assertIn("git diff --no-index", results[0]["stderr"])
+            self.assertEqual(agent.feedback_client.calls, [])
+
+    def test_git_diff_no_index_with_expected_returncode_can_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            (workspace / "example.txt").write_text("changed\n", encoding="utf-8")
+
+            results = agent._run_verified_commands(
+                [{"cmd": ["git", "diff", "--no-index", "/dev/null", "example.txt"], "expected_returncode": 1}],
+                source="implementation",
+                context={"purpose": "collect standalone diff evidence"},
+            )
+
+            self.assertEqual(results[0]["returncode"], 1)
+            self.assertTrue(results[0]["returncode_matches_expected"])
+            self.assertFalse(results[0].get("blocked_by_tool_verifier", False))
+            self.assertEqual(len(agent.feedback_client.calls), 1)
+
     def test_shared_transcript_keeps_implementation_and_feedback_context_together(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1916,6 +2086,51 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertTrue(agent._default_quality_policy_applies())
             self.assertFalse(agent._explicit_artifact_only_constraint())
 
+    def test_prompt_contracts_warn_against_unrequested_api_overconstraint(self) -> None:
+        contract_text = "\n".join([
+            REQUIREMENTS_CONTRACT,
+            PLAN_REFINEMENT_CONTRACT,
+            IMPLEMENTATION_CONTRACT,
+        ])
+
+        self.assertIn("Do not invent narrow public API details", contract_text)
+        self.assertIn("return container/record type", contract_text)
+        self.assertIn("unrequested representation", contract_text)
+
+    def test_requirements_review_rejects_unrequested_interval_output_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Build a Python module intervals.py with merge_intervals(pairs). "
+                    "It must merge closed integer intervals, validate start <= end, "
+                    "and include unit tests and README."
+                ),
+            )
+            agent.initialize()
+            requirements = base_requirements("Interval merge")
+            requirements["refined_requirements"] = [
+                "Module `intervals.py` must contain `merge_intervals(pairs)`.",
+                "Output format: a list of lists.",
+            ]
+            requirements["assumptions"] = ["The output format will be a list of lists for consistency."]
+            requirements["plan"] = [{
+                "id": "S1",
+                "title": "Research and Architecture",
+                "description": "Research the sort-and-merge pattern and write DESIGN.md.",
+                "depends_on": [],
+                "acceptance_criteria": ["DESIGN.md exists"],
+                "validation_commands": [["test", "-f", "DESIGN.md"]],
+            }]
+
+            review = agent._requirements_review(1, requirements)
+
+            self.assertEqual(review["status"], "needs_requirements_change")
+            self.assertIn("list-of-lists", "\n".join(review["required_changes"]))
+
     def test_plan_refinement_preserves_active_step_validation_updates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1960,6 +2175,93 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                 active_step["validation_commands"],
                 [["python", "-c", "print('fresh reviewer evidence')"]],
             )
+
+    def test_stale_reviewer_validation_with_passing_corrected_command_requests_plan_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, feedback_responses=[
+                json.dumps({
+                    "status": "resolved",
+                    "needs_rework": False,
+                    "summary": "Reviewer would accept without deterministic stale-plan evidence.",
+                    "required_changes": [],
+                    "verification_evidence": ["implementation command evidence inspected"],
+                })
+            ])
+            agent.initialize()
+            agent.requirements = base_requirements("CLI validation")
+            step = {
+                "id": "S3",
+                "title": "Testing and CLI Verification",
+                "description": "Run CLI checks.",
+                "depends_on": [],
+                "acceptance_criteria": ["CLI output matches expected slugs."],
+                "validation_commands": [{
+                    "cmd": [
+                        "python",
+                        "-c",
+                        "import subprocess; subprocess.run(['python', 'slugify.py', '---Test---'], check=True)",
+                    ]
+                }],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            (workspace / "slugify.py").write_text(
+                "import argparse\n"
+                "parser = argparse.ArgumentParser()\n"
+                "parser.add_argument('text')\n"
+                "args = parser.parse_args()\n"
+                "print(args.text.strip('-').lower())\n",
+                encoding="utf-8",
+            )
+            implementation = {
+                "written": [],
+                "commands": [{
+                    "command": ["python", "slugify.py", "--", "---Test---"],
+                    "returncode": 0,
+                    "expected_returncode": 0,
+                    "returncode_matches_expected": True,
+                    "timed_out": False,
+                    "stdout": "test\n",
+                    "stderr": "",
+                }],
+                "raw": {},
+            }
+
+            review = agent._step_review_pass(step, 2, implementation, "hard_pushback")
+
+            self.assertEqual(review["status"], "needs_plan_change")
+            self.assertIn("stale or misaligned", "\n".join(review["required_changes"]))
+
+    def test_blocked_logically_flawed_reviewer_validation_is_plan_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            result = {
+                "command": ["python", "-c", "print('stale validation')"],
+                "returncode": 126,
+                "expected_returncode": 0,
+                "timed_out": False,
+                "stdout": "",
+                "stderr": (
+                    "Tool call blocked before execution by verification step: "
+                    "The reviewer-owned validation command is logically flawed and does not actually verify the failure mode."
+                ),
+            }
+            implementation_commands = [{
+                "command": ["python", "validate_all.py"],
+                "returncode": 0,
+                "expected_returncode": 0,
+                "timed_out": False,
+            }]
+
+            self.assertTrue(agent._looks_like_stale_or_misaligned_plan_validation_result(
+                result,
+                implementation_commands,
+            ))
 
     def test_problem_analysis_phase_runs_before_planning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2021,6 +2323,28 @@ class FeedbackLoopAgentTests(unittest.TestCase):
         self.assertIn('"id": "A"', ANALYSIS_CONTRACT)
         self.assertIn('"id": "B"', ANALYSIS_CONTRACT)
         self.assertIn("at least two", ANALYSIS_CONTRACT)
+
+    def test_analysis_structural_findings_accept_common_camel_case_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+
+            findings = agent._analysis_structural_findings({
+                "problem_restatement": "Do the requested work.",
+                "possible_solution_paths": [
+                    {"id": "A", "description": "Direct path"},
+                    {"id": "B", "description": "Alternative path"},
+                ],
+                "recommended_path": {"path_id": "A"},
+                "analysis_quality": {
+                    "is_comprehensive": True,
+                    "is_domainAware": True,
+                    "is_actionableForPlanning": True,
+                },
+            })
+
+            self.assertEqual(findings, [])
 
     def test_approach_review_can_request_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2421,6 +2745,77 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             findings = agent._plan_structural_findings()
 
             self.assertIn("expected failure path", "\n".join(findings))
+
+    def test_plan_validation_allows_positive_empty_case_with_separate_expected_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Interval merge plan")
+            agent.plan_steps = [{
+                "id": "S2",
+                "title": "Implement core logic",
+                "description": "Create merge_intervals with invalid interval validation.",
+                "depends_on": [],
+                "acceptance_criteria": [
+                    "merge_intervals returns [] for empty input.",
+                    "merge_intervals raises ValueError for invalid intervals.",
+                ],
+                "validation_commands": [
+                    [
+                        "python",
+                        "-c",
+                        "from intervals import merge_intervals; assert merge_intervals([]) == []; print('SUCCESS')",
+                    ],
+                    {
+                        "cmd": [
+                            "python",
+                            "-c",
+                            "from intervals import merge_intervals; merge_intervals([(3, 1)])",
+                        ],
+                        "expected_returncode": 1,
+                    },
+                ],
+                "status": "pending",
+            }]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertNotIn("expected failure path", "\n".join(findings))
+
+    def test_plan_validation_rejects_silent_captured_subprocess_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            step = {
+                "id": "S3",
+                "title": "Validate generated CLI",
+                "description": "Run a generated validator through subprocess.",
+                "depends_on": [],
+                "acceptance_criteria": ["Validator exits successfully."],
+                "validation_commands": [[
+                    "python",
+                    "-c",
+                    "import subprocess; r = subprocess.run(['python', 'validate.py'], capture_output=True, text=True); exit(0 if r.returncode == 0 else 1)",
+                ]],
+                "status": "pending",
+            }
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertIn("captures subprocess output but discards it", "\n".join(findings))
+
+            step["validation_commands"] = [[
+                "python",
+                "-c",
+                "import subprocess; r = subprocess.run(['python', 'validate.py'], capture_output=True, text=True); assert r.returncode == 0, r.stderr; exit(0)",
+            ]]
+
+            findings = agent._validation_command_findings(step)
+
+            self.assertNotIn("captures subprocess output but discards it", "\n".join(findings))
 
     def test_plan_validation_rejects_plain_command_for_intentional_residual_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3257,6 +3652,34 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertTrue(review["inferred_from_malformed_response"])
             self.assertEqual(agent.feedback_client.calls, [])
 
+    def test_malformed_feedback_with_clear_resolved_status_does_not_force_rework(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace, feedback_responses=[])
+            agent.initialize()
+            raw = (
+                '```json\n'
+                '{\n'
+                '  "status": "resolved",\n'
+                '  "summary": "The validation command `python -c "print(1)"` returned exit code 0.",\n'
+                '  "verification_evidence": ["ANSWER.txt was verified against the expected result."]\n'
+                '}\n'
+                '```'
+            )
+
+            review = agent._extract_json_or_retry(
+                raw,
+                phase="STEP_REVIEW_PHASE",
+                contract='{"status":"resolved|needs_rework","required_changes":["specific change"]}',
+                feedback=True,
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertFalse(review["needs_rework"])
+            self.assertTrue(review["inferred_from_malformed_response"])
+            self.assertEqual(agent.feedback_client.calls, [])
+
     def test_reasoning_only_tool_call_approval_does_not_force_json_repair_loop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3478,7 +3901,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             agent.config = replace(agent.config, implementation_model=model, runtime=runtime)
 
             self.assertEqual(agent._implementation_payload_tokens(), 8192)
-            self.assertEqual(agent._structured_control_tokens(), 6144)
+            self.assertEqual(agent._structured_control_tokens(), 8192)
             self.assertEqual(agent._feedback_response_tokens(agent.config.implementation_model), 8192)
 
     def test_plan_review_rejects_malformed_shell_test_flag(self) -> None:
@@ -3629,6 +4052,52 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(review["status"], "resolved")
             self.assertEqual(review["deterministic_evidence_findings"], [])
             self.assertEqual(review["feedback_tool_evidence"]["validation_results"][0]["returncode"], 0)
+
+    def test_failed_validation_summary_preserves_concrete_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Failing validation evidence")
+            (workspace / "test_example.py").write_text(
+                "import unittest\n\n"
+                "class ExampleTests(unittest.TestCase):\n"
+                "    def test_placeholder(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            step = {
+                "id": "T4",
+                "title": "Create tests",
+                "description": "Create and run tests.",
+                "depends_on": [],
+                "acceptance_criteria": ["Tests pass."],
+                "validation_commands": [[
+                    "python",
+                    "-c",
+                    "import sys; sys.stderr.write('regex mismatch detail\\n'); sys.exit(1)",
+                ]],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+
+            review = agent._step_review_pass(
+                step,
+                1,
+                {
+                    "written": ["test_example.py"],
+                    "commands": [],
+                    "raw": {"test_evidence": ["failing validation reproduced"]},
+                },
+                "hard_pushback",
+            )
+
+            self.assertEqual(review["status"], "needs_rework")
+            self.assertIn("First finding: Feedback validation command returned 1", review["summary"])
+            self.assertIn("regex mismatch detail", review["summary"])
+            self.assertIn("regex mismatch detail", "\n".join(review["required_changes"]))
 
     def test_git_diff_gate_allows_explicit_already_implemented_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

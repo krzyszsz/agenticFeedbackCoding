@@ -66,6 +66,16 @@
         "tool-005-curl-json-safety",
         "hist-001-real-palindrome"
       ]
+    },
+    "extended-comparison-5": {
+      "description": "Five-task extended-timeout comparison suite for single-shot versus harness runs.",
+      "task_ids": [
+        "algo-002-nested-parity",
+        "code-001-slug-cli",
+        "code-003-interval-merge",
+        "tool-003-output-truncation",
+        "hist-001-real-palindrome"
+      ]
     }
   }
 }

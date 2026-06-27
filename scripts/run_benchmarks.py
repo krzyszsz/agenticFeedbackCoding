@@ -16,9 +16,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from feedback_agent.config import DEFAULT_CONFIG, _deep_merge
+from feedback_agent.config import DEFAULT_CONFIG, ModelConfig, _deep_merge
+from feedback_agent.llm import OpenAICompatClient
 from feedback_agent.model_profiles import ModelProfile, resolve_profile
-from feedback_agent.workspace import run_commands, write_files
+from feedback_agent.workspace import collect_workspace_files, extract_json_object, run_commands, write_files
 
 
 def load_tasks(path: Path) -> list[dict[str, Any]]:
@@ -117,6 +118,12 @@ def benchmark_config(
         "loop": {
             "max_approach_reattempts": 5,
         },
+        "phases": {
+            "analysis": {"max_iterations": 2},
+            "requirements_refinement": {"max_iterations": 4},
+            "plan_validation": {"max_iterations": 4},
+            "implementation": {"max_iterations": 7},
+        },
         "project_design": {
             "title": task["title"],
             "prompt": task["prompt"],
@@ -147,6 +154,111 @@ def seed_workspace(workspace: Path, task: dict[str, Any]) -> None:
     setup_files = task.get("setup_files") or []
     if setup_files:
         write_files(workspace, setup_files)
+
+
+def direct_model_config(
+    profile_name: str,
+    *,
+    reasoning_budget_tokens: int | None,
+    max_tokens: int,
+) -> ModelConfig:
+    profile = resolve_profile(profile_name)
+    return ModelConfig(
+        name=profile.name,
+        base_url=f"http://127.0.0.1:{profile.port}/v1",
+        api_key="not-needed",
+        model="local-gguf",
+        context_window=profile.context_window,
+        max_tokens=max_tokens,
+        temperature=0.2,
+        request_timeout_seconds=21600,
+        retry_attempts=20,
+        retry_sleep_seconds=30,
+        request_heartbeat_seconds=30,
+        preserve_reasoning=True,
+        reasoning_budget_tokens=reasoning_budget_tokens or profile.reasoning_budget_tokens,
+        send_reasoning_budget=True,
+    )
+
+
+def single_shot_prompt(task: dict[str, Any], workspace: Path) -> str:
+    workspace_files = collect_workspace_files(workspace, max_file_bytes=12000)
+    return (
+        "You are running without the agentic feedback harness. This is a single-shot benchmark.\n"
+        "Complete the requested project in one response. You cannot ask follow-up questions, run tools, "
+        "inspect the filesystem after this response, or receive reviewer repair feedback.\n"
+        "Return strict JSON only, with this shape:\n"
+        "{\n"
+        '  "files": [{"path": "relative/path", "content": "complete file content"}],\n'
+        '  "notes": "brief implementation note",\n'
+        '  "self_check": ["short check you performed mentally"]\n'
+        "}\n"
+        "Use only relative paths inside the workspace. Do not include markdown fences or extra prose. "
+        "Do not create harness state files such as PLAN.md, REQUIREMENTS.md, RESEARCH.md, or .agent_state files "
+        "unless the user explicitly asks for those as project deliverables.\n\n"
+        f"Task title: {task['title']}\n"
+        f"Task prompt:\n{task['prompt']}\n\n"
+        "Existing workspace files, if any, are provided as bounded context. Preserve user files unless the task requires changing them:\n"
+        f"{json.dumps(workspace_files, indent=2)}"
+    )
+
+
+def run_single_shot(
+    workspace: Path,
+    task: dict[str, Any],
+    *,
+    implementation_profile: str,
+    reasoning_budget_tokens: int | None,
+    max_tokens: int,
+) -> tuple[int, float, str, dict[str, Any]]:
+    start = time.monotonic()
+    prompt = single_shot_prompt(task, workspace)
+    client = OpenAICompatClient(
+        direct_model_config(
+            implementation_profile,
+            reasoning_budget_tokens=reasoning_budget_tokens,
+            max_tokens=max_tokens,
+        )
+    )
+    raw = ""
+    try:
+        raw = client.chat(
+            [
+                {
+                    "role": "system",
+                    "content": "You produce one strict JSON object for a coding benchmark. No tools and no follow-up.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.2,
+        )
+        payload = extract_json_object(raw)
+        files = payload.get("files", [])
+        if not isinstance(files, list):
+            raise ValueError("single-shot response field 'files' is not a list")
+        written = write_files(workspace, files)
+        elapsed = time.monotonic() - start
+        metadata = {
+            "files_written": written,
+            "notes": payload.get("notes", ""),
+            "self_check": payload.get("self_check", []),
+        }
+        log = "===== SINGLE SHOT PROMPT =====\n" + prompt + "\n\n===== SINGLE SHOT RESPONSE =====\n" + raw + "\n"
+        return 0, elapsed, log, metadata
+    except Exception as exc:
+        elapsed = time.monotonic() - start
+        metadata = {"error": str(exc), "raw_tail": raw[-4000:]}
+        log = (
+            "===== SINGLE SHOT PROMPT =====\n"
+            + prompt
+            + "\n\n===== SINGLE SHOT ERROR =====\n"
+            + repr(exc)
+            + "\n\n===== SINGLE SHOT RESPONSE TAIL =====\n"
+            + raw[-4000:]
+            + "\n"
+        )
+        return 2, elapsed, log, metadata
 
 
 def _docker_model_url(profile: ModelProfile) -> str:
@@ -262,6 +374,7 @@ def summarize_result(result: dict[str, Any]) -> dict[str, Any]:
 def result_matches_run(
     result: dict[str, Any],
     *,
+    run_mode: str,
     task_id: str,
     implementation_profile: str,
     feedback_profile: str | None,
@@ -270,7 +383,8 @@ def result_matches_run(
     feedback_response_max_tokens: int | None = None,
 ) -> bool:
     matches = (
-        result.get("task_id") == task_id
+        result.get("run_mode", "harness") == run_mode
+        and result.get("task_id") == task_id
         and result.get("implementation_profile") == implementation_profile
         and result.get("feedback_profile") == feedback_profile
         and result.get("reasoning_budget_tokens") == reasoning_budget_tokens
@@ -285,6 +399,7 @@ def result_matches_run(
 def load_resume_results(
     output_dir: Path,
     *,
+    run_mode: str,
     selected_tasks: list[dict[str, Any]],
     implementation_profile: str,
     feedback_profile: str | None,
@@ -299,35 +414,26 @@ def load_resume_results(
         existing = json.loads(results_path.read_text(encoding="utf-8")).get("results", [])
     except json.JSONDecodeError:
         return []
-    selected_ids = {task["id"] for task in selected_tasks}
-    return [
-        result
-        for result in existing
-        if isinstance(result, dict)
-        and result.get("task_id") in selected_ids
-        and result_matches_run(
-            result,
-            task_id=str(result.get("task_id")),
-            implementation_profile=implementation_profile,
-            feedback_profile=feedback_profile,
-            reasoning_budget_tokens=reasoning_budget_tokens,
-            max_tokens=max_tokens,
-            feedback_response_max_tokens=feedback_response_max_tokens,
-        )
-    ]
+    return [result for result in existing if isinstance(result, dict)]
+
+
+def should_skip_existing_result(result: dict[str, Any] | None) -> bool:
+    """Resume should preserve completed passes but rerun failures/timeouts."""
+    return bool(result is not None and result.get("grade") == "pass")
 
 
 def markdown_table(results: list[dict[str, Any]]) -> str:
     lines = [
-        "| Task | Category | Model | Verifier | Budget | Grade | Final | Seconds | Approach Attempts |",
-        "|---|---|---|---|---:|---|---:|---:|---:|",
+        "| Task | Category | Mode | Model | Verifier | Budget | Grade | Final | Seconds | Approach Attempts |",
+        "|---|---|---|---|---|---:|---|---:|---:|---:|",
     ]
     for result in results:
         summary = result.get("summary") or {}
         lines.append(
-            "| {task} | {category} | {model} | {verifier} | {budget} | {grade} | {final} | {seconds:.1f} | {attempts} |".format(
+            "| {task} | {category} | {mode} | {model} | {verifier} | {budget} | {grade} | {final} | {seconds:.1f} | {attempts} |".format(
                 task=result["task_id"],
                 category=result["category"],
+                mode=result.get("run_mode", "harness"),
                 model=result["implementation_profile"],
                 verifier=result.get("feedback_profile") or "same",
                 budget=result.get("reasoning_budget_tokens") or "profile",
@@ -341,21 +447,21 @@ def markdown_table(results: list[dict[str, Any]]) -> str:
 
 
 def summary_table(results: list[dict[str, Any]]) -> str:
-    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for result in results:
-        key = (result["implementation_profile"], result.get("feedback_profile") or "same")
+        key = (result.get("run_mode", "harness"), result["implementation_profile"], result.get("feedback_profile") or "same")
         groups.setdefault(key, []).append(result)
     lines = [
-        "| Model | Verifier | Budget | Tasks | Pass | Fail | Manual | Avg Seconds |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "| Mode | Model | Verifier | Budget | Tasks | Pass | Fail | Manual | Avg Seconds |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|",
     ]
-    for (model, verifier), items in sorted(groups.items()):
+    for (mode, model, verifier), items in sorted(groups.items()):
         passed = sum(1 for item in items if item["grade"] == "pass")
         failed = sum(1 for item in items if item["grade"] == "fail")
         manual = sum(1 for item in items if item["grade"] == "manual_review")
         avg = sum(float(item.get("elapsed_seconds") or 0) for item in items) / max(1, len(items))
         budgets = sorted({str(item.get("reasoning_budget_tokens") or "profile") for item in items})
-        lines.append(f"| {model} | {verifier} | {', '.join(budgets)} | {len(items)} | {passed} | {failed} | {manual} | {avg:.1f} |")
+        lines.append(f"| {mode} | {model} | {verifier} | {', '.join(budgets)} | {len(items)} | {passed} | {failed} | {manual} | {avg:.1f} |")
     return "\n".join(lines) + "\n"
 
 
@@ -364,6 +470,7 @@ def main() -> int:
     parser.add_argument("--tasks", default="benchmarks/tasks.json")
     parser.add_argument("--suites", default="benchmarks/suites.json")
     parser.add_argument("--suite")
+    parser.add_argument("--mode", choices=["harness", "single-shot"], default="harness")
     parser.add_argument("--implementation-profile", default="gemma4-26b-a4b-qat-mtp")
     parser.add_argument("--feedback-profile")
     parser.add_argument("--reasoning-budget-tokens", type=int)
@@ -387,6 +494,7 @@ def main() -> int:
 
     results: list[dict[str, Any]] = load_resume_results(
         output_dir,
+        run_mode=args.mode,
         selected_tasks=tasks,
         implementation_profile=args.implementation_profile,
         feedback_profile=args.feedback_profile,
@@ -406,6 +514,7 @@ def main() -> int:
                 for result in results
                 if result_matches_run(
                     result,
+                    run_mode=args.mode,
                     task_id=task["id"],
                     implementation_profile=args.implementation_profile,
                     feedback_profile=args.feedback_profile,
@@ -416,34 +525,64 @@ def main() -> int:
             ),
             None,
         )
-        if existing_result is not None:
+        if should_skip_existing_result(existing_result):
             print(f"{task['id']}: skipped existing {existing_result['grade']} in {existing_result.get('elapsed_seconds', 0):.1f}s")
             continue
-        workspace = repo_root / "workspaces" / "benchmarks" / stamp / task["id"]
+        if existing_result is not None:
+            print(
+                f"{task['id']}: rerunning existing {existing_result['grade']} "
+                f"from {existing_result.get('elapsed_seconds', 0):.1f}s"
+            )
+            results = [
+                result
+                for result in results
+                if not result_matches_run(
+                    result,
+                    run_mode=args.mode,
+                    task_id=task["id"],
+                    implementation_profile=args.implementation_profile,
+                    feedback_profile=args.feedback_profile,
+                    reasoning_budget_tokens=args.reasoning_budget_tokens,
+                    max_tokens=args.max_tokens,
+                    feedback_response_max_tokens=args.feedback_response_max_tokens,
+                )
+            ]
+        workspace = repo_root / "workspaces" / "benchmarks" / stamp / args.mode / task["id"]
         seed_workspace(workspace, task)
         config_path = output_dir / f"{task['id']}.json"
-        cfg = benchmark_config(
-            task,
-            repo_root=repo_root,
-            workspace=workspace,
-            implementation_profile=args.implementation_profile,
-            feedback_profile=args.feedback_profile,
-            docker_isolation=args.docker_isolation,
-            reasoning_budget_tokens=args.reasoning_budget_tokens,
-            max_tokens=args.max_tokens,
-            feedback_response_max_tokens=args.feedback_response_max_tokens,
-        )
-        write_config(config_path, cfg)
-        returncode, elapsed, output = run_harness(
-            repo_root,
-            config_path,
-            implementation_profile=args.implementation_profile,
-            feedback_profile=args.feedback_profile,
-            timeout_seconds=args.task_timeout_seconds or None,
-        )
+        single_shot_metadata: dict[str, Any] = {}
+        if args.mode == "harness":
+            cfg = benchmark_config(
+                task,
+                repo_root=repo_root,
+                workspace=workspace,
+                implementation_profile=args.implementation_profile,
+                feedback_profile=args.feedback_profile,
+                docker_isolation=args.docker_isolation,
+                reasoning_budget_tokens=args.reasoning_budget_tokens,
+                max_tokens=args.max_tokens,
+                feedback_response_max_tokens=args.feedback_response_max_tokens,
+            )
+            write_config(config_path, cfg)
+            returncode, elapsed, output = run_harness(
+                repo_root,
+                config_path,
+                implementation_profile=args.implementation_profile,
+                feedback_profile=args.feedback_profile,
+                timeout_seconds=args.task_timeout_seconds or None,
+            )
+        else:
+            returncode, elapsed, output, single_shot_metadata = run_single_shot(
+                workspace,
+                task,
+                implementation_profile=args.implementation_profile,
+                reasoning_budget_tokens=args.reasoning_budget_tokens,
+                max_tokens=args.max_tokens,
+            )
         (output_dir / f"{task['id']}.log").write_text(output, encoding="utf-8")
         grade = grade_task(workspace, task)
         result = {
+            "run_mode": args.mode,
             "task_id": task["id"],
             "title": task["title"],
             "category": task["category"],
@@ -459,7 +598,14 @@ def main() -> int:
             "grade": grade["grade"] if returncode == 0 else "fail",
             "post_validation": grade["validation_results"],
         }
-        result["summary"] = summarize_result(result)
+        if args.mode == "harness":
+            result["summary"] = summarize_result(result)
+        else:
+            result["summary"] = {
+                "final_status": "single_shot_written" if returncode == 0 else "single_shot_failed",
+                "files_written": len(single_shot_metadata.get("files_written", [])),
+            }
+            result["single_shot"] = single_shot_metadata
         results.append(result)
         (output_dir / "results.json").write_text(json.dumps({"results": results}, indent=2), encoding="utf-8")
         (output_dir / "results.md").write_text(

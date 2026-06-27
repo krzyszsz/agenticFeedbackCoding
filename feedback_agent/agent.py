@@ -159,6 +159,11 @@ back on destructive or misdirected operations, wrong source/destination paths,
 malformed quoting, commands that cannot verify the intended behavior, or timeout
 requests that are unjustified. Approve only commands that are appropriate for
 the current task and bounded by the configured workspace/tool policy.
+Remember that evidence commands can have non-zero success semantics: for
+example, `git diff --no-index` returns 1 when it successfully finds differences.
+Block that pattern unless the command explicitly declares `expected_returncode`
+or wraps the diff so the overall validation command exits 0 when the observed
+diff is the intended evidence.
 """
 
 
@@ -193,6 +198,11 @@ steps instead of creating many tiny steps. Every step must remain independently
 verifiable. Include enough detail for the implementation and feedback agents to
 make good decisions later; avoid filler and repetition, but do not omit important
 requirements just to make the response shorter.
+Do not invent narrow public API details that the user did not specify. In
+particular, do not force a return container/record type, serialization format,
+file layout, or CLI behavior just because one implementation path is convenient.
+Record the ambiguity as an assumption and choose conservative validation that
+matches the prompt examples or preserves caller-visible input conventions.
 Do not emit chat-template or fake tool-call markers such as <|channel>,
 <tool_call>, call:ls_tool, or similar. This harness cannot execute those
 markers; validation happens through the parsed JSON `validation_commands` fields
@@ -223,6 +233,10 @@ validation script that asserts the remaining failure is the intended one.
 Likewise, if acceptance criteria say failure logs should indicate logic errors,
 that is an intentional expected-failure step and the validation command must
 declare the expected non-zero return code or wrap the assertion.
+Do not put `git diff --no-index` in a validation command without accounting for
+its exit code: it returns 1 when differences are found. Use `expected_returncode`
+for a standalone diff command or a wrapper script that exits 0 after confirming
+the diff is expected.
 """
 
 
@@ -251,6 +265,11 @@ Do not repeat the full requirements unless that detail is needed to make the
 plan clear. Validation commands must terminate and assert behavior. Do not use
 `python -m http.server` by itself; wrap any server startup inside a script that
 performs checks and exits.
+Do not resolve ambiguous API details by narrowing them to an unrequested type or
+format. If the user did not specify the exact return representation, preserve the
+prompt examples and caller-visible input conventions in the plan, or add a
+validation script that checks semantic behavior without unnecessary
+representation constraints.
 Do not embed quote-heavy inline Python source in JSON command strings when the
 task allows helper validation files. Prefer simple argv checks such as
 ["test", "-f", "index.html"], or run a generated validation script such as
@@ -289,6 +308,11 @@ test, or browser check needs longer. Write the files needed to complete the
 current plan step or a coherent vertical slice of it. For large steps, it is fine
 to split work across feedback attempts, but do not artificially withhold
 inseparable files or documentation that is needed for a high-quality result.
+Do not let an earlier refined assumption overconstrain the user's API. When the
+prompt leaves return representation or file/CLI surface ambiguous, preserve
+natural caller-visible conventions and prompt examples instead of converting
+values to a different type solely for convenience. If the current plan appears
+to require an unrequested representation, request `needs_plan_change`.
 The `files` payload creates files, not empty directories. When a step requires
 directory scaffolding but no real source file belongs there yet, create a small
 placeholder such as `game/js/.gitkeep`, `game/css/.gitkeep`, or
@@ -317,6 +341,10 @@ or, better, a small assertion command that checks the non-zero return code and e
 If the current step intentionally leaves known failures for a later step, make
 that explicit with `expected_returncode` or a validation script that proves the
 remaining failure is intentional. A plain failing command is ambiguous evidence.
+Do not chain `git diff --no-index` after passing tests with `&&`: it returns 1
+when it successfully prints a diff. If diff output is useful as supplemental
+evidence, run a wrapper that checks the intended diff and exits 0, or declare
+`expected_returncode` for a standalone diff evidence command.
 Do not emit chat-template or fake tool-call markers such as <|channel>,
 <tool_call>, call:ls_tool, or similar. This harness cannot execute those
 markers; it only runs commands listed inside the parsed JSON `commands` field
@@ -757,13 +785,14 @@ class FeedbackLoopAgent:
             return feedback_cfg.max_tokens
         return self._tokens_with_reasoning_room(feedback_cfg, configured, minimum=512)
 
-    def _structured_control_tokens(self, ceiling: int = 2048) -> int:
+    def _structured_control_tokens(self, ceiling: int = 4096) -> int:
         """Bound non-file-generation JSON phases.
 
         Analysis, requirements, and plan-refinement turns are orchestration
         control messages. They should be detailed enough to guide later work,
         but they should not inherit the large implementation payload ceiling
-        reserved for generated files.
+        reserved for generated files. Reasoning models still need enough room
+        to emit the required JSON after their thinking budget.
         """
         return self._tokens_with_reasoning_room(self.config.implementation_model, ceiling, minimum=1024)
 
@@ -949,6 +978,12 @@ class FeedbackLoopAgent:
                 }
             return None
         positive_markers = (
+            '"status": "resolved"',
+            '"status":"resolved"',
+            "'status': 'resolved'",
+            "'status':'resolved'",
+            '"needs_rework": false',
+            '"needs_rework":false',
             "i will accept",
             "i'll accept",
             "i accept",
@@ -968,6 +1003,11 @@ class FeedbackLoopAgent:
             "complete and meets all requirements",
             "no required changes",
             "no changes required",
+            "was verified",
+            "verified against",
+            "returned exit code 0",
+            "validation command returned exit code 0",
+            "confirming the correctness",
         )
         negative_markers = (
             "needs rework",
@@ -1009,6 +1049,8 @@ class FeedbackLoopAgent:
                 "cannot verify",
                 "not actually complete",
             )
+        negative_scope = re.sub(r"""["']?needs_rework["']?\s*:\s*false""", "", negative_scope)
+        negative_scope = re.sub(r"""["']?required_changes["']?\s*:\s*\[\s*\]""", "", negative_scope)
         positive = any(marker in positive_scope for marker in positive_markers)
         negative = any(marker in negative_scope for marker in negative_markers)
         if not positive and not negative:
@@ -1378,11 +1420,26 @@ class FeedbackLoopAgent:
         quality = analysis.get("analysis_quality") or {}
         if isinstance(quality, dict):
             for key in ("is_comprehensive", "is_domain_aware", "is_actionable_for_planning"):
-                if quality.get(key) is not True:
+                if not self._analysis_quality_flag(quality, key):
                     findings.append(f"analysis_quality.{key} is not true.")
         else:
             findings.append("Analysis is missing analysis_quality.")
         return findings
+
+    @staticmethod
+    def _analysis_quality_flag(quality: dict[str, Any], key: str) -> bool:
+        """Accept common model casing variants for required boolean flags."""
+        parts = key.split("_")
+        variants = {
+            key,
+            re.sub(r"_([a-z])", lambda match: match.group(1).upper(), key),
+        }
+        if len(parts) > 2:
+            variants.add(
+                "_".join(parts[:2])
+                + "".join(part[:1].upper() + part[1:] for part in parts[2:])
+            )
+        return any(quality.get(variant) is True for variant in variants)
 
     def _requirements_refinement_phase(self, extra_context: str | None = None) -> dict:
         """Turn an underspecified project brief into requirements and a draft plan."""
@@ -1473,6 +1530,7 @@ class FeedbackLoopAgent:
             requirements=requirements,
             plan=normalize_plan_steps(requirements.get("plan", [])) if isinstance(requirements, dict) else [],
         )
+        public_api_findings = self._public_api_overconstraint_findings(requirements)
         previous_requirements = self.requirements
         previous_plan_steps = self.plan_steps
         try:
@@ -1484,7 +1542,7 @@ class FeedbackLoopAgent:
             self.requirements = previous_requirements
             self.plan_steps = previous_plan_steps
         deterministic_findings = []
-        for item in [*environment_findings, *computed_answer_findings, *plan_structural_findings]:
+        for item in [*environment_findings, *computed_answer_findings, *public_api_findings, *plan_structural_findings]:
             if item not in deterministic_findings:
                 deterministic_findings.append(item)
         prompt = {
@@ -1539,6 +1597,41 @@ class FeedbackLoopAgent:
                 review["needs_rework"] = True
                 review["summary"] = "Deterministic requirements checks found unresolved validation or environment issues."
         return review
+
+    def _public_api_overconstraint_findings(self, requirements: dict[str, Any]) -> list[str]:
+        """Catch requirements that narrow an unspecified public API representation."""
+        prompt = self.config.project_design.prompt.lower()
+        req_text = json.dumps(requirements, sort_keys=True).lower()
+        interval_output_markers = (
+            "output intervals will be returned as a list of lists",
+            "output format will be a list of lists",
+            "output: a list of merged intervals (each interval as a list)",
+            "output format: a list of lists",
+            "each interval as a list",
+            "returned as a list of lists",
+        )
+        prompt_allows_list_of_lists = any(
+            marker in prompt
+            for marker in (
+                "list of lists",
+                "lists of lists",
+                "each interval as a list",
+                "return lists",
+                "returns lists",
+            )
+        )
+        if (
+            "merge_intervals" in prompt
+            and "interval" in prompt
+            and not prompt_allows_list_of_lists
+            and any(marker in req_text for marker in interval_output_markers)
+        ):
+            return [
+                "Requirements narrow `merge_intervals` output representation to list-of-lists even though the user "
+                "did not specify that exact public API type. Preserve the prompt's ambiguity/caller-visible interval "
+                "representation or validate semantic merged pairs without forcing a different container type."
+            ]
+        return []
 
     def _plan_validation_phase(self) -> dict:
         """Block implementation until the ordered plan is executable and checkable."""
@@ -1959,7 +2052,7 @@ class FeedbackLoopAgent:
                 "For browser/game work, prefer Playwright-style interaction evidence and screenshot/report artifacts when configured.",
                 "Do not request incidental package/browser installation inside generated validation scripts for default browser checks; if a task requires another stack, request an explicit dependency/setup step with bounded commands.",
                 "In compromise mode, accept a clearly labelled non-browser fallback only when browser launch cannot be made reliable and the fallback still gives concrete evidence.",
-                "Return needs_plan_change if this step cannot be independently verified as written.",
+                "Return needs_plan_change if this step cannot be independently verified as written, or if reviewer-owned validation is stale/misaligned while stronger implementation-provided validation now matches the chosen approach.",
                 "Return needs_requirements_change if the requirements are contradictory or impossible.",
                 "Return cannot_resolve only when bounded retries are unlikely to help.",
             ],
@@ -2850,6 +2943,12 @@ class FeedbackLoopAgent:
                     "Replace it with a simpler expression, a multiline shell command, or a generated validation script "
                     "when the task allows helper files."
                 )
+            if self._looks_like_silent_subprocess_capture_validation(parts):
+                findings.append(
+                    f"{step_id} validation captures subprocess output but discards it when the child command fails. "
+                    "Print or assert the captured stdout/stderr on failure, or use a small validation script, so repair "
+                    "iterations can see the real nested error."
+                )
             inline_python_syntax_error = self._inline_python_static_syntax_error(raw_parts)
             if inline_python_syntax_error:
                 findings.append(
@@ -3185,6 +3284,23 @@ class FeedbackLoopAgent:
             or re.search(r":\s*(?:if|for|while|try|with|def|class)\b", code) is not None
         )
 
+    def _looks_like_silent_subprocess_capture_validation(self, parts: list[str]) -> bool:
+        """Detect validators that hide nested subprocess stderr/stdout."""
+        for _source, code in self._iter_inline_python_snippets(parts):
+            lower = code.lower()
+            if "subprocess.run" not in lower or "capture_output=true" not in lower:
+                continue
+            if "exit(" not in lower and "sys.exit" not in lower and "assert" not in lower:
+                continue
+            emits_captured_output = (
+                re.search(r"print\s*\([^)]*\.\s*(?:stdout|stderr)", lower) is not None
+                or re.search(r"sys\.(?:stdout|stderr)\.write\s*\([^)]*\.\s*(?:stdout|stderr)", lower) is not None
+                or re.search(r"assert\b[^;\n]*,\s*[^;\n]*(?:stdout|stderr)", lower) is not None
+            )
+            if not emits_captured_output:
+                return True
+        return False
+
     def _inline_python_static_syntax_error(self, parts: list[str]) -> str | None:
         """Return a concise syntax error for direct or shell-wrapped Python."""
         for source, code in self._iter_inline_python_snippets(parts):
@@ -3264,7 +3380,15 @@ class FeedbackLoopAgent:
         ]).lower()
         if not any(marker in step_text for marker in ("raise", "raises", "exception", "error", "empty", "invalid")):
             return False
-        return "[]" in code or "raise " in code or "sys.exit" in code
+        if "[]" in code:
+            empty_input_expected_to_fail = (
+                "empty" in step_text
+                and any(marker in step_text for marker in ("raise", "raises", "exception", "error"))
+            )
+            empty_input_asserts_success = re.search(r"assert\b[^;]*==\s*\[\]", code) is not None
+            if empty_input_expected_to_fail and not empty_input_asserts_success:
+                return True
+        return "raise " in code or "sys.exit" in code
 
     def _looks_like_plain_test_or_app_command(self, parts: list[str]) -> bool:
         """Return True for commands likely meant to observe a residual failure.
@@ -4172,6 +4296,7 @@ class FeedbackLoopAgent:
             parts = self._command_parts_for_safety(command)
             if not parts:
                 continue
+            expected_returncode = self._command_expected_returncode(command)
             executable = Path(parts[0]).name
             if executable in {"dd", "mkfs", "fdisk", "parted", "wipefs", "mount", "umount"}:
                 findings.append({
@@ -4189,6 +4314,16 @@ class FeedbackLoopAgent:
                 findings.extend(self._path_sensitive_tool_findings(index, executable, parts))
             if executable == "curl":
                 findings.extend(self._curl_payload_findings(index, parts))
+            if expected_returncode == 0 and self._looks_like_unwrapped_git_diff_no_index(parts):
+                findings.append({
+                    "index": index,
+                    "risk_level": "medium",
+                    "reason": (
+                        "`git diff --no-index` returns 1 when it successfully finds differences. "
+                        "Use a command object with expected_returncode for standalone diff evidence, "
+                        "or wrap the diff so the overall validation exits 0 after confirming the intended evidence."
+                    ),
+                })
             inline_python_syntax_error = self._inline_python_static_syntax_error(parts)
             if inline_python_syntax_error:
                 findings.append({
@@ -4214,6 +4349,30 @@ class FeedbackLoopAgent:
                         "reason": "Shell curl command appears to have unbalanced single quotes; use an argv command or write a request body file.",
                     })
         return findings
+
+    def _looks_like_unwrapped_git_diff_no_index(self, parts: list[str]) -> bool:
+        """Detect diff-evidence commands whose successful evidence exits non-zero."""
+        if not parts:
+            return False
+        executable = Path(parts[0]).name
+        if executable == "git":
+            lowered = [part.lower() for part in parts]
+            return len(lowered) >= 3 and lowered[1] == "diff" and "--no-index" in lowered
+        if executable not in {"bash", "sh"} or len(parts) < 3 or parts[1] not in {"-c", "-lc"}:
+            return False
+        script = parts[2].lower()
+        if "git diff" not in script or "--no-index" not in script:
+            return False
+        neutralizers = (
+            "|| true",
+            "|| :",
+            "if git diff",
+            "if ! git diff",
+            "case $? in",
+            "case ${?} in",
+            "case \"$?\" in",
+        )
+        return not any(marker in script for marker in neutralizers)
 
     def _command_parts_for_safety(self, command: Any) -> list[str]:
         if isinstance(command, dict):
@@ -4510,6 +4669,7 @@ class FeedbackLoopAgent:
                 findings.append(
                     f"Feedback validation command returned {result.get('returncode')} but expected "
                     f"{result.get('expected_returncode', 0)}: {result.get('command')}"
+                    f"{self._command_failure_excerpt(result)}"
                 )
                 if self._looks_like_malformed_validation_command(result):
                     findings.append(
@@ -4521,6 +4681,11 @@ class FeedbackLoopAgent:
                         "Plan validation command appears to run an expected failure path without declaring expected_returncode "
                         "or wrapping the assertion; request a plan change instead of asking for implementation-only changes."
                     )
+                if self._looks_like_stale_or_misaligned_plan_validation_result(result, implementation_commands):
+                    findings.append(
+                        "Plan validation command appears stale or misaligned with the accepted implementation evidence; "
+                        "request a plan change with corrected validation commands instead of repeating implementation-only repair."
+                    )
         for result in implementation_commands:
             if result.get("timed_out"):
                 findings.append(f"Implementation command timed out: {result.get('command')}")
@@ -4529,6 +4694,7 @@ class FeedbackLoopAgent:
                 findings.append(
                     f"Implementation command returned {result.get('returncode')} but expected "
                     f"{result.get('expected_returncode', 0)}: {result.get('command')}"
+                    f"{self._command_failure_excerpt(result)}"
                 )
         findings.extend(self._git_diff_findings(step, implementation, feedback_tool_evidence or {}))
         findings.extend(
@@ -4538,6 +4704,72 @@ class FeedbackLoopAgent:
             )
         )
         return findings
+
+    def _command_failure_excerpt(self, result: dict[str, Any], *, limit: int = 700) -> str:
+        """Return a bounded output excerpt for deterministic repair findings."""
+        chunks = []
+        stdout = str(result.get("stdout") or "").strip()
+        stderr = str(result.get("stderr") or "").strip()
+        if stdout:
+            chunks.append(f"stdout: {stdout}")
+        if stderr:
+            chunks.append(f"stderr: {stderr}")
+        if not chunks:
+            return ""
+        text = " | ".join(chunks)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > limit:
+            text = "..." + text[-limit:]
+        return f". Output excerpt: {text}"
+
+    def _looks_like_stale_or_misaligned_plan_validation_result(
+        self,
+        result: dict[str, Any],
+        implementation_commands: list[dict[str, Any]],
+    ) -> bool:
+        """Detect reviewer-owned commands that need plan repair, not code churn."""
+        if not implementation_commands or not all(
+            self._command_returncode_matches_expected(item) and not item.get("timed_out")
+            for item in implementation_commands
+        ):
+            return False
+        stderr = str(result.get("stderr") or "").lower()
+        stdout = str(result.get("stdout") or "").lower()
+        text = f"{stdout}\n{stderr}"
+        stale_markers = (
+            "no module named",
+            "can't open file",
+            "cannot open file",
+            "no such file or directory",
+            "module not found",
+            "importerror",
+            "modulenotfounderror",
+        )
+        if any(marker in text for marker in stale_markers):
+            return True
+        if (
+            "tool call blocked before execution by verification step" in text
+            and any(
+                marker in text
+                for marker in (
+                    "logically flawed",
+                    "does not actually verify",
+                    "cannot achieve this via simple cli arguments",
+                    "stale",
+                    "misaligned",
+                )
+            )
+        ):
+            return True
+        implementation_text = json.dumps(
+            [item.get("command") for item in implementation_commands],
+            ensure_ascii=False,
+        ).lower()
+        cli_separator_markers = (" -- ", "'--'", '"--"')
+        return (
+            "returned non-zero exit status 2" in text
+            and any(marker in implementation_text for marker in cli_separator_markers)
+        )
 
     def _command_returncode_matches_expected(self, result: dict[str, Any]) -> bool:
         """Return True when a command produced the intended exit status.
@@ -4814,7 +5046,16 @@ class FeedbackLoopAgent:
             "importerror",
             "modulenotfounderror",
         )
-        return any(marker in text for marker in stale_markers)
+        if any(marker in text for marker in stale_markers):
+            return True
+        accepted_command_text = json.dumps(
+            [item.get("command") for item in accepted_results],
+            ensure_ascii=False,
+        ).lower()
+        return (
+            "returned non-zero exit status 2" in text
+            and any(marker in accepted_command_text for marker in (" -- ", "'--'", '"--"'))
+        )
 
     def _workspace_reference_findings(
         self,
@@ -4948,7 +5189,11 @@ class FeedbackLoopAgent:
         if review_mode == "hard_pushback":
             review["status"] = "needs_rework"
             review["needs_rework"] = True
-            review["summary"] = "Please rework this step: hard-pushback evidence checks found missing, failing, or absent git-diff evidence."
+            first_finding = evidence_findings[0] if evidence_findings else "no concrete finding recorded"
+            review["summary"] = (
+                "Please rework this step: deterministic hard-pushback evidence checks failed. "
+                f"First finding: {first_finding}"
+            )
             review["required_changes"] = evidence_findings
         else:
             review["status"] = "skipped_with_note"
