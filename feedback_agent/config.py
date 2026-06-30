@@ -44,6 +44,8 @@ class RuntimeConfig:
     research_file: str
     command_timeout_seconds: int
     max_command_timeout_seconds: int
+    command_progress_review_interval_seconds: int
+    command_progress_review_min_interval_seconds: int
     print_transcript: bool
     live_turn_max_chars: int
     color_transcript: bool
@@ -183,6 +185,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "research_file": "RESEARCH.md",
         "command_timeout_seconds": 120,
         "max_command_timeout_seconds": 21_600,
+        "command_progress_review_interval_seconds": 300,
+        "command_progress_review_min_interval_seconds": 30,
         "print_transcript": True,
         "live_turn_max_chars": 0,
         "color_transcript": True,
@@ -387,6 +391,14 @@ def load_config(path: str | Path, repo_root: Path | None = None) -> AgentConfig:
             research_file=str(runtime_data.get("research_file", "RESEARCH.md")),
             command_timeout_seconds=int(runtime_data.get("command_timeout_seconds", 120)),
             max_command_timeout_seconds=int(runtime_data.get("max_command_timeout_seconds", 21_600)),
+            command_progress_review_interval_seconds=max(
+                0,
+                int(runtime_data.get("command_progress_review_interval_seconds", 300)),
+            ),
+            command_progress_review_min_interval_seconds=max(
+                1,
+                int(runtime_data.get("command_progress_review_min_interval_seconds", 30)),
+            ),
             print_transcript=bool(runtime_data.get("print_transcript", True)),
             live_turn_max_chars=int(runtime_data.get("live_turn_max_chars", 0)),
             color_transcript=bool(runtime_data.get("color_transcript", True)),

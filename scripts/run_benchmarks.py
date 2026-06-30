@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import subprocess
 import sys
@@ -67,6 +68,11 @@ def select_tasks(tasks: list[dict[str, Any]], ids: list[str], limit: int | None)
     return tasks
 
 
+def resolve_selection_ids(suite_ids: list[str], explicit_task_ids: list[str]) -> list[str]:
+    """Choose benchmark task ids from the most specific CLI selector."""
+    return explicit_task_ids if explicit_task_ids else suite_ids
+
+
 def benchmark_config(
     task: dict[str, Any],
     *,
@@ -105,6 +111,8 @@ def benchmark_config(
             "workspace": str(workspace.relative_to(repo_root) if workspace.is_relative_to(repo_root) else workspace),
             "command_timeout_seconds": 120,
             "max_command_timeout_seconds": 21600,
+            "command_progress_review_interval_seconds": 300,
+            "command_progress_review_min_interval_seconds": 30,
             "print_transcript": True,
             "live_turn_max_chars": 20000,
             "final_summary": "compact",
@@ -265,6 +273,66 @@ def _docker_model_url(profile: ModelProfile) -> str:
     return f"http://{profile.container_name}:{profile.port}/v1"
 
 
+def _timeout_output(exc: subprocess.TimeoutExpired) -> str:
+    output = exc.output or ""
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return str(output)
+
+
+def _stream_process_output(
+    proc: subprocess.Popen[str],
+    *,
+    timeout_seconds: int | None,
+    start: float,
+) -> str:
+    """Stream real benchmark subprocess output instead of hiding long runs.
+
+    Tests use small fake ``Popen`` objects without a real stdout file descriptor;
+    those continue through ``communicate``. Real Docker harness runs get live
+    transcript output, so a long model call or tool command is visible while the
+    result log still captures the same text.
+    """
+    pipe = getattr(proc, "stdout", None)
+    if pipe is None or not hasattr(pipe, "fileno"):
+        stdout, _stderr = proc.communicate(timeout=timeout_seconds)
+        return stdout or ""
+
+    selector = selectors.DefaultSelector()
+    selector.register(pipe, selectors.EVENT_READ)
+    chunks: list[str] = []
+    deadline = start + timeout_seconds if timeout_seconds else None
+    last_heartbeat = start
+    pipe_closed = False
+    while not pipe_closed:
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            raise subprocess.TimeoutExpired(
+                cmd=getattr(proc, "args", "scripts/run_agent.sh"),
+                timeout=timeout_seconds,
+                output="".join(chunks),
+            )
+        events = selector.select(timeout=1.0)
+        if not events and proc.poll() is not None:
+            events = selector.select(timeout=0)
+        for key, _event in events:
+            data = os.read(key.fileobj.fileno(), 8192)
+            if data:
+                text = data.decode("utf-8", errors="replace")
+                chunks.append(text)
+                print(text, end="", flush=True)
+            else:
+                selector.unregister(key.fileobj)
+                key.fileobj.close()
+                pipe_closed = True
+        if now - last_heartbeat >= 60 and proc.poll() is None:
+            elapsed = int(now - start)
+            print(f"[benchmark-runner] harness subprocess still running: {elapsed}s elapsed.", flush=True)
+            last_heartbeat = now
+    proc.wait(timeout=5)
+    return "".join(chunks)
+
+
 def run_harness(
     repo_root: Path,
     config_path: Path,
@@ -297,12 +365,10 @@ def run_harness(
             env=env,
             start_new_session=True,
         )
-        stdout, _stderr = proc.communicate(timeout=timeout_seconds)
+        stdout = _stream_process_output(proc, timeout_seconds=timeout_seconds, start=start)
         return proc.returncode, time.monotonic() - start, stdout or ""
     except subprocess.TimeoutExpired as exc:
-        output = exc.stdout or ""
-        if isinstance(output, bytes):
-            output = output.decode("utf-8", errors="replace")
+        output = _timeout_output(exc)
         if proc is not None:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
@@ -320,6 +386,8 @@ def run_harness(
             )
             try:
                 more, _stderr = proc.communicate(timeout=5)
+                if isinstance(more, bytes):
+                    more = more.decode("utf-8", errors="replace")
                 output += more or ""
             except subprocess.TimeoutExpired:
                 try:
@@ -329,6 +397,8 @@ def run_harness(
                 except OSError:
                     proc.kill()
                 more, _stderr = proc.communicate(timeout=5)
+                if isinstance(more, bytes):
+                    more = more.decode("utf-8", errors="replace")
                 output += more or ""
         output += f"\n[BENCHMARK_TIMEOUT] harness task exceeded {timeout_seconds} seconds and was stopped.\n"
         return 124, time.monotonic() - start, output
@@ -487,7 +557,7 @@ def main() -> int:
 
     repo_root = REPO_ROOT
     suite_ids = load_suite_ids(repo_root / args.suites, args.suite)
-    tasks = select_tasks(load_tasks(repo_root / args.tasks), [*suite_ids, *args.task_id], args.limit)
+    tasks = select_tasks(load_tasks(repo_root / args.tasks), resolve_selection_ids(suite_ids, args.task_id), args.limit)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_dir = Path(args.output_dir) if args.output_dir else repo_root / "runs" / f"benchmarks-{stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)

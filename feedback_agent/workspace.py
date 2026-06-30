@@ -4,7 +4,7 @@ import json
 import re
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .bounds import run_bounded_process
 
@@ -88,13 +88,12 @@ def append_plan_note(workspace: Path, note: str, plan_filename: str = "PLAN.md")
         f.write(f"\n- {note.strip()}\n")
 
 
-def _json_object_candidates(text: str) -> list[str]:
+def _json_object_candidates(text: str) -> list[tuple[int, int, str]]:
     """Return balanced JSON-object-looking substrings from noisy model output."""
-    candidates: list[str] = []
-    start: int | None = None
-    depth = 0
+    candidates: list[tuple[int, int, str]] = []
     in_string = False
     escaped = False
+    starts: list[int] = []
     for index, char in enumerate(text):
         if in_string:
             if escaped:
@@ -108,15 +107,32 @@ def _json_object_candidates(text: str) -> list[str]:
             in_string = True
             continue
         if char == "{":
-            if depth == 0:
-                start = index
-            depth += 1
-            continue
-        if char == "}" and depth:
-            depth -= 1
-            if depth == 0 and start is not None:
-                candidates.append(text[start:index + 1])
-                start = None
+            starts.append(index)
+    for start in starts:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                depth += 1
+                continue
+            if char == "}" and depth:
+                depth -= 1
+                if depth == 0:
+                    candidates.append((start, index + 1, text[start:index + 1]))
+                    break
     return candidates
 
 
@@ -152,21 +168,34 @@ def extract_json_object(text: str) -> dict:
     # Qwen-family models often prepend reasoning even when asked for JSON.
     # We do not treat that as success, but the parser can still recover the
     # first complete object so the orchestration loop can keep moving.
-    parsed: list[dict] = []
-    for candidate in _json_object_candidates(stripped):
+    candidates = _json_object_candidates(stripped)
+    parsed: list[tuple[int, int, dict]] = []
+    for start, end, candidate in candidates:
         for variant in (candidate, _repair_common_model_json_escapes(candidate)):
             try:
                 value = json.loads(variant)
             except json.JSONDecodeError:
                 continue
             if isinstance(value, dict):
-                parsed.append(value)
+                parsed.append((start, end, value))
                 break
     if parsed:
         # Local models sometimes emit an initial JSON object, then say "wait"
         # and emit the corrected object. The last parseable object is usually
-        # the one the model intended us to use.
-        return parsed[-1]
+        # the one the model intended us to use. Ignore parseable nested objects
+        # even when the containing object failed to parse: accepting a nested
+        # planning_confirmation or command fragment as the phase payload silently
+        # corrupts the workflow state and hides the real malformed response.
+        top_level = [
+            item for item in parsed
+            if not any(
+                other_start < item[0] and item[1] < other_end
+                for other_start, other_end, _candidate in candidates
+            )
+        ]
+        if top_level:
+            return top_level[-1][2]
+        raise ValueError("Only nested JSON objects were parseable inside a malformed larger object.")
     raise ValueError(f"No JSON object found in model output: {text[:200]}")
 
 
@@ -210,6 +239,8 @@ def write_files(workspace: Path, files: list[dict]) -> list[str]:
             # single quotes, so serialize non-string content as real JSON.
             text = json.dumps(content, ensure_ascii=False, indent=2) + "\n"
         target.write_text(text, encoding="utf-8")
+        if text.startswith("#!"):
+            target.chmod(target.stat().st_mode | 0o111)
         written.append(str(rel))
     return written
 
@@ -223,10 +254,12 @@ def _command_parts_and_timeout(
 
     Most commands are simple argv lists. For long-running tools, a model may use
     {"cmd": [...], "timeout_seconds": 7200}; for expected negative-path tests,
-    it may also use {"cmd": [...], "expected_returncode": 2}. The harness clamps
-    timeouts so a typo cannot create an accidental infinite process. If a local
-    model returns a plain string despite the schema, split it as a shell-like
-    command but still execute it without a shell.
+    it may also use {"cmd": [...], "expected_returncode": 2}. Positive requested
+    timeouts are clamped by a positive max timeout. A requested/default timeout
+    of 0 disables the hard command deadline so progress review, not elapsed time
+    alone, decides whether the process should keep running. If a local model
+    returns a plain string despite the schema, split it as a shell-like command
+    but still execute it without a shell.
     """
     if isinstance(command, dict):
         parts = command.get("cmd") or command.get("command") or []
@@ -238,7 +271,12 @@ def _command_parts_and_timeout(
         expected_returncode = 0
     if isinstance(parts, str):
         parts = shlex.split(parts)
-    timeout = max(1, min(requested_timeout, max_timeout_seconds))
+    if requested_timeout <= 0:
+        timeout = 0
+    elif max_timeout_seconds <= 0:
+        timeout = requested_timeout
+    else:
+        timeout = max(1, min(requested_timeout, max_timeout_seconds))
     return [str(part) for part in parts], timeout, expected_returncode
 
 
@@ -295,6 +333,9 @@ def run_commands(
     max_timeout_seconds: int | None = None,
     allow_git_mutation: bool = False,
     output_limit_chars: int = 4000,
+    progress_callback: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+    progress_interval_seconds: int = 0,
+    progress_min_interval_seconds: int = 1,
 ) -> list[dict]:
     """Run bounded validation commands inside the workspace.
 
@@ -303,8 +344,8 @@ def run_commands(
     for useful critique.
     """
     results: list[dict] = []
-    max_timeout = max_timeout_seconds or timeout_seconds
-    for command in commands:
+    max_timeout = timeout_seconds if max_timeout_seconds is None else max_timeout_seconds
+    for index, command in enumerate(commands):
         if not command:
             continue
         parts, command_timeout, expected_returncode = _command_parts_and_timeout(command, timeout_seconds, max_timeout)
@@ -342,11 +383,21 @@ def run_commands(
                     "blocked_git_mutation": True,
                 })
                 continue
+        command_progress_callback = None
+        if progress_callback is not None:
+            def command_progress_callback(snapshot: dict[str, Any], *, command_index: int = index) -> dict[str, Any] | None:
+                snapshot = dict(snapshot)
+                snapshot["command_index"] = command_index
+                return progress_callback(snapshot)
+
         result = run_bounded_process(
             parts,
             cwd=workspace,
             timeout_seconds=command_timeout,
             output_limit_chars=output_limit_chars,
+            progress_callback=command_progress_callback,
+            progress_interval_seconds=progress_interval_seconds,
+            progress_min_interval_seconds=progress_min_interval_seconds,
         )
         result["expected_returncode"] = expected_returncode
         result["returncode_matches_expected"] = result["returncode"] == expected_returncode

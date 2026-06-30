@@ -64,7 +64,7 @@
       "category": "coding",
       "grading": "automatic",
       "prompt": "Build a Python module intervals.py with merge_intervals(pairs). It must merge closed integer intervals, validate start <= end, and include unit tests and README.",
-      "post_validation_commands": [["python", "-c", "from intervals import merge_intervals; assert merge_intervals([(5,7),(1,3),(2,6),(10,10)]) == [(1,7),(10,10)]"]]
+      "post_validation_commands": [["python", "-c", "from intervals import merge_intervals; normalize = lambda value: [tuple(pair) for pair in value]; assert normalize(merge_intervals([(5,7),(1,3),(2,6),(10,10)])) == [(1,7),(10,10)]; assert normalize(merge_intervals([(1,2),(2,3)])) == [(1,3)]; assert normalize(merge_intervals([(1,2),(3,4)])) == [(1,2),(3,4)]"]]
     },
     {
       "id": "code-004-config-normalizer",
@@ -92,7 +92,7 @@
       "category": "tool_periodic",
       "grading": "automatic",
       "prompt": "Build monitor_disk.sh and README.md. The script should check disk free space periodically with df, print one status line each interval, stop after a configurable number of checks, and write ACTION_REQUIRED when free percentage is below a threshold. It must support CHECK_INTERVAL_SECONDS, MAX_CHECKS, and MIN_FREE_PERCENT environment overrides so tests do not wait 30 seconds.",
-      "post_validation_commands": [["bash", "-lc", "CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=2 MIN_FREE_PERCENT=0 bash monitor_disk.sh | tee monitor.out && test $(grep -c 'check=' monitor.out) -eq 2"]]
+      "post_validation_commands": [["bash", "-lc", "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\" monitor.out' EXIT; printf '%s\\n' '#!/bin/sh' 'printf \"%s\\n\" \"Filesystem 1024-blocks Used Available Capacity Mounted on\" \"/dev/mock 1000 800 200 80% /\"' > \"$tmp/df\" && chmod +x \"$tmp/df\" && PATH=\"$tmp:$PATH\" CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=2 MIN_FREE_PERCENT=0 bash monitor_disk.sh | tee monitor.out && test \"$(wc -l < monitor.out)\" -eq 2 && PATH=\"$tmp:$PATH\" CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=1 MIN_FREE_PERCENT=90 bash monitor_disk.sh | grep -q ACTION_REQUIRED"]]
     },
     {
       "id": "tool-002-log-watch",
@@ -100,7 +100,7 @@
       "category": "tool_periodic",
       "grading": "automatic",
       "prompt": "Create watch_log.sh. It should tail a log file path, poll every configurable interval, remember the last checked line in .watch_state, and print TRIGGERED when a configurable pattern appears. Include README and a fast validation script.",
-      "post_validation_commands": [["bash", "-lc", "printf 'ok\\nALERT one\\n' > app.log && WATCH_INTERVAL_SECONDS=0 MAX_POLLS=1 PATTERN=ALERT bash watch_log.sh app.log | grep TRIGGERED"]]
+      "post_validation_commands": [["bash", "-lc", "printf 'ok\\nALERT one\\n' > app.log; for cmd in \"timeout 5s bash watch_log.sh -f app.log -p ALERT -i 1\" \"timeout 5s bash watch_log.sh app.log ALERT 1\" \"timeout 5s bash watch_log.sh app.log --pattern ALERT --interval 1\" \"timeout 5s bash watch_log.sh app.log -p ALERT -i 1\" \"LOG_FILE=app.log PATTERN=ALERT INTERVAL=1 timeout 5s bash watch_log.sh\" \"WATCH_PATTERN=ALERT timeout 5s bash watch_log.sh app.log\"; do rm -f .watch_state; if eval \"$cmd\" | grep -m1 TRIGGERED; then exit 0; fi; done; exit 1"]]
     },
     {
       "id": "tool-003-output-truncation",
@@ -115,8 +115,8 @@
       "title": "Timeout friendly command",
       "category": "tool_safety",
       "grading": "automatic",
-      "prompt": "Create wait_for_file.py. It should poll for a file until timeout_seconds, print periodic status, and exit 0 when the file appears or 2 on timeout. Include tests that complete quickly.",
-      "post_validation_commands": [["python", "-c", "import subprocess,sys; r=subprocess.run([sys.executable,'wait_for_file.py','missing.file','--timeout-seconds','0.1','--interval-seconds','0.02'], text=True, capture_output=True); assert r.returncode==2 and 'timeout' in (r.stdout+r.stderr).lower()"]]
+      "prompt": "Create wait_for_file.py. It should poll for a file path until --timeout-seconds expires, sleep --interval-seconds between checks, print periodic status, and exit 0 when the file appears or 2 on timeout. Include tests that complete quickly and prove a file created after startup is detected.",
+      "post_validation_commands": [["python", "-c", "import pathlib,shutil,subprocess,sys,tempfile,threading,time; td=tempfile.mkdtemp(); p=pathlib.Path(td)/'appears.txt'; timer=threading.Timer(0.05, lambda: p.write_text('ok')); timer.start(); r=subprocess.run([sys.executable,'wait_for_file.py',str(p),'--timeout-seconds','1','--interval-seconds','0.02'], text=True, capture_output=True); timer.join(); shutil.rmtree(td); assert r.returncode==0,(r.returncode,r.stdout,r.stderr); start=time.monotonic(); r=subprocess.run([sys.executable,'wait_for_file.py','missing.file','--timeout-seconds','0.1','--interval-seconds','0.02'], text=True, capture_output=True); elapsed=time.monotonic()-start; out=(r.stdout+r.stderr).lower(); assert r.returncode==2 and 'unrecognized' not in out and 'waiting' in out and elapsed>=0.05,(r.returncode,elapsed,out)"]]
     },
     {
       "id": "tool-005-curl-json-safety",
@@ -228,7 +228,7 @@
       "category": "tool_periodic",
       "grading": "automatic",
       "prompt": "Create watch_and_react.sh. It should check a file every interval and append a line to actions.log once a pattern appears. It must be testable with zero interval and bounded polls.",
-      "post_validation_commands": [["bash", "-lc", "printf READY > state.txt && WATCH_INTERVAL_SECONDS=0 MAX_POLLS=2 PATTERN=READY bash watch_and_react.sh state.txt && grep READY actions.log"]]
+      "post_validation_commands": [["bash", "-lc", "printf READY > state.txt && WATCH_INTERVAL_SECONDS=0 MAX_POLLS=2 PATTERN=READY timeout 5s bash watch_and_react.sh state.txt && grep READY actions.log"]]
     },
     {
       "id": "integration-001-mini-package",

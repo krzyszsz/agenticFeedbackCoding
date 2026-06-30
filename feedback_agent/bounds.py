@@ -6,7 +6,7 @@ import selectors
 import signal
 import subprocess
 import time
-from typing import Any
+from typing import Any, Callable
 
 
 def estimate_tokens(text: str) -> int:
@@ -34,6 +34,9 @@ def run_bounded_process(
     cwd: Path,
     timeout_seconds: int,
     output_limit_chars: int,
+    progress_callback: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+    progress_interval_seconds: int = 0,
+    progress_min_interval_seconds: int = 1,
 ) -> dict[str, Any]:
     """Run a subprocess while keeping only bounded stdout/stderr tails.
 
@@ -47,6 +50,10 @@ def run_bounded_process(
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     byte_counts = {"stdout": 0, "stderr": 0}
     timed_out = False
+    stopped_by_progress_review = False
+    progress_reviews: list[dict[str, Any]] = []
+    started = time.monotonic()
+    hard_timeout_seconds = timeout_seconds if timeout_seconds > 0 else None
 
     try:
         proc = subprocess.Popen(
@@ -64,7 +71,8 @@ def run_bounded_process(
             "stdout": "",
             "stderr": f"command not found: {exc.filename or command[0]}",
             "timed_out": False,
-            "timeout_seconds": timeout_seconds,
+            "timeout_seconds": hard_timeout_seconds,
+            "hard_timeout_disabled": hard_timeout_seconds is None,
             "stdout_truncated": False,
             "stderr_truncated": False,
             "stdout_bytes": 0,
@@ -77,7 +85,8 @@ def run_bounded_process(
             "stdout": "",
             "stderr": f"command not executable: {exc.filename or command[0]}",
             "timed_out": False,
-            "timeout_seconds": timeout_seconds,
+            "timeout_seconds": hard_timeout_seconds,
+            "hard_timeout_disabled": hard_timeout_seconds is None,
             "stdout_truncated": False,
             "stderr_truncated": False,
             "stdout_bytes": 0,
@@ -88,7 +97,10 @@ def run_bounded_process(
     assert proc.stderr is not None
     selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
     selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
-    deadline = time.monotonic() + timeout_seconds
+    deadline = started + timeout_seconds if hard_timeout_seconds is not None else None
+    progress_interval = max(0, progress_interval_seconds)
+    min_progress_interval = max(1, progress_min_interval_seconds)
+    next_progress_review = started + progress_interval if progress_callback and progress_interval else None
     killed_process_group = False
     force_close_deadline: float | None = None
 
@@ -108,6 +120,76 @@ def run_bounded_process(
             if proc.poll() is None:
                 proc.kill()
 
+    def decoded_tail(stream_name: str) -> str:
+        text = buffers[stream_name].decode("utf-8", errors="replace")
+        if byte_counts[stream_name] > output_limit_bytes:
+            return f"[{stream_name} truncated for progress review: kept last {output_limit_bytes} of {byte_counts[stream_name]} bytes]\n{text}"
+        return text
+
+    def progress_snapshot(now: float, review_count: int) -> dict[str, Any]:
+        return {
+            "command": command,
+            "cwd": str(cwd),
+            "elapsed_seconds": round(now - started, 3),
+            "timeout_seconds": hard_timeout_seconds,
+            "hard_timeout_disabled": hard_timeout_seconds is None,
+            "review_count": review_count,
+            "returncode": proc.poll(),
+            "stdout": decoded_tail("stdout"),
+            "stderr": decoded_tail("stderr"),
+            "stdout_bytes": byte_counts["stdout"],
+            "stderr_bytes": byte_counts["stderr"],
+            "stdout_truncated": byte_counts["stdout"] > output_limit_bytes,
+            "stderr_truncated": byte_counts["stderr"] > output_limit_bytes,
+        }
+
+    def normalize_progress_decision(decision: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(decision, dict):
+            decision = {}
+        normalized = dict(decision)
+        raw_decision = str(normalized.get("decision") or normalized.get("status") or "continue").strip().lower()
+        if raw_decision in {"stop", "stopped", "terminate", "terminated", "kill", "cancel"}:
+            raw_decision = "terminate"
+        elif raw_decision != "continue":
+            raw_decision = "continue"
+        normalized["decision"] = raw_decision
+        try:
+            next_check = int(normalized.get("next_check_seconds", progress_interval or min_progress_interval))
+        except (TypeError, ValueError):
+            next_check = progress_interval or min_progress_interval
+        normalized["next_check_seconds"] = max(min_progress_interval, next_check)
+        if not normalized.get("summary"):
+            normalized["summary"] = (
+                "Progress reviewer requested termination."
+                if raw_decision == "terminate"
+                else "Progress reviewer allowed the command to continue."
+            )
+        return normalized
+
+    def maybe_run_progress_review(now: float) -> None:
+        nonlocal killed_process_group, force_close_deadline, next_progress_review, stopped_by_progress_review
+        if progress_callback is None or next_progress_review is None:
+            return
+        if killed_process_group or proc.poll() is not None or now < next_progress_review:
+            return
+        snapshot = progress_snapshot(now, len(progress_reviews) + 1)
+        try:
+            decision = normalize_progress_decision(progress_callback(snapshot))
+        except Exception as exc:  # pragma: no cover - defensive boundary around optional reviewer code.
+            decision = normalize_progress_decision({
+                "decision": "continue",
+                "summary": f"Progress review failed, so the harness kept draining the running command: {exc}",
+                "review_error": repr(exc),
+            })
+        progress_reviews.append(decision)
+        if decision["decision"] == "terminate":
+            stopped_by_progress_review = True
+            killed_process_group = True
+            force_close_deadline = time.monotonic() + 1.0
+            kill_process_group(signal.SIGTERM)
+            return
+        next_progress_review = time.monotonic() + int(decision["next_check_seconds"])
+
     def cleanup_process_group() -> None:
         """Clean up descendants left behind by shells or validation scripts.
 
@@ -123,11 +205,12 @@ def run_bounded_process(
 
     while selector.get_map():
         now = time.monotonic()
-        if not killed_process_group and now >= deadline:
+        if deadline is not None and not killed_process_group and now >= deadline:
             timed_out = True
             killed_process_group = True
             force_close_deadline = now + 1.0
             kill_process_group(signal.SIGKILL)
+        maybe_run_progress_review(now)
         if force_close_deadline is not None and now >= force_close_deadline:
             for key in list(selector.get_map().values()):
                 stream = key.fileobj
@@ -162,15 +245,25 @@ def run_bounded_process(
         stdout = f"[stdout truncated: kept last {output_limit_bytes} of {byte_counts['stdout']} bytes]\n{stdout}"
     if stderr_truncated:
         stderr = f"[stderr truncated: kept last {output_limit_bytes} of {byte_counts['stderr']} bytes]\n{stderr}"
+    if stopped_by_progress_review:
+        summaries = "; ".join(str(item.get("summary", "")) for item in progress_reviews[-3:] if item.get("summary"))
+        marker = "[command stopped by progress review]"
+        if summaries:
+            marker += f" {summaries}"
+        stderr = (stderr + "\n" + marker).strip()
     return {
         "command": command,
-        "returncode": 124 if timed_out else returncode,
+        "returncode": 125 if stopped_by_progress_review else 124 if timed_out else returncode,
         "stdout": stdout,
         "stderr": stderr,
         "timed_out": timed_out,
-        "timeout_seconds": timeout_seconds,
+        "timeout_seconds": hard_timeout_seconds,
+        "hard_timeout_disabled": hard_timeout_seconds is None,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
         "stdout_bytes": byte_counts["stdout"],
         "stderr_bytes": byte_counts["stderr"],
+        "stopped_by_progress_review": stopped_by_progress_review,
+        "progress_reviews": progress_reviews,
     }

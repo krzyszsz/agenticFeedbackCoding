@@ -70,6 +70,36 @@ class Conversation:
         if self.echo:
             self._print_turn(turn)
 
+    def replace_last_turn(self, *, role: str, content_prefix: str, new_content: str) -> bool:
+        """Replace the active-context copy of the latest turn when it is unsafe.
+
+        The append-only full transcript remains the audit log. The compact active
+        transcript is allowed to replace pathological content with a bounded note
+        so later model calls do not inherit malformed or repetitive output.
+        """
+        if not self.turns:
+            return False
+        latest = self.turns[-1]
+        if latest.role != role or not latest.content.startswith(content_prefix):
+            return False
+        self.turns[-1] = Turn(role=role, content=new_content)
+        self._write_turns(self.path, self.turns)
+        if self.full_path and self.full_path != self.path:
+            self._append_turn_to_path(
+                self.full_path,
+                Turn(
+                    role="system",
+                    content=(
+                        "ACTIVE_CONTEXT_TURN_REPLACED: the latest active-context turn was "
+                        "rewritten with a bounded recovery note. The original turn remains "
+                        "earlier in this append-only full transcript."
+                    ),
+                ),
+            )
+        if self.echo:
+            self._print_turn(self.turns[-1])
+        return True
+
     def messages(self, *, system_as_user: bool = False) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
         for turn in self.turns:
@@ -83,7 +113,8 @@ class Conversation:
         return max(1, sum(estimate_tokens(t.content) for t in self.turns))
 
     def replace_with_memory(self, memory: str, keep_recent_turns: int) -> None:
-        recent = self.turns[-keep_recent_turns:] if keep_recent_turns > 0 else []
+        raw_recent = self.turns[-keep_recent_turns:] if keep_recent_turns > 0 else []
+        recent = [turn for turn in raw_recent if turn.role != "system"]
         memory_turn = Turn(
             role="system",
             content=(
