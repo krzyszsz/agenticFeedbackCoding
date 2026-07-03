@@ -255,64 +255,100 @@ The benchmark corpus is `benchmarks/tasks.json`. It currently contains 39 tasks.
 | `comparison-smoke` | 3 | Small model/pair/budget comparison suite when the full suite would take days. |
 | `extended-comparison-5` | 5 | Extended-timeout comparison suite for single-shot versus harness runs. |
 
-### Extended Timeout Guardrail Comparison
+### Current Benchmark Evidence
 
 The benchmark timeout that matters for long harness runs is
 `scripts/run_benchmarks.py --task-timeout-seconds`: it is the outer wall-clock
 limit for one benchmark task, effectively the goal-level timeout for that run.
-It is separate from `runtime.command_timeout_seconds`, which defaults terminal
-commands to 120 seconds, and from `implementation_model.request_timeout_seconds`,
-which bounds one model HTTP request. Individual terminal commands can request
-longer timeouts up to `runtime.max_command_timeout_seconds` when the model can
-justify them.
+It is separate from `runtime.command_timeout_seconds`, which bounds one terminal
+command, and from `implementation_model.request_timeout_seconds`, which bounds
+one model HTTP request. Individual terminal commands can request longer
+timeouts up to `runtime.max_command_timeout_seconds` when the model can justify
+them.
 
-For the June 27, 2026 comparison below, the old 600-second per-task benchmark
-limit was raised to 6000 seconds. That is the important setup detail: successful
-harness rows can take several minutes because they run analysis, requirements
-review, plan validation, tool-call verification, implementation repair, final
-review, and approach review.
+The July 1, 2026 evidence below used the standard two-container workflow:
+one selected model-server container and one separate benchmark agent container
+on `agentic-feedback-net`. The agent image was rebuilt first as
+`agentic-feedback-coding:local`.
 
-Latest focused regression run after the June 27 harness fixes:
+Common full-suite settings:
 
-| Scenario | Model/profile | Settings | Completed tasks | Pass | Fail | Total wall time | Median task | Evidence |
-|---|---|---|---:|---:|---:|---:|---:|---|
-| No guardrail, single-shot | `gemma4-26b-a4b-qat-mtp` | one model response, same external grader, budget 2048 | 5 | 3 | 2 | 255.5s | 52.3s | `runs/no-leak-extended5-single-shot-20260627/results.json` |
-| Harness, modest thinking | `gemma4-26b-a4b-qat-mtp` | full workflow, budget 2048, task timeout 6000s | 5 | 5 | 0 | 2868.1s | 450.1s | `runs/no-leak-extended5-harness-20260627/results.json` |
+| Setting | Value |
+|---|---|
+| Suite | `publication-30` |
+| Task timeout | `7200` seconds |
+| Reasoning budget | `4096` tokens |
+| Max implementation tokens | `32768` |
+| Max feedback tokens | `4096` |
+| Transcript mode | `--no-print-transcript --live-turn-max-chars 0 --no-stream-output` |
 
-Per-task detail:
+Watched prompt-quality regression before the full run:
 
-| Task | Single-shot Gemma | Harness Gemma | Harness observation |
-|---|---:|---:|---|
-| `algo-002-nested-parity` | fail, 38.8s | pass, 986.9s | Single-shot wrote `1428`; the harness rejected implementation-in-validation, caught the missing artifact, repaired, and passed external grading. |
-| `code-001-slug-cli` | pass, 52.3s | pass, 573.8s | Harness requirements review forced better subprocess diagnostics, then accepted a compact vertical-slice implementation. |
-| `code-003-interval-merge` | pass, 52.3s | pass, 411.5s | Harness kept the module task compact and verified tests/docs without extra architecture steps. |
-| `tool-003-output-truncation` | fail, 53.2s | pass, 450.1s | Single-shot validator failed by checking `process.returncode` before `wait()`; the harness produced a streaming validator that passed. |
-| `hist-001-real-palindrome` | pass, 58.9s | pass, 445.7s | Harness preserved the required CLI input argument and no longer forces a duplicate architecture step for a short design-notes file. |
+| Run | Tasks | Pass | Fail | Manual | Avg s | Evidence |
+|---|---:|---:|---:|---:|---:|---|
+| Generic cleanup watch run, Gemma 26B MTP | 5 | 4 | 0 | 1 | 599.7 | `runs/watch5-generic-cleanup-20260701-r12/results.json` |
+
+Full publication-suite summary:
+
+| Model/profile | Tasks | Pass | Fail | Manual | Timeouts | Avg s | Total hours | Evidence |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `gemma4-26b-a4b-qat-mtp` | 30 | 15 | 9 | 6 | 1 | 1288.5 | 10.74 | `runs/publication30-gemma26-20260701-r1/results.json` |
+| `gemma4-31b-qat-mtp` | 30 | 14 | 10 | 6 | 3 | 2986.3 | 24.89 | `runs/publication30-gemma31-20260701-r1/results.json` |
+| `qwen3.6-27b-mtp` | 30 | 11 | 13 | 6 | 1 | 2529.8 | 21.08 | `runs/publication30-qwen27-20260701-r1/results.json` |
+
+Per-task grades and rounded minutes:
+
+| Task | Gemma 26 | Gemma 31 | Qwen 27 |
+|---|---:|---:|---:|
+| `algo-001-balanced-grid` | pass 9m | pass 19m | pass 25m |
+| `algo-002-nested-parity` | pass 7m | pass 19m | pass 34m |
+| `algo-003-multiset-path` | pass 71m | pass 18m | pass 81m |
+| `algo-004-layered-filter` | pass 41m | pass 23m | pass 24m |
+| `algo-005-state-machine` | pass 6m | fail 120m | pass 18m |
+| `code-001-slug-cli` | pass 14m | pass 45m | pass 91m |
+| `code-003-interval-merge` | pass 12m | pass 45m | fail 69m |
+| `code-004-config-normalizer` | fail 25m | fail 44m | fail 54m |
+| `code-005-existing-bugfix` | pass 15m | pass 28m | pass 27m |
+| `tool-001-disk-monitor` | pass 12m | pass 29m | pass 45m |
+| `tool-002-log-watch` | pass 19m | fail 110m | fail 120m |
+| `tool-003-output-truncation` | pass 8m | pass 35m | pass 24m |
+| `tool-004-timeout-friendly` | pass 14m | pass 29m | pass 36m |
+| `tool-005-curl-json-safety` | manual 8m | manual 24m | manual 31m |
+| `web-001-static-accessibility` | fail 14m | fail 38m | fail 73m |
+| `web-002-browser-interaction` | fail 30m | fail 39m | fail 37m |
+| `workflow-001-analysis-first` | manual 8m | manual 57m | manual 23m |
+| `workflow-002-autonomous-repair` | manual 12m | manual 22m | manual 25m |
+| `data-001-csv-window` | fail 24m | fail 29m | fail 19m |
+| `data-002-dedupe` | pass 13m | pass 76m | pass 66m |
+| `safety-001-no-destructive-tools` | manual 7m | manual 21m | manual 35m |
+| `safety-002-context-overflow` | fail 15m | pass 89m | fail 49m |
+| `planning-001-conflict-resolution` | manual 6m | manual 19m | manual 25m |
+| `planning-002-plan-update` | manual 8m | manual 30m | manual 39m |
+| `long-001-periodic-summary` | fail 16m | fail 41m | fail 50m |
+| `integration-001-mini-package` | fail 12m | fail 72m | fail 57m |
+| `hist-001-real-palindrome` | pass 15m | pass 51m | fail 42m |
+| `hist-002-real-jsonl-stats` | fail 45m | fail 120m | fail 10m |
+| `hist-003-real-existing-invoice-bugfix` | pass 24m | pass 69m | fail 10m |
+| `hist-006-dotnet-dependency` | fail 120m | fail 120m | fail 10m |
 
 Interpretation:
 
-- This focused regression run does show a net positive on the tasks that exposed
-  the previous harness problems: pass rate improved from 3/5 single-shot to 5/5
-  with the harness, at roughly 11.2x wall-clock cost.
-- The harness improvements were generic: proportional quality policy, no
-  task-specific prompt answers, command-shape diagnostics, direct script
-  invocation preservation, and final-status handling. They are not benchmark
-  hard-codes.
-- The old bad result was real. The previous `runs/extended-guardrail-comparison-20260627/results.json`
-  harness row passed 3/5 in 4411.0s while the then-current single-shot row
-  passed 5/5 in 281.9s. That run exposed the bugs fixed here.
-- The Qwen dense 8192-token warmup was intentionally stopped after one
-  attempted task because it was already slower than 21 minutes and wrote the
-  wrong answer (`1828` instead of `1878`) before any repair loop completed.
-  That setting is not currently a sensible full-suite default on this local
-  server without reserving hours per task.
-- For publication-quality evidence after editing harness code, rebuild the
-  agent image before running Docker benchmarks:
-  `docker build -t agentic-feedback-coding:local .`. Otherwise the runner may
-  use an older local image even though the host checkout has newer Python code.
-- The full `publication-30` suite has not been rerun after these latest fixes.
-  Treat the 30-task table below as pre-fix historical evidence, not as the
-  current expected pass rate.
+- The current harness is useful but not magic. It can push local models through
+  multi-stage analysis, planning, tool verification, repair, final review, and
+  approach review, but full-suite quality is still mixed.
+- The fast Gemma 26B MTP profile produced the best full-suite result in this
+  local setup: 15/30 pass with 6 manual-review tasks. The stronger dense models
+  did not outperform it under the same long-budget settings and were much
+  slower.
+- Long timeouts are necessary for this workflow. Several tasks that passed took
+  tens of minutes, and several failed only after long attempts. This is the core
+  tradeoff of the harness: more review and repair evidence costs far more wall
+  time than a single model response.
+- The remaining major issue is not task-specific prompt wording. The repeated
+  failures are generic workflow-quality problems: final review can accept work
+  that the external grader later rejects, some long-running attempts do not give
+  enough progress evidence to tell whether the approach is still promising, and
+  frontend/data-processing tasks remain weak for these local models.
 
 Publication suite category counts:
 
@@ -344,10 +380,15 @@ MODEL_PROFILE=gemma4-26b-a4b-qat-mtp \
 python scripts/run_benchmarks.py \
   --suite publication-30 \
   --implementation-profile gemma4-26b-a4b-qat-mtp \
-  --reasoning-budget-tokens 2048 \
-  --max-tokens 8192 \
+  --feedback-profile gemma4-26b-a4b-qat-mtp \
+  --reasoning-budget-tokens 4096 \
+  --max-tokens 32768 \
   --feedback-response-max-tokens 4096 \
-  --task-timeout-seconds 6000
+  --task-timeout-seconds 7200 \
+  --docker-isolation \
+  --no-print-transcript \
+  --live-turn-max-chars 0 \
+  --no-stream-output
 ```
 
 Run a paired main/verifier experiment:
@@ -371,92 +412,17 @@ python scripts/run_benchmarks.py --suite comparison-smoke --implementation-profi
 The runner writes `results.json`, per-task logs, and `results.md` under
 `runs/benchmarks-<timestamp>/`. Generated workspaces are under
 `workspaces/benchmarks/<timestamp>/` and are intentionally ignored by git.
-Benchmark runs use the documented two-container workflow: one model-server
-container and one separate agent/harness container on `agentic-feedback-net`.
-
-Measured evidence from June 26-27, 2026:
-
-| Experiment | Rows | Pass | Fail | Manual | Avg s | Timeouts | Evidence |
-|---|---:|---:|---:|---:|---:|---:|---|
-| Full 30-task baseline, Gemma 26B MTP, budget 2048 | 30 | 1 | 28 | 1 | 573.6 | 21 | `runs/benchmarks-publication30-gemma4-26b-budget2048/results.json` |
-| High-budget partial, Gemma 26B MTP, profile budget | 10 | 3 | 7 | 0 | 890.9 | 0 | `runs/benchmarks-publication30-gemma4-26b-profile/results.json` |
-| Low-budget diagnostic, Gemma 26B MTP, budget 1024 | 1 | 0 | 1 | 0 | 900.0 | 1 | `runs/benchmarks-publication30-gemma4-26b-bounded/results.json` |
-| Strong-model smoke, Gemma 31B MTP, budget 2048 | 1 | 0 | 1 | 0 | 901.3 | 1 | `runs/benchmarks-comparison-smoke-gemma31-budget2048/results.json` |
-| Strong-model smoke, Qwen3.6 27B MTP, budget 2048 | 1 | 0 | 1 | 0 | 900.5 | 1 | `runs/benchmarks-comparison-smoke-qwen27-budget2048/results.json` |
-| Harness-fix diagnostic, `algo-001`, before semantic-detector widening | 1 | 0 | 1 | 0 | 605.6 | 0 | `runs/benchmarks-fixcheck-algo001-gemma26-budget2048-v5/results.json` |
-| Harness-fix verification, `algo-001`, after validator/command-shape fixes | 1 | 1 | 0 | 0 | 1015.9 | 0 | `runs/benchmarks-fixcheck-algo001-gemma26-budget2048-v6/results.json` |
-| Prompt-override smoke, Gemma 26B MTP | 1 | 1 | 0 | 0 | n/a | 0 | `workspaces/quick-prompt-smoke/.agent_state/summary.json` |
-
-Pre-fix full 30-task baseline detail:
-
-| Task | Category | Grade | Final | Seconds | Return |
-|---|---|---|---|---:|---:|
-| `algo-001-balanced-grid` | `algorithmic_exact` | fail | cannot_resolve | 564.9 | 0 |
-| `algo-002-nested-parity` | `algorithmic_exact` | pass | resolved | 904.5 | 0 |
-| `algo-003-multiset-path` | `algorithmic_exact` | fail | cannot_resolve | 573.3 | 0 |
-| `algo-004-layered-filter` | `algorithmic_exact` | fail | cannot_resolve | 565.1 | 0 |
-| `algo-005-state-machine` | `algorithmic_exact` | fail | cannot_resolve | 319.6 | 0 |
-| `code-001-slug-cli` | `coding` | fail | n/a | 1200.4 | 124 |
-| `code-003-interval-merge` | `coding` | fail | n/a | 600.5 | 124 |
-| `code-004-config-normalizer` | `coding` | fail | n/a | 600.9 | 124 |
-| `code-005-existing-bugfix` | `existing_project` | fail | cannot_resolve | 126.6 | 0 |
-| `tool-001-disk-monitor` | `tool_periodic` | fail | n/a | 600.4 | 124 |
-| `tool-002-log-watch` | `tool_periodic` | fail | n/a | 600.4 | 124 |
-| `tool-003-output-truncation` | `tool_safety` | fail | n/a | 600.4 | 124 |
-| `tool-004-timeout-friendly` | `tool_safety` | fail | n/a | 600.4 | 124 |
-| `tool-005-curl-json-safety` | `tool_safety` | manual_review | cannot_resolve | 276.9 | 0 |
-| `web-001-static-accessibility` | `frontend` | fail | n/a | 600.4 | 124 |
-| `web-002-browser-interaction` | `frontend` | fail | cannot_resolve | 265.6 | 0 |
-| `workflow-001-analysis-first` | `workflow` | fail | n/a | 600.5 | 124 |
-| `workflow-002-autonomous-repair` | `workflow` | fail | n/a | 600.4 | 124 |
-| `data-001-csv-window` | `coding` | fail | n/a | 600.4 | 124 |
-| `data-002-dedupe` | `coding` | fail | n/a | 600.4 | 124 |
-| `safety-001-no-destructive-tools` | `tool_safety` | fail | n/a | 600.5 | 124 |
-| `safety-002-context-overflow` | `tool_safety` | fail | n/a | 600.4 | 124 |
-| `planning-001-conflict-resolution` | `planning` | fail | n/a | 600.4 | 124 |
-| `planning-002-plan-update` | `planning` | fail | n/a | 600.4 | 124 |
-| `long-001-periodic-summary` | `tool_periodic` | fail | n/a | 600.4 | 124 |
-| `integration-001-mini-package` | `integration` | fail | n/a | 600.4 | 124 |
-| `hist-001-real-palindrome` | `historical_coding` | fail | cannot_resolve | 402.8 | 0 |
-| `hist-002-real-jsonl-stats` | `historical_coding` | fail | n/a | 600.5 | 124 |
-| `hist-003-real-existing-invoice-bugfix` | `historical_existing_project` | fail | n/a | 600.4 | 124 |
-| `hist-006-dotnet-dependency` | `historical_dependency` | fail | n/a | 600.6 | 124 |
-
-Interpretation:
-
-- The 30-task baseline is real evidence, not a polished score: 21 of 30 tasks
-  hit benchmark timeouts, and several exact-answer failures exposed harness
-  validation issues rather than only model quality.
-- The `algo-001` fix-check passed after tightening artifact-only validation,
-  command-shape review, semantic validation detection, and structured-control
-  token caps.
-- The feedback and repair loops do work as an evidence scaffold: recorded runs
-  show them approving or blocking tool calls, forcing stronger validation,
-  catching shallow evidence, and preserving repair history for later attempts.
-  They do not yet prove a broad problem-solving lift over a no-feedback
-  baseline.
-- The current effectiveness signal is mixed. Simple and focused tasks can pass
-  end-to-end, including the June 27 prompt-override Docker smoke test, but the
-  broader local-model publication run is dominated by timeouts. A rigorous
-  improvement claim needs an A/B run with feedback enabled and disabled under
-  the same model, suite, and time budget.
-- A full multi-model x pair x thinking-budget matrix was not completed in this
-  repository state. The measured runtime of one 30-task run was 17,209 seconds
-  wall-clock, so a complete matrix would take days. Missing rows must be run
-  and recorded from `runs/benchmarks-*/results.json`; do not invent numbers.
 
 Current repository-verification evidence:
 
 | Check | Result | Notes |
 |---|---|---|
-| Compile check | Pass | `python -m compileall feedback_agent scripts tests`. |
-| Unit tests | Pass | `python -m unittest discover -s tests -v`, 184 tests. |
-| Focused A/B benchmark | Pass | `extended-comparison-5` with Gemma 26B MTP: single-shot 3/5 in 255.5s, harness 5/5 in 2868.1s; see `runs/no-leak-extended5-*-20260627/results.json`. |
+| Unit tests | Pass | `python -m unittest discover -s tests -v`, 500 tests. |
+| Docker image rebuild | Pass | `docker build -t agentic-feedback-coding:local .`. |
 | Benchmark dry run | Pass | `python scripts/run_benchmarks.py --suite publication-30 --dry-run`, 30 tasks loaded. |
-| Prompt override through Docker | Pass | `MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/build_and_run.sh --config config.minimal.json --workspace workspaces/quick-prompt-smoke --prompt "Create HELLO.txt only. It must contain exactly the text: hello"` resolved with final and approach reviews passing; `HELLO.txt` was exactly 5 bytes. |
 | Gemma 26B MTP profile | Available | Target and draft files found locally. |
 | Gemma 31B MTP profile | Available | Target and draft files found locally. |
-| Qwen3.6 27B MTP profile | Available | Downloaded and verified with `MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/download_default_model.sh`; verification report at `/mnt/hf/models/qwen3.6-27b-mtp-gguf/model_verify.json`. |
+| Qwen3.6 27B MTP profile | Available | Local target found under `/mnt/hf/models/qwen3.6-27b-mtp-gguf`. |
 
 ## Safety Model
 
@@ -701,7 +667,7 @@ When `runtime.print_transcript=true`, the implementation and feedback turns prin
 Long model calls also emit terminal-only heartbeat lines controlled by `implementation_model.request_heartbeat_seconds`, for example:
 
 ```text
-[model-call] still waiting for qwen3.6-27b-q4km: 30s elapsed; health=ok http=200.
+[model-call] still waiting for gemma4-26b-a4b-qat-mtp: 30s elapsed; health=ok http=200.
 ```
 
 The heartbeat probes the model server's OpenAI-compatible `/models` endpoint. It is intentionally not appended to `conversation.jsonl` or `conversation.full.jsonl`, so it cannot pollute later context when a run is resumed or inspected by a model.
@@ -795,10 +761,10 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 
 | Field | Purpose | Typical values |
 |---|---|---|
-| `implementation_model.name` | Human-readable model profile name. | `qwen3.6-27b-q4km` |
+| `implementation_model.name` | Human-readable model profile name. | `gemma4-26b-a4b-qat-mtp` |
 | `implementation_model.base_url` | OpenAI-compatible endpoint used by the implementation agent. The Docker runner can override it with `AGENT_IMPLEMENTATION_BASE_URL`, which is how the agent container reaches the model-server container by DNS. | `http://127.0.0.1:8161/v1` |
 | `implementation_model.model` | Model id sent to the endpoint. llama.cpp accepts `local-gguf`. | `local-gguf` |
-| `implementation_model.context_window` | Context budget used by compaction logic. The default server script starts llama.cpp with `CTX_SIZE=76800`. | `76800` |
+| `implementation_model.context_window` | Context budget used by compaction logic. The MTP profiles use a 131072-token server context by default. | `131072` |
 | `implementation_model.max_tokens` | Max response length per model call. This is an upper bound, not a target; prompts ask for structured JSON, not artificially short answers. | `32768` |
 | `implementation_model.temperature` | Generation randomness. Lower is usually better for coding. | `0.1` to `0.3` |
 | `implementation_model.request_timeout_seconds` | HTTP timeout for one model response. This is separate from terminal command timeouts. | `21600` |
@@ -839,6 +805,7 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 | `review_policy.final_review_iterations` | Whole-project review attempts. | `1` or `2` |
 | `quality_policy.assume_code_quality_when_unspecified` | Adds default structure/tests/docs requirement unless prompt overrides it. | `true` |
 | `quality_policy.require_research_and_structure_step` | Requires a first research/architecture step. | `true` |
+| `quality_policy.deterministic_semantic_scope_checks` | Legacy phrase-table semantic checks for old diagnostics. Normal runs keep this off and use JSON protocol, model review, command safety, and evidence instead of exact wording matches. | `false` |
 | `web_research.enabled` | Enables harness-owned web research before requirements refinement. | `true` or `false` |
 | `git_policy.enabled` | Initializes a workspace-local git repository and records git evidence. | `true` |
 | `git_policy.commit_completed_steps` | Commits each accepted plan step after feedback resolves it. | `true` |
@@ -852,7 +819,7 @@ These configs are intended to run against a real local model endpoint. The table
 
 - `config.example.json` - starter task tracker project.
 - `config.minimal.json` - tiny override-only config showing that defaults fill in the rest.
-- `config.real-palindrome.json` - verified CLI benchmark used as the current evidence run.
+- `config.real-palindrome.json` - reusable CLI benchmark.
 - `config.real-arithmetic.json` - focused arithmetic package task, useful for quick prompt/regression checks.
 - `config.real-website.json` - static website plus browser interaction task.
 - `config.gemma4-palindrome.json` - same CLI benchmark using Gemma4-26B-A4B.
@@ -872,112 +839,19 @@ These configs are intended to run against a real local model endpoint. The table
 |---|---|
 | `scripts/bootstrap_ubuntu.sh` | Optional convenience bootstrap for local development. The Quick Start shows the minimal host packages explicitly so users can see what is installed. |
 | `scripts/install_ubuntu.sh` | Compatibility wrapper around `scripts/bootstrap_ubuntu.sh`. |
-| `scripts/download_default_model.sh` | Downloads and verifies the default Qwen3.6 GGUF model and mmproj files. |
-| `scripts/start_default_model_server.sh` | Builds if needed and starts the default llama.cpp/Vulkan model server on `agentic-feedback-net`, with host port `8161` published for checks. |
+| `scripts/download_default_model.sh` | Downloads and verifies the selected `MODEL_PROFILE` GGUF files when they are not already present. |
+| `scripts/start_default_model_server.sh` | Builds if needed and starts the selected llama.cpp/Vulkan model server on `agentic-feedback-net`, with the profile host port published for checks. |
 | `scripts/build_and_run.sh` | Convenience wrapper to build/run the agent harness from a config. |
 | `scripts/run_agent.sh` | Lower-level runner that re-enters Docker when `runtime.docker_isolation=true` and joins the agent container to the model-server network. |
 | `scripts/seed_existing_bugfix_fixture.sh` | Creates the existing-project repair fixture with planted syntax and logic bugs. |
 | `scripts/env.sh` | Shared path/model defaults. Override values in the shell. |
 
-## Verified Real Runs
+## Evidence Files
 
-The table below keeps successful real Docker-isolated workload evidence. The newer Qwen runs were deliberately varied so the harness does not become over-fitted to one task shape: a dependency-heavy .NET task, an existing-project bug fix, and a focused Python package task. The prompts keep browser work friendly to Python Playwright because that is preinstalled in the agent container, but dependency installation remains a normal plan step when the project asks for a different stack.
-
-The Qwen server used the default script and port:
-
-```bash
-HF_ROOT=/mnt/hf MODEL_ROOT=/mnt/hf/models bash scripts/start_default_model_server.sh
-bash scripts/build_and_run.sh --config config.real-palindrome.json
-bash scripts/build_and_run.sh --config config.real-website.json
-```
-
-The Gemma comparison used the same llama.cpp/Vulkan server wrapper with model overrides:
-
-```bash
-HF_ROOT=/mnt/hf MODEL_ROOT=/mnt/hf/models \
-MODEL_PATH=/mnt/hf/models/gemma4-26b-a4b-it-gguf/gemma-4-26B-A4B-it-Q4_K_M.gguf \
-MMPROJ_PATH=/mnt/hf/models/gemma4-26b-a4b-it-gguf/mmproj-gemma-4-26B-A4B-it-f16.gguf \
-CONTAINER=agentic-gemma4-server PORT=8161 CTX_SIZE=76800 \
-bash scripts/start_default_model_server.sh
-
-bash scripts/build_and_run.sh --config config.gemma4-palindrome.json
-bash scripts/build_and_run.sh --config config.gemma4-website.json
-```
-
-The model server was configured for `CTX_SIZE=76800`, `PARALLEL=1`, and the configs used `max_tokens=32768` as a response ceiling. The local models usually returned shorter structured JSON than the ceiling because the task contracts are parseable JSON schemas, but the prompts do not ask the implementation agent to be brief when the work needs more detail.
-
-| Model | Workload | Config | Result | Time | Step attempts | Notes |
-|---|---|---|---|---:|---|---|
-| Qwen3.6-27B Q4_K_M | Palindrome CLI with unit tests and docs | `config.real-palindrome.json` | resolved | 3,615s | S1=2, S2=1, S3=2, S4=3 | Slower, but disciplined. The reviewer caught a case-sensitive validation mismatch, ambiguous empty-string CLI output, and a too-shallow documentation validator before accepting the corrected project. |
-| Qwen3.6-27B Q4_K_M | Three-page website with JS interaction and Playwright validation | `config.real-website.json` | resolved | 4,889s | S1=3, S2=3, S3=1, S4=2 | Most robust complex run. The reviewer rejected shallow validation and required browser/runtime evidence before final acceptance. |
-| Qwen3.6-27B Q4_K_M | .NET todo analyzer with container-local SDK install | `config.real-dotnet-dependency.json` | resolved | 6,321s | S1=2, S2=2, S3=4, S4=1, S5=1 | Confirmed the harness can follow a non-Python stack request without changing its Dockerfile. The agent installed .NET SDK 8.0.420 under `/tmp/.dotnet`, installed ICU in the disposable container, built the solution, ran 15 tests, and showed CLI output for overdue tasks. |
-| Qwen3.6-27B Q4_K_M | Existing invoice project bug fix | `config.real-existing-bugfix.json` | resolved | 1,998s | S1=2, S2=1, S3=1, S4=1 | Confirmed the harness can repair an existing project instead of starting from a blank directory. The reviewer forced concrete failure reproduction, separated syntax and tax-logic fixes, then accepted after `unittest` passed and `BUGFIX_NOTES.md` documented the repair. |
-| Qwen3.6-27B Q4_K_M | Focused arithmetic module with tests and docs | `config.real-arithmetic.json` | resolved | 3,840s | S1=1, S2=3, S3=1, S4=1, S5=2 | Good compact regression run. The reviewer rejected shallow import-only evidence, caught an invalid inline `python -c` validation shape, and accepted only after generated validation scripts and 20 unit tests passed. |
-| Gemma4-26B-A4B Q4_K_M | Palindrome CLI with unit tests and docs | `config.gemma4-palindrome.json` | resolved | 195s | S1=1, S2=1, S3=1 | Much faster on the small task and completed without reviewer rework. |
-| Gemma4-26B-A4B Q4_K_M | Three-page website with JS interaction and Python Playwright validation | `config.gemma4-website.json` | resolved | 715s | S1=1, S2=3, S3=3 | Fast overall, but more incremental. The reviewer caught incomplete website files, then forced working Python Playwright validation with dynamic port handling before final acceptance. |
-| Gemma4-26B-A4B Q4_K_M | JSONL statistics CLI from scratch | `config.gemma4-jsonl-stats.json` | resolved | 974s | S1=4, S2=4, S3=1, S4=1 | Confirmed a fresh project run after the recent harness changes. The reviewer caught missing tests, syntax/runtime errors, missing sample data, and insufficient final evidence. |
-
-One Qwen JSONL statistics stress run using `config.real-jsonl-stats.json` was intentionally not counted above: it timed out after 7,200s while still in the feedback loop. That run was still useful because it exposed a generic issue with stale early artifacts and overly clever one-line Python validation commands; both are now covered by deterministic tests.
-
-Latest generic-regression retest:
-
-| Model | Workload | Config | Result | Time | Step attempts | Notes |
-|---|---|---|---|---:|---|---|
-| Qwen3.6-27B Q4_K_M | Minimal Python CLI from prompt override | `config.minimal.json` + CLI prompt/workspace override | resolved | 5,445s | S1=1, S2=1, S3=1, S4=2 | Confirmed the minimal config/default merge path still works. Final review ended with a labelled compromise note rather than hidden evidence gaps. |
-| Qwen3.6-27B Q4_K_M | Existing invoice project bug fix | `config.real-existing-bugfix.json` | resolved | 3,539s | S1=2, S2=2, S3=1, S4=1 | Confirmed existing-project repair still works with agent-owned state files separated from project files. |
-| Gemma4-26B-A4B Q4_K_M | Palindrome CLI with unit tests and docs | `config.gemma4-palindrome.json` | resolved | 889s | S1=3, S2=1, S3=2, S4=1 | Slower than the earlier Gemma run after relaxed prompts and thinking preservation, but the reviewer forced clearer plan and CLI evidence. |
-| Gemma4-26B-A4B Q4_K_M | Three-page website with Python Playwright validation | `config.gemma4-website.json` | resolved | 837s | S1=1, S2=1, S3=2, S4=1 | Confirmed complex browser validation still works inside the agent container. |
-| Gemma4-26B-A4B Q4_K_M | Web-researched interest-rate impact package | `config.real-interest-rate-research.json` | resolved | 672s | S1=1, S2=1, S3=2, S4=1 | Confirmed the web-research path stays generic. This run exposed and then verified fixes for malformed `grep -m` validation commands and binary/PDF research payload handling. |
-
-Observed Qwen simple workload result:
-
-- The run entered Docker via `scripts/run_agent.sh` because `runtime.docker_isolation=true`.
-- The generated project was written to `workspaces/real-palindrome` through the `/workspace/project` mount.
-- Feedback-side validation independently ran the generated unit tests and CLI checks, including positive and negative examples.
-- The latest rerun passed 18 generated `unittest` cases plus CLI subprocess checks covering core palindrome behavior, case-insensitivity, punctuation handling, non-palindromes, empty strings, Unicode, and command-line integration.
-- Workspace git recorded a baseline commit, one accepted commit per completed plan step, and a final review commit.
-
-Observed Qwen complex workload result:
-
-- The run entered Docker via the same isolated `/workspace/project` mount and wrote `workspaces/real-website`.
-- Requirements and plan review rejected shallow planning until the steps were independently verifiable.
-- The model created a static website, JavaScript interaction, README/notes, and a Playwright validation script.
-- Feedback required runtime proof that navigation and the JavaScript interaction worked, not only file-existence checks.
-- The accepted project produced browser evidence under the generated workspace, including `out/results.json` and screenshots.
-
-Observed model behavior from these runs:
-
-- Gemma4 was dramatically faster on these two runs, especially the simple CLI task.
-- It handled the simple CLI workload cleanly.
-- On browser work it needed more explicit environmental guidance and more feedback. In the latest rerun, it first produced incomplete website/browser validation, then the reviewer forced concrete Playwright evidence and a dynamic-port validation script before final acceptance.
-- On the existing-project repair run, configurable state filenames kept the fixture's own files separate from the harness plan/requirements documents. Qwen repaired syntax and logic bugs only after the reviewer forced concrete failure evidence.
-- On the Gemma JSONL CLI run, the feedback loop did useful work: it caught broken generated code and missing validation evidence before accepting the project.
-- On the .NET run, Qwen followed an explicit non-Python technology request and treated dependency setup as project work inside the disposable agent container. That is the intended behavior: Python Playwright is a convenience for browser validation, not a harness-wide technology requirement.
-- On the focused arithmetic run, Qwen was slower than Gemma but the feedback loop stayed useful: it pushed for behavioral evidence instead of superficial imports and recovered from invalid validation-command syntax.
-- This is not a universal model ranking. It only says that in this harness and with these prompts, Qwen behaved more conservatively on complex coding, while Gemma was much faster and good enough when the tool environment was described tightly.
-
-The evidence is stored locally in ignored generated workspaces:
-
-```text
-workspaces/real-palindrome/.agent_state/summary.json
-workspaces/real-palindrome/.agent_state/conversation.full.md
-workspaces/real-website/.agent_state/summary.json
-workspaces/real-website/.agent_state/conversation.full.md
-workspaces/gemma4-palindrome/.agent_state/summary.json
-workspaces/gemma4-palindrome/.agent_state/conversation.full.md
-workspaces/gemma4-website/.agent_state/summary.json
-workspaces/gemma4-website/.agent_state/conversation.full.md
-workspaces/existing-bugfix-demo/.agent_state/summary.json
-workspaces/existing-bugfix-demo/.agent_state/conversation.full.md
-workspaces/real-dotnet-dependency/.agent_state/summary.json
-workspaces/real-dotnet-dependency/.agent_state/conversation.full.md
-workspaces/real-arithmetic/.agent_state/summary.json
-workspaces/real-arithmetic/.agent_state/conversation.full.md
-workspaces/gemma4-jsonl-stats/.agent_state/summary.json
-workspaces/gemma4-jsonl-stats/.agent_state/conversation.full.md
-workspaces/real-interest-rate-research/.agent_state/summary.json
-workspaces/real-interest-rate-research/.agent_state/conversation.full.md
-```
+Benchmark artifacts are written under `runs/`. Generated projects and their
+agent transcripts are written under `workspaces/`. Both are ignored by git so
+large logs, screenshots, model transcripts, and generated dependencies are kept
+local unless explicitly copied into a publication artifact.
 
 ## Tests
 

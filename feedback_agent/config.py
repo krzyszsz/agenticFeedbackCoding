@@ -98,6 +98,7 @@ class ResolutionPolicy:
 class QualityPolicy:
     assume_code_quality_when_unspecified: bool
     require_research_and_structure_step: bool
+    deterministic_semantic_scope_checks: bool
 
 
 @dataclass(frozen=True)
@@ -224,6 +225,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "quality_policy": {
         "assume_code_quality_when_unspecified": True,
         "require_research_and_structure_step": True,
+        "deterministic_semantic_scope_checks": False,
     },
     "review_policy": {
         "hard_pushback_iterations": 3,
@@ -319,6 +321,7 @@ def _quality_policy(data: dict[str, Any]) -> QualityPolicy:
     return QualityPolicy(
         assume_code_quality_when_unspecified=bool(policy.get("assume_code_quality_when_unspecified", True)),
         require_research_and_structure_step=bool(policy.get("require_research_and_structure_step", True)),
+        deterministic_semantic_scope_checks=bool(policy.get("deterministic_semantic_scope_checks", False)),
     )
 
 

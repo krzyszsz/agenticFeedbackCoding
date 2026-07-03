@@ -227,8 +227,8 @@
       "title": "Watch and react",
       "category": "tool_periodic",
       "grading": "automatic",
-      "prompt": "Create watch_and_react.sh. It should check a file every interval and append a line to actions.log once a pattern appears. It must be testable with zero interval and bounded polls.",
-      "post_validation_commands": [["bash", "-lc", "printf READY > state.txt && WATCH_INTERVAL_SECONDS=0 MAX_POLLS=2 PATTERN=READY timeout 5s bash watch_and_react.sh state.txt && grep READY actions.log"]]
+      "prompt": "Create watch_and_react.sh. It should take the watched file path as its first argument, read PATTERN from the environment, check the file every WATCH_INTERVAL_SECONDS seconds, append a line containing the matched pattern to actions.log once the pattern appears, and stop after MAX_POLLS when that environment variable is set. It must be testable with WATCH_INTERVAL_SECONDS=0 and a bounded MAX_POLLS value.",
+      "post_validation_commands": [["bash", "-lc", "rm -f actions.log state.txt && printf READY > state.txt && WATCH_INTERVAL_SECONDS=0 MAX_POLLS=2 PATTERN=READY timeout 5s bash watch_and_react.sh state.txt && grep READY actions.log"]]
     },
     {
       "id": "integration-001-mini-package",

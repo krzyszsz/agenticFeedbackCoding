@@ -84,6 +84,8 @@ def benchmark_config(
     reasoning_budget_tokens: int | None,
     max_tokens: int,
     feedback_response_max_tokens: int,
+    print_transcript: bool,
+    live_turn_max_chars: int,
 ) -> dict[str, Any]:
     impl = resolve_profile(implementation_profile)
     feedback = resolve_profile(feedback_profile) if feedback_profile else None
@@ -113,8 +115,8 @@ def benchmark_config(
             "max_command_timeout_seconds": 21600,
             "command_progress_review_interval_seconds": 300,
             "command_progress_review_min_interval_seconds": 30,
-            "print_transcript": True,
-            "live_turn_max_chars": 20000,
+            "print_transcript": print_transcript,
+            "live_turn_max_chars": live_turn_max_chars,
             "final_summary": "compact",
             "feedback_response_max_tokens": feedback_response_max_tokens,
         },
@@ -285,6 +287,7 @@ def _stream_process_output(
     *,
     timeout_seconds: int | None,
     start: float,
+    stream_output: bool,
 ) -> str:
     """Stream real benchmark subprocess output instead of hiding long runs.
 
@@ -320,7 +323,8 @@ def _stream_process_output(
             if data:
                 text = data.decode("utf-8", errors="replace")
                 chunks.append(text)
-                print(text, end="", flush=True)
+                if stream_output:
+                    print(text, end="", flush=True)
             else:
                 selector.unregister(key.fileobj)
                 key.fileobj.close()
@@ -340,6 +344,7 @@ def run_harness(
     implementation_profile: str,
     feedback_profile: str | None,
     timeout_seconds: int | None,
+    stream_output: bool,
 ) -> tuple[int, float, str]:
     safe_stem = re.sub(r"[^a-zA-Z0-9_.-]+", "-", config_path.stem).strip("-")[:40] or "task"
     container_name = f"agentic-bench-{safe_stem}-{os.getpid()}-{int(time.time() * 1000) % 1000000}"
@@ -365,7 +370,12 @@ def run_harness(
             env=env,
             start_new_session=True,
         )
-        stdout = _stream_process_output(proc, timeout_seconds=timeout_seconds, start=start)
+        stdout = _stream_process_output(
+            proc,
+            timeout_seconds=timeout_seconds,
+            start=start,
+            stream_output=stream_output,
+        )
         return proc.returncode, time.monotonic() - start, stdout or ""
     except subprocess.TimeoutExpired as exc:
         output = _timeout_output(exc)
@@ -552,6 +562,9 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--task-timeout-seconds", type=int, default=0)
     parser.add_argument("--docker-isolation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--print-transcript", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--live-turn-max-chars", type=int, default=20000)
+    parser.add_argument("--stream-output", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -632,6 +645,8 @@ def main() -> int:
                 reasoning_budget_tokens=args.reasoning_budget_tokens,
                 max_tokens=args.max_tokens,
                 feedback_response_max_tokens=args.feedback_response_max_tokens,
+                print_transcript=args.print_transcript,
+                live_turn_max_chars=args.live_turn_max_chars,
             )
             write_config(config_path, cfg)
             returncode, elapsed, output = run_harness(
@@ -640,6 +655,7 @@ def main() -> int:
                 implementation_profile=args.implementation_profile,
                 feedback_profile=args.feedback_profile,
                 timeout_seconds=args.task_timeout_seconds or None,
+                stream_output=args.stream_output,
             )
         else:
             returncode, elapsed, output, single_shot_metadata = run_single_shot(

@@ -7,6 +7,22 @@ from .config import AgentConfig
 from .conversation import Conversation, Turn
 
 
+CONTROL_SCHEMA_PLACEHOLDER_VALUES = {
+    "review summary",
+    "whole project review",
+    "decision summary",
+    "verification summary",
+    "specific change",
+    "specific final change",
+    "specific analysis gap",
+    "specific analysis gap to fix",
+    "question",
+    "evidence",
+    "evidence reviewed",
+    "why continue or terminate",
+}
+
+
 def maybe_compact(
     conversation: Conversation,
     config: AgentConfig,
@@ -567,6 +583,9 @@ def latest_control_state(turns: list[Turn]) -> str:
 
 
 def _append_reviewer_state(lines: list[str], marker: str, content: str) -> None:
+    if _feedback_response_is_off_contract_for_control(content):
+        lines.append(f"- {marker} response is off-contract or incomplete; it is not an accepted workflow decision.")
+        return
     status = _extract_jsonish_value("status", content)
     needs_rework = _extract_jsonish_value("needs_rework", content)
     summary = _extract_jsonish_value("summary", content)
@@ -581,6 +600,18 @@ def _append_reviewer_state(lines: list[str], marker: str, content: str) -> None:
         lines.append(f"- {marker} is present in the recent transcript.")
     if summary:
         lines.append(f"- Reviewer summary: {_clip(summary, 500)}")
+
+
+def _feedback_response_is_off_contract_for_control(content: str) -> bool:
+    if not content.startswith("FEEDBACK_AGENT_RESPONSE:"):
+        return False
+    status = _extract_jsonish_value("status", content)
+    if not status:
+        return False
+    summary = _extract_jsonish_value("summary", content)
+    if not summary:
+        return True
+    return summary.strip().lower() in CONTROL_SCHEMA_PLACEHOLDER_VALUES
 
 
 def _latest_indexed_turn(
