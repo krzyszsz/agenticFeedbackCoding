@@ -131,7 +131,7 @@
       "title": "Accessible static page",
       "category": "frontend",
       "grading": "automatic",
-      "prompt": "Build a static index.html and style.css for a compact personal notes page. Include semantic landmarks, visible focus states, no external assets, and a Python validation script that checks structure.",
+      "prompt": "Build a static index.html and style.css for a compact personal notes page. Include semantic landmarks, visible focus states, no external assets, and a Python validation script named validate_site.py that checks structure.",
       "post_validation_commands": [["python", "validate_site.py"]]
     },
     {
@@ -171,7 +171,7 @@
       "title": "CSV rolling window",
       "category": "coding",
       "grading": "automatic",
-      "prompt": "Create rolling_average.py. It reads CSV with columns timestamp,value and prints a JSON list of 3-sample rolling averages rounded to 2 decimals. Include tests.",
+      "prompt": "Create rolling_average.py. It reads CSV with columns timestamp,value and prints a JSON list of 3-sample rolling averages rounded to 2 decimals, omitting rows until a full 3-sample window is available. Include tests.",
       "post_validation_commands": [["bash", "-lc", "printf 'timestamp,value\\n1,2\\n2,4\\n3,6\\n4,8\\n' > data.csv && test \"$(python rolling_average.py data.csv)\" = '[4.0,6.0]'"]]
     },
     {
@@ -219,8 +219,8 @@
       "title": "Periodic summary script",
       "category": "tool_periodic",
       "grading": "automatic",
-      "prompt": "Create periodic_summary.sh. It should run a command every interval, append timestamped output to a log, stop after MAX_CHECKS, and print a final summary. Defaults may be 30 seconds, but tests must override to zero.",
-      "post_validation_commands": [["bash", "-lc", "CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=3 COMMAND='printf ok' bash periodic_summary.sh | tee periodic.out && test $(grep -c ok periodic.out) -ge 3"]]
+      "prompt": "Create periodic_summary.sh. It should read COMMAND, CHECK_INTERVAL_SECONDS, and MAX_CHECKS from the environment, run COMMAND every interval, append timestamped output to a log, stop after MAX_CHECKS, and print a final summary. Defaults may be 30 seconds, but tests must override CHECK_INTERVAL_SECONDS to zero.",
+      "post_validation_commands": [["bash", "-lc", "rm -f periodic_summary.log periodic.out && CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=3 COMMAND='printf ok' bash periodic_summary.sh | tee periodic.out && test \"$(grep -c ok periodic_summary.log)\" -ge 3 && grep -q 'Summary: Completed 3 checks' periodic.out"]]
     },
     {
       "id": "long-002-watch-and-react",

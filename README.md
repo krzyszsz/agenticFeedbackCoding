@@ -282,6 +282,37 @@ Common full-suite settings:
 | Max feedback tokens | `4096` |
 | Transcript mode | `--no-print-transcript --live-turn-max-chars 0 --no-stream-output` |
 
+Watched failure-analysis run after the July 4, 2026 loop fixes:
+
+| Run | Tasks | Pass | Fail | Manual | Avg s | Evidence |
+|---|---:|---:|---:|---:|---:|---|
+| Gemma 26B MTP watched regression | 5 | 5 | 0 | 0 | 712.3 | `runs/minimal-flagged5-20260704-r12/results.md` |
+
+Tasks in that watched set:
+
+| Task | Grade | Seconds | What it exercised |
+|---|---|---:|---|
+| `code-004-config-normalizer` | pass | 795.6 | validation-command repair loops, exact stdout JSON, unit tests |
+| `web-001-static-accessibility` | pass | 404.3 | Docker post-validation with Python Playwright |
+| `data-001-csv-window` | pass | 622.7 | scalar JSON-list preservation and compact stdout |
+| `safety-002-context-overflow` | pass | 711.0 | bounded output/truncation documentation and Docker grading |
+| `long-001-periodic-summary` | pass | 1027.8 | long periodic shell workflow, env controls, log/stdout validation |
+
+Failure logs inspected during that run series are under
+`runs/minimal-flagged5-20260704-r4` through
+`runs/minimal-flagged5-20260704-r12`, with generated workspaces under
+`workspaces/benchmarks/20260704T*/harness/`. The common patterns were:
+validation-command shell/Python quoting loops, stale approach retries after a
+`resolved_with_compromise` plan result, scalar JSON-list requests drifting into
+wrapper objects, default `json.dumps` whitespace breaking compact stdout,
+unnamed documentation drifting to `DOCS.md` instead of conventional
+`README.md`, and two benchmark prompt/grader ambiguities that were clarified.
+The harness changes are generic: validation-command-only repair exhaustion can
+continue with fresh later evidence, compromise statuses no longer block phases,
+scalar JSON-list shape is checked in analysis and requirements with negation
+handling, compact JSON stdout source evidence catches default separators, and
+Docker post-validation runs inside the agent image.
+
 Watched prompt-quality regression before the full run:
 
 | Run | Tasks | Pass | Fail | Manual | Avg s | Evidence |
@@ -417,7 +448,7 @@ Current repository-verification evidence:
 
 | Check | Result | Notes |
 |---|---|---|
-| Unit tests | Pass | `python -m unittest discover -s tests -v`, 500 tests. |
+| Unit tests | Pass | `python -m unittest tests.test_feedback_agent`, 521 tests. |
 | Docker image rebuild | Pass | `docker build -t agentic-feedback-coding:local .`. |
 | Benchmark dry run | Pass | `python scripts/run_benchmarks.py --suite publication-30 --dry-run`, 30 tasks loaded. |
 | Gemma 26B MTP profile | Available | Target and draft files found locally. |

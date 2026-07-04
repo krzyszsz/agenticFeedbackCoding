@@ -167,6 +167,41 @@ observable behavior without making a hidden caller-visible promise.
 """
 
 
+REQUIREMENTS_SCOPE_PRESERVATION_GUIDANCE = """
+Requirements scope preservation:
+During requirements refinement, preserve explicit caller-visible names, data
+shapes, invocation surfaces, and output formats from the user's prompt. Do not
+turn a requested JSON list into wrapper objects, machine-readable stdout into
+pretty/human-readable output, a named setting or environment-style control into
+a different interface, or a named artifact into a different filename. If a
+documentation artifact is requested without a filename, prefer the conventional
+`README.md` unless the request points to a more specific document. Assumptions
+may fill gaps, but they must not replace explicit prompt words or create hidden
+caller-visible requirements.
+For generated CLIs, machine-readable stdout JSON should stay compact unless the
+user asks for pretty output. For scripts, uppercase controls named in the prompt
+should remain supported as environment variables or equivalent named controls,
+not be replaced by flags-only or positional-only interfaces. For validation
+scripts requested without an argument contract, provide a useful zero-argument
+bounded default.
+"""
+
+
+ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE = """
+Original-request fit check:
+Before accepting requirements, a plan, final output, or an approach decision,
+compare it to the original user prompt instead of only to the refined
+requirements or generated tests. Ask what a reasonable user would run, open,
+read, or parse without knowing the harness's internal assumptions. If the
+workflow invented a filename, required argument, output shape, artifact
+location, or validation-only interface that the prompt did not ask for, request
+a smaller compatibility repair, requirements correction, or plan correction
+instead of accepting the invented surface. If repeated repair cycles keep
+validating the invented surface rather than the user-facing one, consider
+whether to stop with an explicit compromise or retry from a corrected approach.
+"""
+
+
 ANALYSIS_CONTRACT = """
 Return strict JSON only:
 {
@@ -287,6 +322,11 @@ the current task and bounded by the configured workspace/tool policy.
 Commands are supplied as argv arrays, not through an outer harness shell. For
 `["bash", "-lc", "script"]`, the `script` value is one argument passed to bash;
 shell expansion inside that script is evaluated by that bash process.
+For validation commands that compare literal stdout or file content, check that
+regex tools are used safely: a literal structured-output pattern containing
+characters such as brackets or braces should use fixed-string matching, an exact
+captured-output comparison, or a small validator script instead of accidental
+regular-expression matching.
 Long-running commands are acceptable when their purpose, bounds, and observable
 progress are justified by the task. Prefer commands that emit useful progress
 or write bounded evidence, because the harness may ask a progress reviewer
@@ -315,7 +355,11 @@ do not reject it merely because this prompt asks you to challenge it. Compare th
 current evidence to the original request, named constraints, and plan state. If
 the current direction is still best, say why and continue. If evidence shows it
 is stale, wrong, unsafe, or under-verified, request the smallest useful change or
-a plan/approach update.
+a plan/approach update. If multiple repair cycles keep changing the same
+validation/protocol detail without improving the user-visible deliverable, ask
+whether the loop is still serving the original request. Prefer a simpler
+validation method, explicit compromise, or plan update over another near-identical
+retry.
 """
 
 
@@ -348,9 +392,14 @@ not enough. Generated tests and validators are evidence, not authority over the
 user's requested behavior. If a generated test expectation conflicts with the
 original request or accepted requirements, request validator/plan repair or
 requirements clarification; do not ask implementation to adopt test-only
-expanded semantics. Positive presence evidence is not enough when the request
-constrains count, absence, uniqueness, ordering, idempotence, or a one-time side
-effect; require validation that checks the relevant boundary.
+expanded semantics. A zero exit code proves only what the command actually
+checked; require evidence that would fail for a plausible wrong implementation
+of the requested user-visible behavior. Positive presence evidence is not enough
+when the request constrains count, absence, uniqueness, ordering,
+idempotence, or a one-time side effect; require validation that checks the
+relevant boundary. When exact stdout, compact machine-readable output, or a
+fixed file format is caller-visible, parsed-only checks can miss regressions;
+request at least one captured string or byte-level comparison for that surface.
 """
 
 
@@ -402,8 +451,10 @@ violating safety/workspace policy, or no longer useful for the current plan. If
 output is repetitive, compare it to the last review and ask whether it shows
 new useful progress, a stable wait state, or a repeated failure. If the command
 is still plausibly advancing toward the current plan, continue it and state the
-specific progress signal you relied on. If the right action is uncertain,
-continue and choose a context-appropriate
+specific progress signal you relied on. Heartbeats, health checks, elapsed
+time, and repeated generic log lines are observability, not task progress;
+treat them as weak evidence unless they are tied to a requested monitoring task.
+If the right action is uncertain, continue and choose a context-appropriate
 next_check_seconds.
 """ + REVIEW_DECISION_OUTPUT_GUIDANCE + JSON_OUTPUT_RULES + """
 """
@@ -433,6 +484,10 @@ Plan scope rules, in priority order:
 5. Do not invent public API details that the user did not specify. Preserve any
    explicit caller-visible shape, and otherwise validate behavior without
    unnecessary representation constraints.
+6. Validation for scripts, CLIs, validators, pages, documents, and generated
+   artifacts should include at least one check of the default or most likely
+   user-facing invocation, artifact path, or output surface implied by the
+   original prompt. Do not validate only a newly invented optional interface.
 """
 
 
@@ -444,6 +499,11 @@ Command and validation rules, in priority order:
    behavior constrains count, absence, uniqueness, ordering, idempotence, or
    one-time side effects, assert that boundary explicitly instead of only
    checking that some positive output exists.
+1.5. When stdout or file formatting is part of the caller-visible behavior, such
+   as exact stdout, compact machine-readable output, or a fixed file format,
+   include at least one captured string or byte-level comparison. Parsing JSON,
+   HTML, CSV, or text into an equivalent structure is useful but not sufficient
+   to prove the caller-visible formatting surface.
 2. Commands are data, not prose. Use a plain argv list for ordinary commands, or
    a command object with `cmd`, `expected_returncode`, and/or
    `timeout_seconds` when metadata is needed. The `cmd` value is always an argv
@@ -451,6 +511,10 @@ Command and validation rules, in priority order:
    expansion, pipes, redirects, or multi-command coordination are required; that
    script string is passed as a single argv item, not pre-expanded by the
    harness.
+2.5. Avoid fragile shell quoting in validation commands. If inline Python needs
+   JSON strings, dict/list literals, or nested quotes inside `bash -lc`, prefer a
+   quoted here-doc, temporary validator script, or direct argv-list `python -c`
+   command over repeatedly repairing escaped quotes.
 3. Expected failure checks must make the intended non-zero outcome explicit
    through `expected_returncode` or a wrapper that exits 0 only after confirming
    the intended failure. Do not hide assertion or child-command failures with
@@ -500,7 +564,7 @@ steps instead of creating many tiny steps. Every step must remain independently
 verifiable. Include enough detail for the implementation and feedback agents to
 make good decisions later; avoid filler and repetition, but do not omit important
 requirements just to make the response shorter.
-""" + SCOPE_BOUNDARY_GUIDANCE + PLAN_SCOPE_RULES + EXECUTABLE_DELIVERABLE_GUIDANCE + VALIDATION_COMMAND_RULES + JSON_OUTPUT_RULES + """
+""" + SCOPE_BOUNDARY_GUIDANCE + REQUIREMENTS_SCOPE_PRESERVATION_GUIDANCE + PLAN_SCOPE_RULES + EXECUTABLE_DELIVERABLE_GUIDANCE + VALIDATION_COMMAND_RULES + JSON_OUTPUT_RULES + """
 """
 
 
@@ -570,6 +634,13 @@ representation-neutral unless the prompt or supplied examples explicitly
 constrain caller-visible shape. If the current plan requires an unrequested
 public interface detail, request `needs_plan_change` instead of baking that
 detail into the implementation.
+For machine-readable stdout JSON, emit compact JSON without indentation or
+unsolicited spaces unless the user asks for pretty/human-readable output. For
+scripts, preserve uppercase controls named in the prompt as environment-variable
+inputs or support them in addition to flags and positional arguments. For
+validation scripts, if the user asks for a script that validates/runs a bounded
+case and does not specify required arguments, make the script runnable with no
+arguments using a small safe default.
 The `files` payload creates files, not empty directories. When a step requires
 directory scaffolding but no real source file belongs there yet, create a small
 placeholder such as `game/js/.gitkeep`, `game/css/.gitkeep`, or
@@ -2107,7 +2178,14 @@ class FeedbackLoopAgent:
         failure instead of drifting into implementation with stale or invalid
         control state.
         """
-        if self._status(result) == "resolved":
+        status = self._status(result)
+        if status in {"resolved", "resolved_with_compromise"}:
+            return None
+        if phase == "requirements" and self._requirements_validation_only_skip_can_continue(result):
+            self._append_plan_note(
+                "[requirements] continuing after validation-command-only retry exhaustion; "
+                "plan validation must repair or replace the recorded validation commands before implementation."
+            )
             return None
         resolution = result.get("resolution") if isinstance(result.get("resolution"), dict) else {}
         summary = (
@@ -2122,6 +2200,125 @@ class FeedbackLoopAgent:
             "phase_result": result,
             "last_review_summary": summary,
         }
+
+    def _requirements_validation_only_skip_can_continue(self, result: dict[str, Any]) -> bool:
+        """Let plan validation handle exhausted requirements validation-command repairs.
+
+        Requirements refinement can otherwise spend all attempts repairing only
+        reviewer-owned command syntax and then restart the whole approach, even
+        though the user-facing requirements are clear. Continue only when every
+        recorded unresolved change is plainly about validation command mechanics.
+        """
+        if self._status(result) != "skipped_with_note":
+            return False
+        iterations = result.get("iterations")
+        if not isinstance(iterations, list) or not iterations:
+            return False
+        last_review = iterations[-1].get("review") if isinstance(iterations[-1], dict) else None
+        if not isinstance(last_review, dict):
+            return False
+        return self._review_required_changes_are_validation_command_mechanics(last_review)
+
+    def _review_required_changes_are_validation_command_mechanics(self, review: dict[str, Any]) -> bool:
+        changes = [str(item).strip() for item in review.get("required_changes", []) if str(item).strip()]
+        return self._findings_are_validation_command_mechanics(changes)
+
+    @classmethod
+    def _findings_are_validation_command_mechanics(cls, findings: list[str]) -> bool:
+        """Return true only for findings about reviewer-owned validation mechanics.
+
+        This deliberately does not include scope, safety, output-shape, or
+        missing-deliverable findings. It is only used to stop repeated repairs
+        of brittle validation commands from blocking otherwise clear work.
+        """
+        normalized = [str(finding).strip().lower() for finding in findings if str(finding).strip()]
+        return bool(normalized) and all(cls._finding_is_validation_command_mechanic(item) for item in normalized)
+
+    @staticmethod
+    def _finding_is_validation_command_mechanic(finding: str) -> bool:
+        normalized = re.sub(r"\s+", " ", finding.lower()).strip()
+        text = f" {normalized} "
+        validation_markers = (
+            " validation ",
+            "validation command",
+            "validation_commands",
+            "shell syntax",
+            "shell parse",
+            "inline python",
+            "python -c",
+            "grep",
+            "pytest",
+            "test runner",
+            "workspace path",
+            "workspace source path",
+            "temporary command output",
+            "static parse check",
+            "static syntax check",
+            "unsupported assertion metadata",
+            "manual_test metadata",
+        )
+        return any(marker in text for marker in validation_markers)
+
+    def _validation_command_compromise_review(
+        self,
+        scope: str,
+        findings: list[str],
+        *,
+        status: str,
+    ) -> dict[str, Any]:
+        unique_findings: list[str] = []
+        for finding in findings:
+            if finding not in unique_findings:
+                unique_findings.append(finding)
+        return {
+            "status": status,
+            "needs_rework": False,
+            "summary": (
+                f"Repeated {scope} repairs are only changing validation-command mechanics. "
+                "Continue with the user-visible requirements and require fresh executable evidence later."
+            ),
+            "required_changes": unique_findings,
+            "cross_check_questions": [
+                "Is another validation-command repair actually improving the deliverable, or only repeating shell/quoting work?"
+            ],
+            "verification_evidence": [],
+        }
+
+    def _apply_validation_command_compromise_to_plan(self, review: dict[str, Any]) -> None:
+        """Remove only validation commands that deterministic checks can show are brittle.
+
+        Later implementation and review phases can still use fresh commands the
+        model actually runs, and those commands are verified before execution.
+        """
+        removed = 0
+        for step in self.plan_steps:
+            commands = list(step.get("validation_commands") or [])
+            kept_commands: list[Any] = []
+            removed_commands: list[Any] = []
+            for command in commands:
+                probe_step = dict(step)
+                probe_step["validation_commands"] = [command]
+                command_findings = self._validation_command_findings(probe_step)
+                if command_findings and self._findings_are_validation_command_mechanics(command_findings):
+                    removed_commands.append(command)
+                else:
+                    kept_commands.append(command)
+            if not removed_commands:
+                continue
+            removed += len(removed_commands)
+            step["validation_commands"] = kept_commands
+            notes = list(step.get("validation_notes") or [])
+            notes.append(
+                "Removed brittle planned validation command(s) after repeated validation-command-only repairs; "
+                "implementation and review must provide fresh executable evidence for this step."
+            )
+            step["validation_notes"] = notes
+        if removed:
+            self.requirements["plan"] = self.plan_steps
+            self._append_plan_note(
+                f"[plan] removed {removed} brittle planned validation command(s) after compromise: "
+                f"{review.get('summary', '')}"
+            )
 
     def _web_research_phase(self) -> dict[str, Any]:
         """Fetch external research when the user explicitly asks for it.
@@ -2283,6 +2480,12 @@ class FeedbackLoopAgent:
         else:
             findings.append("Analysis is missing analysis_quality.")
         findings.extend(self._analysis_internal_contradiction_findings(analysis))
+        if self._prompt_requests_scalar_json_list_stdout() and self._requirements_wrap_scalar_json_list(analysis):
+            findings.append(
+                "Analysis turns a requested JSON list of scalar values into wrapper objects or records. "
+                "Restate the caller-visible stdout shape from the prompt as list values directly, and leave "
+                "object fields such as timestamps out unless the original request explicitly asks for them."
+            )
         if self._legacy_semantic_phrase_checks_enabled():
             findings.extend(self._analysis_public_api_shape_findings(analysis))
             findings.extend(self._unrequested_scope_expansion_findings(analysis, source_label="Analysis"))
@@ -2561,12 +2764,22 @@ class FeedbackLoopAgent:
             self._write_plan_doc()
             review = self._requirements_review(index, latest)
             iterations.append({"iteration": index, "requirements": latest, "review": review})
-            if self._status(review) == "resolved":
+            review_status = self._status(review)
+            if review_status == "resolved" or (
+                review_status == "skipped_with_note"
+                and self._review_required_changes_are_validation_command_mechanics(review)
+            ):
                 self.last_requirements_review = {}
                 doc_review = self._requirements_review_for_doc(review)
                 self._write_requirements_doc(doc_review)
-                self._append_plan_note(f"[requirements] resolved after iteration {index}: {doc_review.get('summary', '')}")
-                return {"status": "resolved", "iterations": iterations}
+                if review_status == "skipped_with_note":
+                    self._append_plan_note(
+                        "[requirements] accepted with validation-command compromise after iteration "
+                        f"{index}: {doc_review.get('summary', '')}"
+                    )
+                else:
+                    self._append_plan_note(f"[requirements] resolved after iteration {index}: {doc_review.get('summary', '')}")
+                return {"status": review_status, "iterations": iterations}
             self.last_requirements_review = self._compact_review_for_transcript(review)
             self.conversation.append(
                 "user",
@@ -2605,7 +2818,8 @@ class FeedbackLoopAgent:
             else []
         )
         public_api_findings = self._public_api_overconstraint_findings(requirements) if semantic_phrase_checks else []
-        stdout_json_findings = self._stdout_json_format_requirements_findings(requirements) if semantic_phrase_checks else []
+        stdout_json_findings = self._stdout_json_format_requirements_findings(requirements)
+        documentation_filename_findings = self._documentation_filename_requirements_findings(requirements)
         script_invocation_findings = (
             self._script_direct_invocation_findings(
                 requirements=requirements,
@@ -2635,6 +2849,7 @@ class FeedbackLoopAgent:
             *computed_answer_findings,
             *public_api_findings,
             *stdout_json_findings,
+            *documentation_filename_findings,
             *script_invocation_findings,
             *plan_structural_findings,
         ]:
@@ -2659,6 +2874,12 @@ class FeedbackLoopAgent:
             },
         }
         if deterministic_findings:
+            if index > 1 and self._findings_are_validation_command_mechanics(deterministic_findings):
+                return self._validation_command_compromise_review(
+                    "requirements",
+                    deterministic_findings,
+                    status="skipped_with_note",
+                )
             return self._deterministic_requirements_review(deterministic_findings)
 
         raw = self._feedback_chat(
@@ -2685,7 +2906,7 @@ class FeedbackLoopAgent:
             "focus on semantic coverage, scope, and requirement clarity.\n"
                 "If WEB_RESEARCH_TOOL_RESULT has completed or partial sources, reject requirements that ignore those sources. "
                 "If web research is skipped or disabled, do not require cited source URLs; request available-knowledge notes instead.\n"
-                f"{_review_prompt_guidance()}\n"
+                f"{_review_prompt_guidance(ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE)}\n"
                 + json.dumps(prompt),
             temperature=0.1,
         )
@@ -2841,21 +3062,109 @@ class FeedbackLoopAgent:
         return []
 
     def _stdout_json_format_requirements_findings(self, requirements: dict[str, Any]) -> list[str]:
-        """Reject unrequested presentation formatting for machine-readable JSON stdout."""
+        """Reject unrequested shape or presentation changes for JSON stdout."""
+        findings: list[str] = []
+        if self._prompt_requests_scalar_json_list_stdout() and self._requirements_wrap_scalar_json_list(requirements):
+            findings.append(
+                "Requirements turn a requested JSON list of scalar values into wrapper objects or records. "
+                "Preserve the caller-visible stdout shape from the prompt: output the list values directly, "
+                "and only add object fields such as timestamps when the original request explicitly asks for them."
+            )
         if not self._prompt_requests_machine_json_stdout():
-            return []
-        if not any(
+            return findings
+        if any(
             self._requirement_string_adds_pretty_json_stdout(text)
             for text in self._requirements_stdout_format_scan_strings(requirements)
         ):
-            return []
-        return [
-            (
+            findings.append(
                 "Requirements add pretty-printing or indentation to machine-readable JSON stdout even though "
                 "the user did not request presentation formatting. Preserve the prompt-implied stdout data "
                 "contract with compact deterministic JSON, and validate stdout as the value the caller receives."
             )
+        return findings
+
+    def _prompt_requests_scalar_json_list_stdout(self) -> bool:
+        prompt = re.sub(r"\s+", " ", self.config.project_design.prompt.lower())
+        if "json" not in prompt or "list" not in prompt:
+            return False
+        if not any(marker in prompt for marker in ("stdout", "standard output", "prints", "print ", "writes")):
+            return False
+        for match in re.finditer(r"\bjson\s+list\s+of\b", prompt):
+            window = prompt[match.end(): match.end() + 140]
+            if any(marker in window for marker in ("object", "objects", "record", "records", "dict", "dictionary")):
+                continue
+            return True
+        return False
+
+    def _requirements_wrap_scalar_json_list(self, requirements: dict[str, Any]) -> bool:
+        for text in self._requirements_stdout_format_scan_strings(requirements):
+            lower = re.sub(r"\s+", " ", text.lower())
+            for match in re.finditer(r"\bjson\s+list\s+of\s+(?:objects|records|dicts|dictionaries)\b", lower):
+                if not self._object_list_shape_phrase_is_negated(lower, match.start(), match.end()):
+                    return True
+            for match in re.finditer(r"\blist\s+of\s+(?:objects|records|dicts|dictionaries)\b", lower):
+                if self._object_list_shape_phrase_is_negated(lower, match.start(), match.end()):
+                    continue
+                if any(marker in lower for marker in ("stdout", "output", "prints", "json")):
+                    return True
+        return False
+
+    @staticmethod
+    def _object_list_shape_phrase_is_negated(text: str, start: int, end: int) -> bool:
+        prefix = text[max(0, start - 80):start]
+        suffix = text[end:end + 80]
+        if re.search(r"\b(?:not|never|no|without)\b[^.;:\n]{0,50}$", prefix):
+            return True
+        if re.search(r"\b(?:rather than|instead of)\b[^.;:\n]{0,50}$", prefix):
+            return True
+        if re.search(r"^[^.;:\n]{0,50}\b(?:is not|are not|must not|should not)\b", suffix):
+            return True
+        return False
+
+    def _documentation_filename_requirements_findings(self, requirements: dict[str, Any]) -> list[str]:
+        """Reject invented documentation filenames when the prompt leaves it unnamed."""
+        if not self._prompt_requests_unnamed_documentation():
+            return []
+        paths = self._markdown_paths_in_value(requirements)
+        non_readme_docs = sorted(
+            path
+            for path in paths
+            if Path(path).name.lower() not in {"readme", "readme.md"}
+        )
+        if not non_readme_docs:
+            return []
+        return [
+            (
+                "Requirements or plan place unnamed documentation in "
+                f"{', '.join(non_readme_docs)}. The original request asked for documentation without naming a "
+                "file, so prefer the conventional `README.md` unless the prompt points to a more specific document."
+            )
         ]
+
+    def _prompt_requests_unnamed_documentation(self) -> bool:
+        prompt = re.sub(r"\s+", " ", self.config.project_design.prompt.lower())
+        if not any(marker in prompt for marker in ("document ", "documentation", "docs", "readme")):
+            return False
+        if re.search(r"\b[\w./-]+\.md\b", prompt) or "readme" in prompt:
+            return False
+        return True
+
+    @classmethod
+    def _markdown_paths_in_value(cls, value: Any) -> set[str]:
+        paths: set[str] = set()
+        if isinstance(value, dict):
+            for item in value.values():
+                paths.update(cls._markdown_paths_in_value(item))
+            return paths
+        if isinstance(value, list):
+            for item in value:
+                paths.update(cls._markdown_paths_in_value(item))
+            return paths
+        if not isinstance(value, str):
+            return paths
+        for match in re.finditer(r"\b[\w./-]+\.md\b", value, flags=re.IGNORECASE):
+            paths.add(match.group(0))
+        return paths
 
     def _prompt_requests_machine_json_stdout(self) -> bool:
         prompt = self.config.project_design.prompt.lower()
@@ -3958,10 +4267,13 @@ class FeedbackLoopAgent:
         for index in range(1, self.config.phases.plan_validation.max_iterations + 1):
             review = self._plan_validation_review(index)
             iterations.append({"iteration": index, "review": review, "plan": self.plan_steps})
-            if self._status(review) == "resolved":
+            status = self._status(review)
+            if status in {"resolved", "resolved_with_compromise"}:
+                if status == "resolved_with_compromise":
+                    self._apply_validation_command_compromise_to_plan(review)
                 self._append_plan_note(f"[plan] validated after iteration {index}: {review.get('summary', '')}")
                 self._write_plan_doc()
-                return {"status": "resolved", "iterations": iterations}
+                return {"status": status, "iterations": iterations}
             refined = self._plan_refinement_pass(index, review)
             iterations[-1]["refinement"] = refined
         fallback = self._fallback_resolution("plan", review)
@@ -3996,6 +4308,12 @@ class FeedbackLoopAgent:
             },
         }
         if structural_findings:
+            if index > 1 and self._findings_are_validation_command_mechanics(structural_findings):
+                return self._validation_command_compromise_review(
+                    "plan",
+                    structural_findings,
+                    status="resolved_with_compromise",
+                )
             return self._deterministic_plan_validation_review(structural_findings)
 
         raw = self._feedback_chat(
@@ -4007,7 +4325,7 @@ class FeedbackLoopAgent:
             "practical feasible verifiable plan. Per-attempt file-count guidance is not a plan-step limit. "
             "If deterministic_structural_findings is empty, do not invent command-syntax objections; "
             "focus on semantic coverage, scope, dependency order, and verifiability.\n"
-                f"{_review_prompt_guidance(PLAN_SCOPE_RULES, VALIDATION_COMMAND_RULES, self._execution_environment_guidance(), self._harness_state_file_guidance(), self._artifact_only_guidance())}\n"
+                f"{_review_prompt_guidance(PLAN_SCOPE_RULES, VALIDATION_COMMAND_RULES, ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE, self._execution_environment_guidance(), self._harness_state_file_guidance(), self._artifact_only_guidance())}\n"
             + json.dumps(prompt),
             temperature=0.1,
         )
@@ -4042,6 +4360,7 @@ class FeedbackLoopAgent:
             "each step has validation commands or an explicit non-command validation method",
             "validation commands terminate and assert behavior instead of starting a server forever",
             "validation evidence proves the requested behavior, not only superficial file existence or command success",
+            "validation includes the default or most likely user-facing invocation, artifact path, or output surface implied by the original prompt",
             "browser/UI steps have executable browser evidence such as Playwright, screenshots, or a validation report when web interaction tools are enabled",
             "browser/UI plans match the agent container tools; Python Playwright is available, but Node/npm/npx/@playwright/test are not available unless explicitly configured",
             "project deliverables must not be harness-owned state files such as PLAN.md, REQUIREMENTS.md, or RESEARCH.md",
@@ -4505,7 +4824,8 @@ class FeedbackLoopAgent:
             "against its acceptance criteria and test evidence. Use reviewer-owned validation results as primary "
                 "evidence. Do bounded sanity checks, but do not spend the review re-solving exact-answer tasks, "
                 "manually enumerating long candidate sets, or performing full arithmetic derivations. If proof is "
-                "weak, request stronger validation evidence instead.\n"
+                "weak, shallow, or only proves that a command exited successfully, request stronger validation evidence "
+                "instead.\n"
                 f"{_review_prompt_guidance()}\n"
                 + json.dumps(prompt),
             context_note=(
@@ -4568,7 +4888,24 @@ class FeedbackLoopAgent:
             iterations.append(item)
             corrections_used += 1
             attempt += 1
-        fallback = self._fallback_resolution("final review", iterations[-1]["review"] if iterations else {})
+        last_review = iterations[-1]["review"] if iterations else {}
+        protocol_compromise = self._final_review_protocol_failure_compromise(step_results, last_review)
+        if protocol_compromise:
+            iterations[-1]["protocol_compromise"] = protocol_compromise
+            self._append_plan_note(f"[final review] resolved_with_compromise: {protocol_compromise['summary']}")
+            self._write_plan_doc()
+            iterations[-1]["git_commit"] = self._git_commit_final_review()
+            self._record_effective_review_if_needed(
+                "FINAL_PROJECT_REVIEW_PHASE",
+                protocol_compromise,
+                reason="final_review_protocol_failure_compromise",
+            )
+            return {
+                "status": "resolved_with_compromise",
+                "iterations": iterations,
+                "resolution": protocol_compromise["resolution"],
+            }
+        fallback = self._fallback_resolution("final review", last_review)
         self._append_plan_note(f"[final review] {fallback['status']}: {fallback['note']}")
         final_review = {
             "status": fallback["status"],
@@ -4583,6 +4920,66 @@ class FeedbackLoopAgent:
             reason="bounded_final_review_resolution",
         )
         return {"status": fallback["status"], "iterations": iterations, "resolution": fallback}
+
+    def _final_review_protocol_failure_compromise(
+        self,
+        step_results: list[dict[str, Any]],
+        review: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self._is_reviewer_protocol_failure(review):
+            return None
+        if not step_results or any(str(item.get("status")) != "resolved" for item in step_results):
+            return None
+        if review.get("deterministic_evidence_findings"):
+            return None
+        if not self._final_feedback_evidence_all_passed(review.get("feedback_tool_evidence")):
+            return None
+        summary = (
+            "All plan steps and final validation commands passed, but the final-review model could not "
+            "return a parseable protocol response after repair. Keeping the verified result with an explicit "
+            "review-protocol compromise instead of restarting the whole approach."
+        )
+        resolution = {
+            "status": "resolved_with_compromise",
+            "note": summary,
+        }
+        return {
+            "status": "resolved_with_compromise",
+            "needs_rework": False,
+            "summary": summary,
+            "required_changes": [],
+            "verification_evidence": [
+                "Step reviews are resolved.",
+                "Final reviewer-owned validation commands passed.",
+                "Only the reviewer JSON protocol repair failed.",
+            ],
+            "resolution": resolution,
+            "review_protocol_error": True,
+        }
+
+    @staticmethod
+    def _is_reviewer_protocol_failure(review: dict[str, Any]) -> bool:
+        if review.get("review_protocol_error"):
+            return True
+        text = "\n".join([
+            str(review.get("summary") or ""),
+            "\n".join(str(item) for item in review.get("required_changes", []) or []),
+        ])
+        return "Reviewer protocol repair failed" in text or "reviewer response was malformed" in text
+
+    def _final_feedback_evidence_all_passed(self, evidence: Any) -> bool:
+        if not isinstance(evidence, dict):
+            return False
+        validation_groups = evidence.get("step_validations") or []
+        seen_result = False
+        for group in validation_groups:
+            for result in group.get("validation_results", []) or []:
+                seen_result = True
+                if result.get("timed_out") or result.get("stopped_by_progress_review"):
+                    return False
+                if not self._command_returncode_matches_expected(result):
+                    return False
+        return seen_result
 
     def _approach_review_phase(
         self,
@@ -4631,7 +5028,7 @@ class FeedbackLoopAgent:
                 "citation list: copy IDs from available_evidence exactly, and put interpretation in summary or "
                 "runbook_updates. Do not add new facts, manual derivations, calculations, or proof claims that "
                 "are not present in available_evidence.\n"
-                f"{_review_prompt_guidance()}\n"
+                f"{_review_prompt_guidance(ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE)}\n"
                 + json.dumps(prompt),
             context_note=(
                 "The full transcript remains in .agent_state/conversation.full.jsonl. "
@@ -4904,13 +5301,15 @@ class FeedbackLoopAgent:
             "review re-solving algorithmic tasks, re-deriving long calculations, or replacing missing validation "
             "with ad hoc scratch work. If validation only proves file shape, existence, or formatting when the "
                 "request needs semantic correctness, return needs_rework requesting stronger validation evidence. "
+                "Do the same when validation passes but would not fail for a plausible wrong implementation of the "
+                "requested user-visible behavior. "
                 "Treat project_design as the highest-priority scope source: if refined requirements, plan text, "
                 "documentation, tests, or code add behavior not present in the original request, request a "
                 "requirements or plan correction instead of accepting the broadened scope. "
                 "If a step accepted a compromise for a verifiable acceptance criterion, do not silently upgrade that "
                 "to resolved at final review; request the missing bounded evidence or a plan/requirements change. "
                 "Push back if the project lacks proof or contradicts requirements.\n"
-                f"{_review_prompt_guidance()}\n"
+                f"{_review_prompt_guidance(ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE)}\n"
                 + json.dumps(prompt),
             context_note=(
                 "The full multi-turn transcript is stored in .agent_state/conversation.full.jsonl. "
@@ -6780,6 +7179,9 @@ class FeedbackLoopAgent:
             grep_option_pattern_finding = self._grep_option_like_pattern_finding(raw_parts)
             if grep_option_pattern_finding:
                 findings.append(f"{step_id} validation {grep_option_pattern_finding}")
+            grep_literal_pattern_finding = self._grep_literal_regex_pattern_finding(raw_parts)
+            if grep_literal_pattern_finding:
+                findings.append(f"{step_id} validation {grep_literal_pattern_finding}")
             if self._looks_like_py_compile_directory_command(parts):
                 findings.append(
                     f"{step_id} validation uses `python -m py_compile` on a directory. "
@@ -6853,6 +7255,13 @@ class FeedbackLoopAgent:
                 findings.append(f"{step_id} validation {raw_numeric_comparison}")
             inline_python_syntax_error = self._inline_python_static_syntax_error(raw_parts)
             if inline_python_syntax_error:
+                shell_wrapped_hint = (
+                    " For shell-wrapped Python with JSON/dict literals or nested quotes, switch to a quoted "
+                    "here-doc, a temporary validator script, or a direct argv-list `python -c` command instead "
+                    "of trying another escaped-quote variant."
+                    if "shell-wrapped python -c" in inline_python_syntax_error
+                    else ""
+                )
                 findings.append(
                     f"{step_id} validation contains inline Python that fails a static syntax check: "
                     f"{inline_python_syntax_error}. Replace it with a simple argv check, a JSON-safe single-line "
@@ -6860,6 +7269,7 @@ class FeedbackLoopAgent:
                     "Do not put raw multiline Python inside a JSON command string. Simple semicolon-separated "
                     "imports, assignments, file reads, assertions, and print calls are allowed when they compile. "
                     "Never use `bash -c python -c ...` or split the shell script across argv elements."
+                    f"{shell_wrapped_hint}"
                 )
             inline_python_unreachable = self._inline_python_unreachable_after_return(raw_parts)
             if inline_python_unreachable:
@@ -9832,7 +10242,8 @@ class FeedbackLoopAgent:
                 "because it has been running for a while, and do not continue it just because an earlier model "
                 "asked for it. Stop only when the current evidence shows the command is wrong, unsafe, stuck in "
                 "a hopeless loop, waiting for unavailable input, or no longer useful. Otherwise continue and set "
-                "a sensible next_check_seconds.\n"
+                "a sensible next_check_seconds. Heartbeats, health checks, elapsed time, and repeated generic "
+                "log lines are observability, not task progress unless the user requested monitoring.\n"
                 f"{_review_prompt_guidance()}\n"
                 + json.dumps(prompt),
                 temperature=0.0,
@@ -10024,6 +10435,9 @@ class FeedbackLoopAgent:
             "argument is evaluated by that bash process, not pre-expanded by the harness. Deterministic findings are authoritative "
             "safety signals. `timeout_seconds: 0` is not a shortcut for ordinary commands; approve it only when "
             "open-ended monitoring is justified and the command exposes enough bounded output for progress review. "
+            "For literal stdout/file-content checks, block accidental regex validation: structured-output strings "
+            "containing brackets or braces should use fixed-string matching, exact captured-output comparison, or "
+            "a validator script. "
             "If context includes implementation-provided test_evidence, treat it as a model claim or intended "
             "validation unless matching command results already exist in the transcript; do not treat it as proof "
             "that the proposed command has already passed. Do not block a safe, bounded validation command merely "
@@ -10286,6 +10700,13 @@ class FeedbackLoopAgent:
                     "index": index,
                     "risk_level": "medium",
                     "reason": "Command " + grep_option_pattern_finding,
+                })
+            grep_literal_pattern_finding = self._grep_literal_regex_pattern_finding(parts)
+            if grep_literal_pattern_finding:
+                findings.append({
+                    "index": index,
+                    "risk_level": "medium",
+                    "reason": "Command " + grep_literal_pattern_finding,
                 })
             if self._timeout_wraps_shell_builtin_wait(parts):
                 findings.append({
@@ -12242,6 +12663,105 @@ class FeedbackLoopAgent:
                 break
         return ""
 
+    def _grep_literal_regex_pattern_finding(self, command: Any) -> str:
+        """Detect likely literal structured output matched as accidental regex."""
+        tokens = self._validation_command_tokens_for_similarity(command)
+        if not tokens:
+            return ""
+        separators = {"&&", "||", "|", ";", "then", "else", "elif", "fi", "do", "done"}
+        index = 0
+        while index < len(tokens):
+            if Path(str(tokens[index])).name != "grep":
+                index += 1
+                continue
+            command_tokens: list[str] = []
+            index += 1
+            while index < len(tokens) and str(tokens[index]) not in separators:
+                command_tokens.append(str(tokens[index]))
+                index += 1
+            if self._grep_command_uses_fixed_or_explicit_regex(command_tokens):
+                continue
+            patterns = self._grep_pattern_tokens(command_tokens)
+            if any(self._looks_like_literal_structured_grep_pattern(pattern) for pattern in patterns):
+                return (
+                    "uses `grep` regex matching for a literal structured-output pattern containing regex "
+                    "metacharacters. Use `grep -Fq`, an exact captured-output comparison, or a small validator "
+                    "script so brackets/braces are treated literally."
+                )
+        return ""
+
+    @classmethod
+    def _grep_command_uses_fixed_or_explicit_regex(cls, tokens: list[str]) -> bool:
+        for token in tokens:
+            if token in {"-F", "--fixed-strings", "-E", "--extended-regexp", "-P", "--perl-regexp"}:
+                return True
+            if token.startswith("--regexp="):
+                continue
+            if not token.startswith("-") or token == "-" or token == "--":
+                continue
+            option_letters = token[1:]
+            if option_letters and all(char.isalpha() for char in option_letters):
+                if any(char in option_letters for char in "FEP"):
+                    return True
+        return False
+
+    def _grep_pattern_tokens(self, tokens: list[str]) -> list[str]:
+        patterns: list[str] = []
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--":
+                if index + 1 < len(tokens):
+                    patterns.append(tokens[index + 1])
+                break
+            if token in {"-e", "--regexp"}:
+                if index + 1 < len(tokens):
+                    patterns.append(tokens[index + 1])
+                index += 2
+                continue
+            if token.startswith("--regexp="):
+                patterns.append(token.split("=", 1)[1])
+                index += 1
+                continue
+            option_arg_count = self._grep_option_argument_count(token)
+            if option_arg_count:
+                index += 1 + option_arg_count
+                continue
+            if self._grep_known_no_arg_option(token):
+                index += 1
+                continue
+            if token.startswith("-") and token != "-":
+                index += 1
+                continue
+            patterns.append(token)
+            break
+        return patterns
+
+    @staticmethod
+    def _looks_like_literal_structured_grep_pattern(pattern: str) -> bool:
+        stripped = pattern.strip()
+        if not stripped:
+            return False
+        starts_like_structured = stripped[0] in "{["
+        contains_json_quote = '"' in stripped and (":" in stripped or "," in stripped)
+        if not (starts_like_structured or contains_json_quote):
+            return False
+        return FeedbackLoopAgent._has_unescaped_regex_bracket(stripped)
+
+    @staticmethod
+    def _has_unescaped_regex_bracket(text: str) -> bool:
+        escaped = False
+        for char in text:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char in "[]":
+                return True
+        return False
+
     @staticmethod
     def _grep_option_consumes_pattern_argument(token: str) -> bool:
         return token in {"-e", "--regexp"} or token.startswith("--regexp=")
@@ -12922,6 +13442,12 @@ class FeedbackLoopAgent:
                     "machine-readable normalized JSON output without presentation formatting. Use compact "
                     "deterministic JSON for stdout unless the user explicitly asks for pretty output."
                 )
+            if self._source_uses_default_json_separators_for_stdout(content):
+                findings.append(
+                    f"{path} appears to emit JSON stdout with Python's default separators even though the "
+                    "prompt requests machine-readable compact JSON. Use compact separators such as "
+                    "`separators=(',', ':')` for caller-visible stdout unless the user explicitly asks for spaces."
+                )
         return findings
 
     @staticmethod
@@ -12937,6 +13463,23 @@ class FeedbackLoopAgent:
             "stdout",
         )
         return any(marker in lower for marker in stdout_markers)
+
+    @staticmethod
+    def _source_uses_default_json_separators_for_stdout(content: str) -> bool:
+        if "json.dumps" not in content and "json.dump" not in content:
+            return False
+        stdout_patterns = (
+            r"print\s*\(\s*json\.dumps\s*\(",
+            r"sys\.stdout\.write\s*\(\s*json\.dumps\s*\(",
+            r"json\.dump\s*\([^,\n]+,\s*sys\.stdout\b",
+        )
+        if not any(re.search(pattern, content) for pattern in stdout_patterns):
+            return False
+        compact_markers = (
+            "separators=",
+            "indent=",
+        )
+        return not any(marker in content for marker in compact_markers)
 
     def _artifact_only_workspace_findings(self, feedback_tool_evidence: dict[str, Any]) -> list[str]:
         if not self._explicit_artifact_only_constraint():

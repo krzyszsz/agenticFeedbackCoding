@@ -456,6 +456,54 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(cfg["phases"]["plan_validation"]["max_iterations"], 4)
             self.assertEqual(cfg["phases"]["implementation"]["max_iterations"], 9)
 
+    def test_benchmark_docker_post_validation_mounts_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            calls: list[dict[str, Any]] = []
+            original = run_benchmarks.run_bounded_process
+
+            def fake_run_bounded_process(command: list[str], **kwargs: Any) -> dict[str, Any]:
+                calls.append({"command": command, "kwargs": kwargs})
+                return {
+                    "command": command,
+                    "returncode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": False,
+                    "timeout_seconds": kwargs["timeout_seconds"],
+                    "hard_timeout_disabled": False,
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                    "stdout_bytes": 0,
+                    "stderr_bytes": 0,
+                }
+
+            try:
+                run_benchmarks.run_bounded_process = fake_run_bounded_process  # type: ignore[assignment]
+                grade = run_benchmarks.grade_task(
+                    workspace,
+                    {
+                        "grading": "automatic",
+                        "post_validation_commands": [["python", "validate_site.py"]],
+                    },
+                    repo_root=root,
+                    docker_post_validation=True,
+                    docker_image="agentic-feedback-coding:local",
+                )
+            finally:
+                run_benchmarks.run_bounded_process = original  # type: ignore[assignment]
+
+            self.assertEqual(grade["grade"], "pass")
+            self.assertTrue(grade["validation_results"][0]["ran_in_docker"])
+            docker_command = calls[0]["command"]
+            self.assertEqual(docker_command[:3], ["docker", "run", "--rm"])
+            self.assertIn(f"{workspace}:/workspace/project", docker_command)
+            self.assertIn("--entrypoint", docker_command)
+            self.assertIn("/usr/bin/env", docker_command)
+            self.assertEqual(docker_command[-3:], ["agentic-feedback-coding:local", "python", "validate_site.py"])
+
     def test_benchmark_result_matching_separates_direct_and_harness_modes(self) -> None:
         result = {
             "run_mode": "single-shot",
@@ -1083,9 +1131,20 @@ class FeedbackLoopAgentTests(unittest.TestCase):
         self.assertIn("Commands are data, not prose", VALIDATION_COMMAND_RULES)
         self.assertIn("one `bash -lc` script string", VALIDATION_COMMAND_RULES)
         self.assertIn("count, absence, uniqueness, ordering, idempotence", VALIDATION_COMMAND_RULES)
+        self.assertIn("captured string or byte-level comparison", VALIDATION_COMMAND_RULES)
+        self.assertIn("Avoid fragile shell quoting", VALIDATION_COMMAND_RULES)
+        self.assertIn("quoted here-doc", VALIDATION_COMMAND_RULES)
         self.assertNotIn("as `\n`", VALIDATION_COMMAND_RULES)
         self.assertNotIn("Comprehensions and generator expressions", VALIDATION_COMMAND_RULES)
         self.assertNotIn("Artifact-only prompts have a stricter command shape", VALIDATION_COMMAND_RULES)
+
+    def test_review_guidance_asks_whether_repair_loop_still_serves_request(self) -> None:
+        guidance = _review_prompt_guidance()
+
+        self.assertIn("multiple repair cycles", guidance)
+        self.assertIn("still serving the original request", guidance)
+        self.assertIn("simpler", guidance)
+        self.assertIn("validation method", guidance)
 
     def test_command_contract_prefers_plain_argv_for_default_success(self) -> None:
         self.assertIn("Use a plain argv list for ordinary commands", VALIDATION_COMMAND_RULES)
@@ -1503,6 +1562,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             checks = "\n".join(agent._plan_validation_prompt_checks())
 
             self.assertIn("validation evidence proves the requested behavior", checks)
+            self.assertIn("default or most likely user-facing invocation", checks)
             self.assertNotIn("computed-answer artifact tasks", checks)
             self.assertNotIn("artifact-only prompts", checks)
             self.assertNotIn("named scripts keep", checks)
@@ -1778,6 +1838,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("TOOL_PROGRESS_REVIEW_PHASE", call_text)
             self.assertIn("Build a checked utility", call_text)
             self.assertIn("waiting for input", call_text)
+            self.assertIn("observability, not task progress", call_text)
             transcript = (workspace / ".agent_state" / "conversation.full.jsonl").read_text(encoding="utf-8")
             self.assertIn("TOOL_PROGRESS_REVIEW_RESULT", transcript)
             self.assertIn("waiting for input", transcript)
@@ -3820,6 +3881,51 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(implementation_prompt.count("ARTIFACT_ONLY_CONSTRAINT:"), 1)
             self.assertIn("must read or compare the actual requested artifact", implementation_prompt)
             self.assertIn("must not be used as a substitute artifact", implementation_prompt)
+            self.assertIn("machine-readable stdout JSON", implementation_prompt)
+            self.assertIn("uppercase controls named in the prompt", implementation_prompt)
+            self.assertIn("small safe default", implementation_prompt)
+
+    def test_requirements_prompt_preserves_caller_visible_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            requirements_payload = base_requirements("Create a JSON-list CLI.")
+            requirements_payload["refined_requirements"] = [
+                "Create rolling_average.py that prints a JSON list to stdout."
+            ]
+            requirements_payload["plan"] = [{
+                "id": "S1",
+                "title": "Implement CLI",
+                "description": "Create rolling_average.py.",
+                "depends_on": [],
+                "acceptance_criteria": ["CLI prints a JSON list."],
+                "validation_commands": [["python", "rolling_average.py", "data.csv"]],
+            }]
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt="Create rolling_average.py. It reads CSV and prints a JSON list.",
+                implementation_responses=[json.dumps(requirements_payload)],
+            )
+            agent.initialize()
+
+            agent._requirements_refinement_phase()
+
+            requirements_prompt = agent.impl_client.calls[0]["messages"][-1]["content"]
+            self.assertIn("Requirements scope preservation", requirements_prompt)
+            self.assertIn("requested JSON list into wrapper objects", requirements_prompt)
+            self.assertIn("machine-readable stdout into", requirements_prompt)
+            self.assertIn("named setting or environment-style control", requirements_prompt)
+            self.assertIn("machine-readable stdout JSON should stay compact", requirements_prompt)
+            self.assertIn("uppercase controls named in the prompt", requirements_prompt)
+            self.assertIn("zero-argument", requirements_prompt)
+            agent._requirements_internal_consistency_findings = lambda *_args, **_kwargs: []
+            agent._requirements_test_runner_consistency_findings = lambda *_args, **_kwargs: []
+            agent._plan_structural_findings = lambda *_args, **_kwargs: []
+            agent._requirements_review(1, requirements_payload)
+            review_prompt = agent.feedback_client.calls[-1]["messages"][-1]["content"]
+            self.assertIn("Original-request fit check", review_prompt)
+            self.assertIn("what a reasonable user would run, open,", review_prompt)
 
     def test_computed_answer_plan_rejects_print_only_semantic_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5603,6 +5709,40 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("machine-readable JSON stdout", text)
             self.assertIn("compact deterministic JSON", text)
 
+    def test_requirements_review_rejects_wrapped_scalar_json_list_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create rolling_average.py. It reads CSV with columns timestamp,value and prints "
+                    "a JSON list of 3-sample rolling averages rounded to 2 decimals. Include tests."
+                ),
+            )
+            agent.initialize()
+            requirements = base_requirements("Rolling average")
+            requirements["refined_requirements"] = [
+                "Read CSV with timestamp,value columns.",
+                "Output a JSON list of objects, each containing timestamp and rolling_average.",
+            ]
+            requirements["plan"] = [{
+                "id": "S1",
+                "title": "Implement rolling average",
+                "description": "Create rolling_average.py and tests.",
+                "depends_on": [],
+                "acceptance_criteria": ["stdout is a JSON list of objects."],
+                "validation_commands": [["python", "-m", "unittest", "test_rolling_average.py"]],
+            }]
+
+            review = agent._requirements_review(1, requirements)
+
+            self.assertEqual(review["status"], "needs_requirements_change")
+            text = "\n".join(review["required_changes"])
+            self.assertIn("JSON list of scalar values", text)
+            self.assertIn("output the list values directly", text)
+
     def test_requirements_pretty_json_check_allows_compact_decision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5633,6 +5773,124 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             ]
 
             findings = agent._stdout_json_format_requirements_findings(requirements)
+
+            self.assertEqual([], findings)
+
+    def test_requirements_scalar_json_list_check_allows_requested_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt="Create report.py that prints a JSON list of objects to stdout.",
+            )
+            requirements = base_requirements("Object report")
+            requirements["refined_requirements"] = [
+                "Print a JSON list of objects to stdout.",
+            ]
+
+            findings = agent._stdout_json_format_requirements_findings(requirements)
+
+            self.assertEqual([], findings)
+
+    def test_requirements_scalar_json_list_check_allows_negated_objects_phrase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create rolling_average.py. It reads CSV with columns timestamp,value and prints "
+                    "a JSON list of 3-sample rolling averages rounded to 2 decimals. Include tests."
+                ),
+            )
+            requirements = base_requirements("Rolling average")
+            requirements["refined_requirements"] = [
+                "Output is a compact JSON list of numbers, not a list of objects or records.",
+            ]
+
+            findings = agent._stdout_json_format_requirements_findings(requirements)
+
+            self.assertEqual([], findings)
+
+    def test_analysis_scalar_json_list_check_allows_negated_objects_phrase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create rolling_average.py. It reads CSV with columns timestamp,value and prints "
+                    "a JSON list of 3-sample rolling averages rounded to 2 decimals. Include tests."
+                ),
+            )
+            findings = agent._analysis_structural_findings({
+                "problem_restatement": "Output a JSON list of numbers, not a list of objects.",
+                "domain_and_constraints": ["The timestamp column is not emitted in object records."],
+                "possible_solution_paths": [
+                    {"id": "A", "description": "Use csv/json."},
+                    {"id": "B", "description": "Use pandas."},
+                ],
+                "recommended_path": {"path_id": "A"},
+                "analysis_quality": {
+                    "is_comprehensive": True,
+                    "is_domain_aware": True,
+                    "is_actionable_for_planning": True,
+                },
+            })
+
+            self.assertEqual([], findings)
+
+    def test_requirements_review_rejects_invented_doc_filename_for_unnamed_documentation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt="Create spammer.py and document why harnesses should truncate tool output.",
+            )
+            agent.initialize()
+            requirements = base_requirements("Context overflow")
+            requirements["refined_requirements"] = [
+                "Create spammer.py.",
+                "Create DOCS.md explaining visible truncation markers.",
+            ]
+            requirements["plan"] = [{
+                "id": "S1",
+                "title": "Implement docs",
+                "description": "Create DOCS.md.",
+                "depends_on": [],
+                "acceptance_criteria": ["DOCS.md exists."],
+                "validation_commands": [["test", "-f", "DOCS.md"]],
+            }]
+
+            review = agent._requirements_review(1, requirements)
+
+            self.assertEqual(review["status"], "needs_requirements_change")
+            text = "\n".join(review["required_changes"])
+            self.assertIn("unnamed documentation", text)
+            self.assertIn("README.md", text)
+
+    def test_requirements_review_allows_explicit_markdown_doc_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt="Create spammer.py and document truncation behavior in DOCS.md.",
+            )
+            requirements = base_requirements("Context overflow")
+            requirements["refined_requirements"] = [
+                "Create spammer.py.",
+                "Create DOCS.md explaining visible truncation markers.",
+            ]
+
+            findings = agent._documentation_filename_requirements_findings(requirements)
 
             self.assertEqual([], findings)
 
@@ -8225,6 +8483,58 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("pretty-print or indent JSON stdout", text)
             self.assertIn("compact deterministic JSON", text)
 
+    def test_stdout_json_format_rejects_default_json_separators_for_compact_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt="Create rolling_average.py that prints a JSON list of numbers to stdout.",
+            )
+            findings = agent._stdout_json_format_implementation_findings({
+                "workspace_files": [
+                    {
+                        "path": "rolling_average.py",
+                        "content": (
+                            "import json\n"
+                            "def main():\n"
+                            "    result = [4.0, 6.0]\n"
+                            "    print(json.dumps(result))\n"
+                        ),
+                    }
+                ]
+            })
+
+            text = "\n".join(findings)
+            self.assertIn("default separators", text)
+            self.assertIn("separators=(',', ':')", text)
+
+    def test_stdout_json_format_allows_explicit_compact_separators(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt="Create rolling_average.py that prints a JSON list of numbers to stdout.",
+            )
+            findings = agent._stdout_json_format_implementation_findings({
+                "workspace_files": [
+                    {
+                        "path": "rolling_average.py",
+                        "content": (
+                            "import json\n"
+                            "def main():\n"
+                            "    result = [4.0, 6.0]\n"
+                            "    print(json.dumps(result, separators=(',', ':')))\n"
+                        ),
+                    }
+                ]
+            })
+
+            self.assertEqual([], findings)
+
     def test_requirements_review_doc_summary_omits_stale_shape_wording(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -8595,6 +8905,37 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("starts with `--`", findings[0]["reason"])
             self.assertIn("grep -q -- PATTERN FILE", findings[0]["reason"])
 
+    def test_tool_call_verification_blocks_literal_structured_output_grep_regex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+
+            findings = agent._deterministic_tool_call_findings([
+                [
+                    "bash",
+                    "-lc",
+                    "python normalize_config.py sample.json | grep -q '{\"b\":1,\"c\":[3,2,1]}'",
+                ],
+            ])
+
+            self.assertEqual(findings[0]["index"], 0)
+            self.assertIn("literal structured-output pattern", findings[0]["reason"])
+            self.assertIn("grep -Fq", findings[0]["reason"])
+
+    def test_tool_call_verification_allows_intentional_grep_regex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+
+            findings = agent._deterministic_tool_call_findings([
+                ["bash", "-lc", "grep -Eq 'alpha|beta' README.md"],
+                ["bash", "-lc", "grep -q '\\[[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\]' app.log"],
+            ])
+
+            self.assertEqual(findings, [])
+
     def test_tool_call_verification_allows_success_pipeline_with_failure_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -8712,6 +9053,40 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                 "Analysis invents a concrete caller-visible input/output representation",
                 "\n".join(findings),
             )
+
+    def test_analysis_structural_findings_reject_wrapped_scalar_json_list_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                prompt=(
+                    "Create rolling_average.py. It reads CSV with columns timestamp,value and prints "
+                    "a JSON list of 3-sample rolling averages rounded to 2 decimals. Include tests."
+                ),
+            )
+
+            findings = agent._analysis_structural_findings({
+                "problem_restatement": "Create a script that outputs a JSON list of objects.",
+                "domain_and_constraints": [
+                    "Output format: JSON list of objects containing timestamp and rolling_average.",
+                ],
+                "possible_solution_paths": [
+                    {"id": "A", "description": "Use csv/json from the standard library."},
+                    {"id": "B", "description": "Use pandas rolling windows."},
+                ],
+                "recommended_path": {"path_id": "A"},
+                "analysis_quality": {
+                    "is_comprehensive": True,
+                    "is_domain_aware": True,
+                    "is_actionable_for_planning": True,
+                },
+            })
+
+            text = "\n".join(findings)
+            self.assertIn("requested JSON list of scalar values", text)
+            self.assertIn("list values directly", text)
 
     def test_analysis_structural_findings_do_not_phrase_match_unrequested_adjacency_scope_expansion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9084,6 +9459,9 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("APPROACH_REVIEW_RESULT", transcript)
             self.assertIn("Approach review kept the result based on cited evidence IDs", transcript)
             self.assertEqual(len(agent.feedback_client.calls), 2)
+            approach_prompt = agent.feedback_client.calls[0]["messages"][-1]["content"]
+            self.assertIn("Original-request fit check", approach_prompt)
+            self.assertIn("what a reasonable user would run, open,", approach_prompt)
 
     def test_approach_review_cannot_keep_failed_workflow_as_resolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9123,6 +9501,135 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertIn("cannot_resolve", review["reviewer_rationale"])
             self.assertIn("Pass the fixture path", json.dumps(review["required_changes"]))
             self.assertIn("Pass the fixture path", review["recommended_next_approach"])
+
+    def test_requirements_validation_command_only_skip_continues_to_plan_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            phase_result = {
+                "status": "skipped_with_note",
+                "iterations": [{
+                    "review": {
+                        "status": "needs_requirements_change",
+                        "summary": "Deterministic requirements checks found validation issues.",
+                        "required_changes": [
+                            "S1 validation contains inline Python that fails a static syntax check.",
+                            "S1 validation contains shell syntax that fails a static parse check.",
+                        ],
+                    }
+                }],
+                "resolution": {"status": "skipped_with_note", "note": "Bounded retries exhausted for requirements."},
+            }
+
+            blocker = agent._blocking_phase_step("requirements", phase_result)
+
+            self.assertIsNone(blocker)
+            plan_text = (workspace / "PLAN.md").read_text(encoding="utf-8")
+            self.assertIn("validation-command-only retry exhaustion", plan_text)
+
+    def test_repeated_requirements_validation_command_findings_compromise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            requirements = base_requirements("Config normalizer")
+            requirements["refined_requirements"] = [
+                "Read a JSON file path argument.",
+                "Write normalized JSON to stdout.",
+            ]
+            requirements["plan"] = [{
+                "id": "S1",
+                "title": "Implement normalizer",
+                "description": "Create normalize_config.py and tests.",
+                "depends_on": [],
+                "acceptance_criteria": ["stdout contains normalized JSON."],
+                "validation_commands": [
+                    "bash -lc 'python3 -c \"expected = {\"b\": 1}; print(expected)\"'",
+                ],
+            }]
+
+            review = agent._requirements_review(2, requirements)
+
+            self.assertEqual(review["status"], "skipped_with_note")
+            self.assertFalse(review["needs_rework"])
+            self.assertIn("validation-command mechanics", review["summary"])
+
+    def test_plan_validation_compromise_removes_only_brittle_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.requirements = base_requirements("Config normalizer")
+            brittle_command = "bash -lc 'python3 -c \"expected = {\"b\": 1}; print(expected)\"'"
+            valid_command = ["python3", "-m", "unittest", "test_normalize_config.py"]
+            agent.plan_steps = [{
+                "id": "S1",
+                "title": "Implement normalizer",
+                "description": "Create normalize_config.py and tests.",
+                "depends_on": [],
+                "acceptance_criteria": ["stdout contains normalized JSON."],
+                "validation_commands": [brittle_command, valid_command],
+            }]
+            agent.requirements["plan"] = agent.plan_steps
+
+            review = agent._plan_validation_review(2)
+            agent._apply_validation_command_compromise_to_plan(review)
+
+            self.assertEqual(review["status"], "resolved_with_compromise")
+            self.assertEqual(agent.plan_steps[0]["validation_commands"], [valid_command])
+            self.assertIn("validation_notes", agent.plan_steps[0])
+
+    def test_resolved_with_compromise_phase_does_not_block_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+
+            blocker = agent._blocking_phase_step(
+                "plan",
+                {
+                    "status": "resolved_with_compromise",
+                    "iterations": [{
+                        "review": {
+                            "status": "resolved_with_compromise",
+                            "summary": "Continue with fresh evidence later.",
+                            "required_changes": ["Validation command syntax only."],
+                        }
+                    }],
+                },
+            )
+
+            self.assertIsNone(blocker)
+
+    def test_requirements_non_validation_skip_still_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            phase_result = {
+                "status": "skipped_with_note",
+                "iterations": [{
+                    "review": {
+                        "status": "needs_requirements_change",
+                        "summary": "Requirements add unrequested public scope.",
+                        "required_changes": [
+                            "Requirements or plan introduce public failure-injection/test switches that the user did not request.",
+                        ],
+                    }
+                }],
+                "resolution": {"status": "skipped_with_note", "note": "Bounded retries exhausted for requirements."},
+            }
+
+            blocker = agent._blocking_phase_step("requirements", phase_result)
+
+            self.assertIsNotNone(blocker)
+            self.assertEqual(blocker["step_id"], "requirements_phase")
 
     def test_research_structure_skeleton_step_satisfies_quality_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -11367,6 +11874,8 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
             self.assertIn("static syntax check", "\n".join(findings))
             self.assertIn("shell-wrapped python -c", "\n".join(findings))
+            self.assertIn("quoted here-doc", "\n".join(findings))
+            self.assertIn("temporary validator script", "\n".join(findings))
 
     def test_plan_validation_rejects_malformed_quoted_heredoc_closer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -12231,6 +12740,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
         self.assertIn("without hiding failures", VALIDATION_COMMAND_RULES)
         self.assertIn("wire them into the command being tested", VALIDATION_COMMAND_RULES)
         self.assertNotIn(".watch_state", VALIDATION_COMMAND_RULES)
+        self.assertIn("fixed-string matching", TOOL_CALL_VERIFICATION_CONTRACT)
 
     def test_executable_deliverable_guidance_is_shared_across_prompts(self) -> None:
         self.assertIn("marks shebang files executable", EXECUTABLE_DELIVERABLE_GUIDANCE)
@@ -13858,6 +14368,10 @@ assert "ok" in stdout
             self.assertIn("reviewer-owned validation results", prompt)
             self.assertIn("do not spend the final review re-solving algorithmic tasks", prompt)
             self.assertIn("requesting stronger validation evidence", prompt)
+            self.assertIn("plausible wrong implementation", prompt)
+            self.assertIn("what a reasonable user would run, open,", prompt)
+            self.assertIn("validating the invented surface", prompt)
+            self.assertIn("parsed-only checks can miss regressions", prompt)
 
     def test_step_review_prompt_prefers_validation_over_manual_derivation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -13894,6 +14408,7 @@ assert "ok" in stdout
             self.assertIn("reviewer-owned validation results as primary evidence", prompt)
             self.assertIn("do not spend the review re-solving exact-answer tasks", prompt)
             self.assertIn("request stronger validation evidence", prompt)
+            self.assertIn("only proves that a command exited successfully", prompt)
 
     def test_browser_guidance_prefers_python_playwright_without_node_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -14090,6 +14605,62 @@ assert "ok" in stdout
             self.assertNotIn("focused directly verifiable change", "\n".join(review["required_changes"]))
             self.assertIn("parse_error", review)
             self.assertIn("final_repair_error", review)
+
+    def test_final_review_protocol_failure_compromises_when_all_evidence_passed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.config = replace(
+                agent.config,
+                review_policy=replace(agent.config.review_policy, final_review_iterations=0),
+            )
+            agent.plan_steps = [{
+                "id": "S1",
+                "title": "Verified step",
+                "description": "Create checked artifact.",
+                "depends_on": [],
+                "acceptance_criteria": ["artifact validated"],
+                "validation_commands": [["python", "validate.py"]],
+                "status": "resolved",
+            }]
+            write_plan_doc(workspace, agent.requirements, agent.plan_steps, [])
+            agent._git_commit_final_review = lambda: {"enabled": False, "committed": False}
+            protocol_failure_review = {
+                "status": "cannot_resolve",
+                "needs_rework": True,
+                "summary": "FINAL_PROJECT_REVIEW_PHASE reviewer response was malformed after JSON repair.",
+                "required_changes": [
+                    "Reviewer protocol repair failed; repeat the review decision in the requested JSON contract before using it as workflow guidance."
+                ],
+                "verification_evidence": [
+                    "Harness parser could not extract valid reviewer JSON from the original or repair response."
+                ],
+                "review_protocol_error": True,
+                "deterministic_evidence_findings": [],
+                "feedback_tool_evidence": {
+                    "step_validations": [{
+                        "step_id": "S1",
+                        "validation_results": [{
+                            "command": ["python", "validate.py"],
+                            "returncode": 0,
+                            "expected_returncode": 0,
+                            "timed_out": False,
+                            "stopped_by_progress_review": False,
+                        }],
+                    }],
+                },
+            }
+            agent._final_project_review = lambda _attempt, _step_results: protocol_failure_review
+
+            result = agent._final_review_phase([
+                {"step_id": "S1", "status": "resolved", "attempts": []}
+            ])
+
+            self.assertEqual(result["status"], "resolved_with_compromise")
+            self.assertEqual(result["resolution"]["status"], "resolved_with_compromise")
+            self.assertIn("review-protocol compromise", result["resolution"]["note"])
 
     def test_feedback_json_repair_omits_malformed_review_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -15017,6 +15588,32 @@ assert "ok" in stdout
             text = "\n".join(findings)
             self.assertIn("starts with `--`", text)
             self.assertIn("grep -q -- PATTERN FILE", text)
+
+    def test_plan_review_rejects_literal_structured_output_grep_regex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.plan_steps = [
+                {
+                    "id": "S1",
+                    "title": "Check compact JSON",
+                    "description": "Check a CLI emits compact JSON.",
+                    "acceptance_criteria": ["stdout equals the compact JSON object."],
+                    "validation_commands": [[
+                        "bash",
+                        "-lc",
+                        "python normalize_config.py sample.json | grep -q '{\"b\":1,\"c\":[3,2,1]}'",
+                    ]],
+                }
+            ]
+
+            findings = agent._plan_structural_findings()
+
+            text = "\n".join(findings)
+            self.assertIn("literal structured-output pattern", text)
+            self.assertIn("grep -Fq", text)
 
     def test_plan_review_rejects_malformed_bash_validation_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

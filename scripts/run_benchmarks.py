@@ -18,9 +18,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from feedback_agent.config import DEFAULT_CONFIG, ModelConfig, _deep_merge
+from feedback_agent.bounds import run_bounded_process
 from feedback_agent.llm import OpenAICompatClient
 from feedback_agent.model_profiles import ModelProfile, resolve_profile
-from feedback_agent.workspace import collect_workspace_files, extract_json_object, run_commands, write_files
+from feedback_agent.workspace import (
+    _command_parts_and_timeout,
+    collect_workspace_files,
+    extract_json_object,
+    run_commands,
+    write_files,
+)
 
 
 def load_tasks(path: Path) -> list[dict[str, Any]]:
@@ -414,12 +421,112 @@ def run_harness(
         return 124, time.monotonic() - start, output
 
 
-def grade_task(workspace: Path, task: dict[str, Any]) -> dict[str, Any]:
+def run_docker_post_validation_commands(
+    repo_root: Path,
+    workspace: Path,
+    commands: list[list[str] | dict[str, Any]],
+    *,
+    image: str = "agentic-feedback-coding:local",
+    timeout_seconds: int = 120,
+    max_timeout_seconds: int = 21600,
+    output_limit_chars: int = 8000,
+) -> list[dict[str, Any]]:
+    """Run benchmark post-validation inside the same Docker image as the harness.
+
+    Harness tasks run with Docker isolation by default. Grading them on the host
+    can create false failures when the task correctly used container-provided
+    tools such as Python Playwright.
+    """
+    results: list[dict[str, Any]] = []
+    uid_gid = f"{os.getuid()}:{os.getgid()}"
+    for index, command in enumerate(commands):
+        parts, command_timeout, expected_returncode = _command_parts_and_timeout(
+            command,
+            timeout_seconds,
+            max_timeout_seconds,
+        )
+        if not parts:
+            continue
+        container_name = f"agentic-bench-post-{os.getpid()}-{index}-{int(time.time() * 1000) % 1000000}"
+        docker_command = [
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+            "--label",
+            "agentic-feedback-benchmark-post=1",
+            "--security-opt",
+            "label=disable",
+            "--user",
+            uid_gid,
+            "-e",
+            "AGENT_IN_CONTAINER=1",
+            "-e",
+            "HOME=/tmp",
+            "-e",
+            "DOTNET_ROOT=/tmp/.dotnet",
+            "-e",
+            "PATH=/tmp/.dotnet:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "-e",
+            "PYTHONPATH=/workspace/project:/app",
+            "-v",
+            f"{workspace}:/workspace/project",
+            "-w",
+            "/workspace/project",
+            "--entrypoint",
+            "/usr/bin/env",
+            image,
+            *parts,
+        ]
+        result = run_bounded_process(
+            docker_command,
+            cwd=repo_root,
+            timeout_seconds=command_timeout,
+            output_limit_chars=output_limit_chars,
+        )
+        if result.get("timed_out") or result.get("stopped_by_progress_review"):
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                cwd=repo_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30,
+            )
+        result["docker_command"] = result.get("command", docker_command)
+        result["command"] = parts
+        result["ran_in_docker"] = True
+        result["expected_returncode"] = expected_returncode
+        result["returncode_matches_expected"] = result.get("returncode") == expected_returncode
+        results.append(result)
+    return results
+
+
+def grade_task(
+    workspace: Path,
+    task: dict[str, Any],
+    *,
+    repo_root: Path | None = None,
+    docker_post_validation: bool = False,
+    docker_image: str = "agentic-feedback-coding:local",
+) -> dict[str, Any]:
     grading = task.get("grading", "manual")
     commands = task.get("post_validation_commands") or []
     validation_results = []
     if commands:
-        validation_results = run_commands(workspace, commands, 120, 21600, output_limit_chars=8000)
+        if docker_post_validation:
+            validation_results = run_docker_post_validation_commands(
+                repo_root or REPO_ROOT,
+                workspace,
+                commands,
+                image=docker_image,
+                timeout_seconds=120,
+                max_timeout_seconds=21600,
+                output_limit_chars=8000,
+            )
+        else:
+            validation_results = run_commands(workspace, commands, 120, 21600, output_limit_chars=8000)
     if grading == "manual":
         status = "manual_review"
     elif validation_results:
@@ -666,7 +773,13 @@ def main() -> int:
                 max_tokens=args.max_tokens,
             )
         (output_dir / f"{task['id']}.log").write_text(output, encoding="utf-8")
-        grade = grade_task(workspace, task)
+        grade = grade_task(
+            workspace,
+            task,
+            repo_root=repo_root,
+            docker_post_validation=args.mode == "harness" and args.docker_isolation,
+            docker_image=cfg["runtime"]["docker_image"] if args.mode == "harness" else "agentic-feedback-coding:local",
+        )
         result = {
             "run_mode": args.mode,
             "task_id": task["id"],
