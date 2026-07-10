@@ -18,6 +18,7 @@ import unittest
 import urllib.error
 from typing import Any
 
+import scripts.benchmark_matrix as benchmark_matrix
 import scripts.run_benchmarks as run_benchmarks
 from feedback_agent.agent import (
     ANALYSIS_CONTRACT,
@@ -577,9 +578,89 @@ class FeedbackLoopAgentTests(unittest.TestCase):
 
     def test_benchmark_resume_reruns_non_passing_results(self) -> None:
         self.assertTrue(run_benchmarks.should_skip_existing_result({"grade": "pass"}))
+        self.assertTrue(run_benchmarks.should_skip_existing_result({"grade": "manual_pass"}))
         self.assertFalse(run_benchmarks.should_skip_existing_result({"grade": "fail"}))
+        self.assertFalse(run_benchmarks.should_skip_existing_result({"grade": "manual_fail"}))
         self.assertFalse(run_benchmarks.should_skip_existing_result({"grade": "timeout"}))
         self.assertFalse(run_benchmarks.should_skip_existing_result(None))
+        self.assertEqual(
+            run_benchmarks.final_benchmark_grade({"grading": "manual"}, 2, "manual_fail"),
+            "manual_fail",
+        )
+        self.assertEqual(
+            run_benchmarks.final_benchmark_grade({"grading": "automatic"}, 2, "pass"),
+            "fail",
+        )
+
+    def test_benchmark_manual_grade_has_pass_fail_label(self) -> None:
+        class FakeClient:
+            def __init__(self, cfg: Any) -> None:
+                self.cfg = cfg
+
+            def chat(
+                self,
+                messages: list[dict[str, str]],
+                *,
+                max_tokens: int | None = None,
+                temperature: float | None = None,
+            ) -> str:
+                return json.dumps({
+                    "grade": "manual_pass",
+                    "evidence": ["README contains the requested policy."],
+                    "concerns": [],
+                })
+
+        original_client = run_benchmarks.OpenAICompatClient
+        try:
+            run_benchmarks.OpenAICompatClient = FakeClient  # type: ignore[assignment]
+            with tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                (workspace / "README.md").write_text("Safe policy\n", encoding="utf-8")
+                grade = run_benchmarks.grade_task(
+                    workspace,
+                    {
+                        "id": "manual-demo",
+                        "title": "Manual demo",
+                        "prompt": "Write README.md with a safe policy.",
+                        "grading": "manual",
+                        "manual_pass_criteria": ["README contains a safe policy."],
+                    },
+                    manual_grader_profile="gemma4-26b-a4b-qat-mtp",
+                    manual_grader_max_tokens=512,
+                )
+        finally:
+            run_benchmarks.OpenAICompatClient = original_client  # type: ignore[assignment]
+
+        self.assertEqual(grade["grade"], "manual_pass")
+        self.assertEqual(grade["manual_review"]["evidence"], ["README contains the requested policy."])
+        self.assertIn("manual pass", run_benchmarks.markdown_table([{
+            "task_id": "manual-demo",
+            "category": "manual",
+            "run_mode": "harness",
+            "implementation_profile": "gemma4-26b-a4b-qat-mtp",
+            "feedback_profile": None,
+            "reasoning_budget_tokens": 2048,
+            "grade": "manual_pass",
+            "elapsed_seconds": 120,
+            "summary": {},
+        }]))
+
+    def test_benchmark_matrix_formats_manual_pass_and_fail(self) -> None:
+        tasks = [{"id": "demo"}]
+        md = benchmark_matrix.matrix_table(tasks, [
+            ("Harness Gemma", Path("runs/harness/results.json"), [{
+                "task_id": "demo",
+                "grade": "manual_pass",
+                "elapsed_seconds": 145,
+            }]),
+            ("Single Gemma", Path("runs/single/results.json"), [{
+                "task_id": "demo",
+                "grade": "manual_fail",
+                "elapsed_seconds": 61,
+            }]),
+        ])
+
+        self.assertIn("| `demo` | manual pass 2m | manual fail 1m |", md)
 
     def test_single_shot_benchmark_writes_model_files_without_harness(self) -> None:
         captured: dict[str, Any] = {}

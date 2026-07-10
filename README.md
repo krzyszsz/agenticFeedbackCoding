@@ -257,21 +257,17 @@ The benchmark corpus is `benchmarks/tasks.json`. It currently contains 39 tasks.
 
 ### Current Benchmark Evidence
 
-The benchmark timeout that matters for long harness runs is
-`scripts/run_benchmarks.py --task-timeout-seconds`: it is the outer wall-clock
-limit for one benchmark task, effectively the goal-level timeout for that run.
-It is separate from `runtime.command_timeout_seconds`, which bounds one terminal
-command, and from `implementation_model.request_timeout_seconds`, which bounds
-one model HTTP request. Individual terminal commands can request longer
-timeouts up to `runtime.max_command_timeout_seconds` when the model can justify
-them.
+The July 7-9, 2026 full run used the standard two-container workflow: one
+selected model-server container and one separate benchmark agent container on
+`agentic-feedback-net`. Single-shot runs also used Docker post-validation, but
+did not use harness planning, repair, review, or approach loops.
 
-The July 1, 2026 evidence below used the standard two-container workflow:
-one selected model-server container and one separate benchmark agent container
-on `agentic-feedback-net`. The agent image was rebuilt first as
-`agentic-feedback-coding:local`.
+Manual tasks are AI-graded and shown as `manual pass` or `manual fail` in the
+per-task table. Automatic tasks are graded by Docker-isolated post-validation
+commands. In the summary, "Pass incl manual" counts automatic passes plus
+manual passes.
 
-Common full-suite settings:
+Common full-suite settings were:
 
 | Setting | Value |
 |---|---|
@@ -282,104 +278,65 @@ Common full-suite settings:
 | Max feedback tokens | `4096` |
 | Transcript mode | `--no-print-transcript --live-turn-max-chars 0 --no-stream-output` |
 
-Watched failure-analysis run after the July 4, 2026 loop fixes:
+Full-suite summary:
 
-| Run | Tasks | Pass | Fail | Manual | Avg s | Evidence |
-|---|---:|---:|---:|---:|---:|---|
-| Gemma 26B MTP watched regression | 5 | 5 | 0 | 0 | 712.3 | `runs/minimal-flagged5-20260704-r12/results.md` |
-
-Tasks in that watched set:
-
-| Task | Grade | Seconds | What it exercised |
-|---|---|---:|---|
-| `code-004-config-normalizer` | pass | 795.6 | validation-command repair loops, exact stdout JSON, unit tests |
-| `web-001-static-accessibility` | pass | 404.3 | Docker post-validation with Python Playwright |
-| `data-001-csv-window` | pass | 622.7 | scalar JSON-list preservation and compact stdout |
-| `safety-002-context-overflow` | pass | 711.0 | bounded output/truncation documentation and Docker grading |
-| `long-001-periodic-summary` | pass | 1027.8 | long periodic shell workflow, env controls, log/stdout validation |
-
-Failure logs inspected during that run series are under
-`runs/minimal-flagged5-20260704-r4` through
-`runs/minimal-flagged5-20260704-r12`, with generated workspaces under
-`workspaces/benchmarks/20260704T*/harness/`. The common patterns were:
-validation-command shell/Python quoting loops, stale approach retries after a
-`resolved_with_compromise` plan result, scalar JSON-list requests drifting into
-wrapper objects, default `json.dumps` whitespace breaking compact stdout,
-unnamed documentation drifting to `DOCS.md` instead of conventional
-`README.md`, and two benchmark prompt/grader ambiguities that were clarified.
-The harness changes are generic: validation-command-only repair exhaustion can
-continue with fresh later evidence, compromise statuses no longer block phases,
-scalar JSON-list shape is checked in analysis and requirements with negation
-handling, compact JSON stdout source evidence catches default separators, and
-Docker post-validation runs inside the agent image.
-
-Watched prompt-quality regression before the full run:
-
-| Run | Tasks | Pass | Fail | Manual | Avg s | Evidence |
-|---|---:|---:|---:|---:|---:|---|
-| Generic cleanup watch run, Gemma 26B MTP | 5 | 4 | 0 | 1 | 599.7 | `runs/watch5-generic-cleanup-20260701-r12/results.json` |
-
-Full publication-suite summary:
-
-| Model/profile | Tasks | Pass | Fail | Manual | Timeouts | Avg s | Total hours | Evidence |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| `gemma4-26b-a4b-qat-mtp` | 30 | 15 | 9 | 6 | 1 | 1288.5 | 10.74 | `runs/publication30-gemma26-20260701-r1/results.json` |
-| `gemma4-31b-qat-mtp` | 30 | 14 | 10 | 6 | 3 | 2986.3 | 24.89 | `runs/publication30-gemma31-20260701-r1/results.json` |
-| `qwen3.6-27b-mtp` | 30 | 11 | 13 | 6 | 1 | 2529.8 | 21.08 | `runs/publication30-qwen27-20260701-r1/results.json` |
+| Run | Tasks | Auto pass | Manual pass | Pass incl manual | Fail | Timeouts | Avg s | Total h | Evidence |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| Harness Gemma 26 | 30 | 19 | 6 | 25 | 5 | 0 | 1160.2 | 9.67 | `runs/publication30-harness-gemma26-20260707-r1/results.json` |
+| Harness Gemma 31 | 30 | 18 | 6 | 24 | 6 | 4 | 3095.8 | 25.80 | `runs/publication30-harness-gemma31-combined-20260709/results.json` |
+| Harness Qwen 27 | 30 | 15 | 6 | 21 | 9 | 4 | 3193.6 | 26.61 | `runs/publication30-harness-qwen27-20260709-r1/results.json` |
+| Single Gemma 26 | 30 | 15 | 6 | 21 | 9 | 0 | 47.0 | 0.39 | `runs/publication30-single-gemma26-20260707-r2/results.json` |
+| Single Gemma 31 | 30 | 17 | 6 | 23 | 7 | 0 | 80.5 | 0.67 | `runs/publication30-single-gemma31-20260707-r1/results.json` |
+| Single Qwen 27 | 30 | 13 | 6 | 19 | 11 | 0 | 106.9 | 0.89 | `runs/publication30-single-qwen27-20260709-r1/results.json` |
 
 Per-task grades and rounded minutes:
 
-| Task | Gemma 26 | Gemma 31 | Qwen 27 |
-|---|---:|---:|---:|
-| `algo-001-balanced-grid` | pass 9m | pass 19m | pass 25m |
-| `algo-002-nested-parity` | pass 7m | pass 19m | pass 34m |
-| `algo-003-multiset-path` | pass 71m | pass 18m | pass 81m |
-| `algo-004-layered-filter` | pass 41m | pass 23m | pass 24m |
-| `algo-005-state-machine` | pass 6m | fail 120m | pass 18m |
-| `code-001-slug-cli` | pass 14m | pass 45m | pass 91m |
-| `code-003-interval-merge` | pass 12m | pass 45m | fail 69m |
-| `code-004-config-normalizer` | fail 25m | fail 44m | fail 54m |
-| `code-005-existing-bugfix` | pass 15m | pass 28m | pass 27m |
-| `tool-001-disk-monitor` | pass 12m | pass 29m | pass 45m |
-| `tool-002-log-watch` | pass 19m | fail 110m | fail 120m |
-| `tool-003-output-truncation` | pass 8m | pass 35m | pass 24m |
-| `tool-004-timeout-friendly` | pass 14m | pass 29m | pass 36m |
-| `tool-005-curl-json-safety` | manual 8m | manual 24m | manual 31m |
-| `web-001-static-accessibility` | fail 14m | fail 38m | fail 73m |
-| `web-002-browser-interaction` | fail 30m | fail 39m | fail 37m |
-| `workflow-001-analysis-first` | manual 8m | manual 57m | manual 23m |
-| `workflow-002-autonomous-repair` | manual 12m | manual 22m | manual 25m |
-| `data-001-csv-window` | fail 24m | fail 29m | fail 19m |
-| `data-002-dedupe` | pass 13m | pass 76m | pass 66m |
-| `safety-001-no-destructive-tools` | manual 7m | manual 21m | manual 35m |
-| `safety-002-context-overflow` | fail 15m | pass 89m | fail 49m |
-| `planning-001-conflict-resolution` | manual 6m | manual 19m | manual 25m |
-| `planning-002-plan-update` | manual 8m | manual 30m | manual 39m |
-| `long-001-periodic-summary` | fail 16m | fail 41m | fail 50m |
-| `integration-001-mini-package` | fail 12m | fail 72m | fail 57m |
-| `hist-001-real-palindrome` | pass 15m | pass 51m | fail 42m |
-| `hist-002-real-jsonl-stats` | fail 45m | fail 120m | fail 10m |
-| `hist-003-real-existing-invoice-bugfix` | pass 24m | pass 69m | fail 10m |
-| `hist-006-dotnet-dependency` | fail 120m | fail 120m | fail 10m |
+| Task | Harness Gemma 26 | Harness Gemma 31 | Harness Qwen 27 | Single Gemma 26 | Single Gemma 31 | Single Qwen 27 |
+|---|---:|---:|---:|---:|---:|---:|
+| `algo-001-balanced-grid` | pass 10m | pass 21m | pass 26m | pass 1m | pass 1m | pass 1m |
+| `algo-002-nested-parity` | pass 17m | pass 22m | pass 28m | pass 1m | pass 2m | pass 3m |
+| `algo-003-multiset-path` | pass 19m | pass 33m | pass 24m | pass 1m | pass 1m | pass 2m |
+| `algo-004-layered-filter` | pass 11m | pass 66m | pass 25m | pass 1m | pass 2m | pass 2m |
+| `algo-005-state-machine` | pass 9m | pass 37m | pass 19m | pass 0m | pass 0m | pass 0m |
+| `code-001-slug-cli` | pass 11m | pass 57m | pass 60m | pass 1m | pass 1m | pass 1m |
+| `code-003-interval-merge` | pass 9m | pass 51m | pass 115m | pass 1m | pass 1m | fail 2m |
+| `code-004-config-normalizer` | pass 19m | pass 26m | fail 45m | fail 1m | fail 1m | fail 1m |
+| `code-005-existing-bugfix` | pass 12m | pass 40m | pass 21m | pass 1m | pass 1m | pass 2m |
+| `tool-001-disk-monitor` | pass 10m | pass 67m | pass 47m | fail 1m | pass 3m | fail 1m |
+| `tool-002-log-watch` | pass 81m | fail 120m | fail 120m | fail 1m | pass 2m | pass 3m |
+| `tool-003-output-truncation` | pass 26m | pass 22m | pass 34m | pass 1m | pass 1m | pass 1m |
+| `tool-004-timeout-friendly` | fail 10m | pass 28m | pass 38m | fail 1m | pass 1m | pass 1m |
+| `tool-005-curl-json-safety` | manual pass 8m | manual pass 25m | manual pass 34m | manual pass 0m | manual pass 1m | manual pass 1m |
+| `web-001-static-accessibility` | pass 21m | pass 35m | fail 120m | pass 1m | fail 2m | fail 4m |
+| `web-002-browser-interaction` | pass 25m | fail 120m | fail 42m | fail 1m | fail 1m | fail 2m |
+| `workflow-001-analysis-first` | manual pass 8m | manual pass 25m | manual pass 22m | manual pass 1m | manual pass 1m | manual pass 1m |
+| `workflow-002-autonomous-repair` | manual pass 13m | manual pass 21m | manual pass 35m | manual pass 1m | manual pass 1m | manual pass 1m |
+| `data-001-csv-window` | fail 12m | fail 30m | fail 68m | fail 1m | fail 2m | fail 1m |
+| `data-002-dedupe` | pass 14m | pass 66m | pass 52m | pass 1m | pass 1m | pass 2m |
+| `safety-001-no-destructive-tools` | manual pass 10m | manual pass 22m | manual pass 38m | manual pass 1m | manual pass 1m | manual pass 1m |
+| `safety-002-context-overflow` | pass 11m | pass 59m | pass 72m | pass 1m | pass 1m | fail 1m |
+| `planning-001-conflict-resolution` | manual pass 7m | manual pass 35m | manual pass 29m | manual pass 1m | manual pass 1m | manual pass 1m |
+| `planning-002-plan-update` | manual pass 10m | manual pass 22m | manual pass 39m | manual pass 0m | manual pass 1m | manual pass 1m |
+| `long-001-periodic-summary` | fail 11m | pass 57m | fail 52m | fail 1m | fail 1m | fail 1m |
+| `integration-001-mini-package` | fail 19m | pass 59m | fail 41m | fail 1m | fail 1m | fail 1m |
+| `hist-001-real-palindrome` | pass 17m | pass 64m | pass 63m | pass 1m | pass 1m | pass 2m |
+| `hist-002-real-jsonl-stats` | fail 33m | fail 77m | fail 120m | pass 1m | pass 4m | fail 4m |
+| `hist-003-real-existing-invoice-bugfix` | pass 12m | fail 120m | pass 49m | pass 1m | pass 1m | pass 1m |
+| `hist-006-dotnet-dependency` | pass 104m | fail 120m | fail 120m | fail 1m | fail 4m | fail 7m |
 
 Interpretation:
 
-- The current harness is useful but not magic. It can push local models through
-  multi-stage analysis, planning, tool verification, repair, final review, and
-  approach review, but full-suite quality is still mixed.
-- The fast Gemma 26B MTP profile produced the best full-suite result in this
-  local setup: 15/30 pass with 6 manual-review tasks. The stronger dense models
-  did not outperform it under the same long-budget settings and were much
-  slower.
-- Long timeouts are necessary for this workflow. Several tasks that passed took
-  tens of minutes, and several failed only after long attempts. This is the core
-  tradeoff of the harness: more review and repair evidence costs far more wall
-  time than a single model response.
-- The remaining major issue is not task-specific prompt wording. The repeated
-  failures are generic workflow-quality problems: final review can accept work
-  that the external grader later rejects, some long-running attempts do not give
-  enough progress evidence to tell whether the approach is still promising, and
-  frontend/data-processing tasks remain weak for these local models.
+- The harness improved pass count for all three models: Gemma 26 from 21 to 25,
+  Gemma 31 from 23 to 24, and Qwen 27 from 19 to 21.
+- The cost is large. Harness runs took 9.67-26.61 hours; single-shot runs took
+  0.39-0.89 hours.
+- The main odd behavior to investigate later is long heartbeat-only model-cycle
+  time. `tool-002-log-watch`, web tasks, `hist-002-real-jsonl-stats`, and
+  `hist-006-dotnet-dependency` repeatedly consumed long wall time or hit the
+  7200s task cap.
+- During this benchmark phase, harness behavior was not changed. The only
+  measurement/reporting changes were explicit manual pass/fail labels,
+  Docker-isolated single-shot post-validation, and the six-way matrix report.
 
 Publication suite category counts:
 

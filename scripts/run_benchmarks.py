@@ -278,6 +278,100 @@ def run_single_shot(
         return 2, elapsed, log, metadata
 
 
+def _normalize_manual_grade(value: Any) -> str | None:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if text in {"pass", "manual_pass"}:
+        return "manual_pass"
+    if text in {"fail", "manual_fail"}:
+        return "manual_fail"
+    return None
+
+
+def manual_grade_task(
+    workspace: Path,
+    task: dict[str, Any],
+    *,
+    grader_profile: str,
+    reasoning_budget_tokens: int | None,
+    max_tokens: int,
+    validation_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Judge a manual benchmark task as pass/fail from bounded artifacts.
+
+    This is benchmark measurement code only. It does not feed back into the
+    harness run and deliberately asks for a methodology marker in the grade so
+    README tables can distinguish automatic checks from model-judged checks.
+    """
+    criteria = task.get("manual_pass_criteria") or []
+    workspace_files = collect_workspace_files(workspace, max_file_bytes=10000)
+    prompt = (
+        "You are grading one completed benchmark task. Decide whether the produced workspace satisfies the task.\n"
+        "Return strict JSON only with this shape:\n"
+        '{ "grade": "manual_pass" | "manual_fail", "evidence": ["short concrete evidence"], "concerns": ["short concerns"] }\n'
+        "Use manual_pass only when the artifacts satisfy the user prompt and all pass criteria. "
+        "Use manual_fail when required evidence is missing, invalid, or ambiguous.\n\n"
+        f"Task title: {task['title']}\n"
+        f"Task prompt:\n{task['prompt']}\n\n"
+        f"Manual pass criteria:\n{json.dumps(criteria, indent=2)}\n\n"
+        f"Validation results, if any:\n{json.dumps(validation_results, indent=2)}\n\n"
+        "Workspace files:\n"
+        f"{json.dumps(workspace_files, indent=2)}"
+    )
+    client = OpenAICompatClient(
+        direct_model_config(
+            grader_profile,
+            reasoning_budget_tokens=reasoning_budget_tokens,
+            max_tokens=max_tokens,
+        )
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a strict benchmark grader. Return one JSON object and no prose.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+    raw = ""
+    for _attempt in range(2):
+        try:
+            raw = client.chat(messages, max_tokens=max_tokens, temperature=0.0)
+            payload = extract_json_object(raw)
+            grade = _normalize_manual_grade(payload.get("grade"))
+            if grade is not None:
+                return {
+                    "grade": grade,
+                    "evidence": payload.get("evidence", []),
+                    "concerns": payload.get("concerns", []),
+                    "raw_tail": raw[-4000:],
+                    "grader_profile": grader_profile,
+                }
+            messages.extend([
+                {"role": "assistant", "content": raw[-4000:]},
+                {
+                    "role": "user",
+                    "content": (
+                        "Your response did not include grade as exactly manual_pass or manual_fail. "
+                        "Re-answer the same grading question as strict JSON only with that grade field."
+                    ),
+                },
+            ])
+        except Exception as exc:
+            return {
+                "grade": "manual_fail",
+                "evidence": [],
+                "concerns": [f"manual grader failed: {exc!r}"],
+                "raw_tail": raw[-4000:],
+                "grader_profile": grader_profile,
+            }
+    return {
+        "grade": "manual_fail",
+        "evidence": [],
+        "concerns": ["manual grader did not return manual_pass or manual_fail"],
+        "raw_tail": raw[-4000:],
+        "grader_profile": grader_profile,
+    }
+
+
 def _docker_model_url(profile: ModelProfile) -> str:
     return f"http://{profile.container_name}:{profile.port}/v1"
 
@@ -510,10 +604,14 @@ def grade_task(
     repo_root: Path | None = None,
     docker_post_validation: bool = False,
     docker_image: str = "agentic-feedback-coding:local",
+    manual_grader_profile: str | None = None,
+    manual_grader_reasoning_budget_tokens: int | None = None,
+    manual_grader_max_tokens: int = 4096,
 ) -> dict[str, Any]:
     grading = task.get("grading", "manual")
     commands = task.get("post_validation_commands") or []
     validation_results = []
+    manual_review = None
     if commands:
         if docker_post_validation:
             validation_results = run_docker_post_validation_commands(
@@ -528,7 +626,19 @@ def grade_task(
         else:
             validation_results = run_commands(workspace, commands, 120, 21600, output_limit_chars=8000)
     if grading == "manual":
-        status = "manual_review"
+        manual_review = None
+        if manual_grader_profile:
+            manual_review = manual_grade_task(
+                workspace,
+                task,
+                grader_profile=manual_grader_profile,
+                reasoning_budget_tokens=manual_grader_reasoning_budget_tokens,
+                max_tokens=manual_grader_max_tokens,
+                validation_results=validation_results,
+            )
+            status = manual_review["grade"]
+        else:
+            status = "manual_review"
     elif validation_results:
         status = "pass" if all(result["returncode_matches_expected"] and not result["timed_out"] for result in validation_results) else "fail"
     else:
@@ -538,7 +648,10 @@ def grade_task(
             status = "pass" if summary.get("final_status") == "resolved" else "fail"
         else:
             status = "fail"
-    return {"grade": status, "validation_results": validation_results}
+    result = {"grade": status, "validation_results": validation_results}
+    if manual_review is not None:
+        result["manual_review"] = manual_review
+    return result
 
 
 def summarize_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -606,7 +719,23 @@ def load_resume_results(
 
 def should_skip_existing_result(result: dict[str, Any] | None) -> bool:
     """Resume should preserve completed passes but rerun failures/timeouts."""
-    return bool(result is not None and result.get("grade") == "pass")
+    return bool(result is not None and result.get("grade") in {"pass", "manual_pass"})
+
+
+def display_grade(grade: str) -> str:
+    return {
+        "manual_pass": "manual pass",
+        "manual_fail": "manual fail",
+        "manual_review": "manual review",
+    }.get(grade, grade)
+
+
+def final_benchmark_grade(task: dict[str, Any], returncode: int, measured_grade: str) -> str:
+    if returncode == 0:
+        return measured_grade
+    if task.get("grading", "manual") == "manual":
+        return "manual_fail"
+    return "fail"
 
 
 def markdown_table(results: list[dict[str, Any]]) -> str:
@@ -624,7 +753,7 @@ def markdown_table(results: list[dict[str, Any]]) -> str:
                 model=result["implementation_profile"],
                 verifier=result.get("feedback_profile") or "same",
                 budget=result.get("reasoning_budget_tokens") or "profile",
-                grade=result["grade"],
+                grade=display_grade(result["grade"]),
                 final=summary.get("final_status", "n/a"),
                 seconds=float(result.get("elapsed_seconds") or 0),
                 attempts=summary.get("approach_attempts", "n/a"),
@@ -643,9 +772,9 @@ def summary_table(results: list[dict[str, Any]]) -> str:
         "|---|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for (mode, model, verifier), items in sorted(groups.items()):
-        passed = sum(1 for item in items if item["grade"] == "pass")
-        failed = sum(1 for item in items if item["grade"] == "fail")
-        manual = sum(1 for item in items if item["grade"] == "manual_review")
+        passed = sum(1 for item in items if item["grade"] in {"pass", "manual_pass"})
+        failed = sum(1 for item in items if item["grade"] in {"fail", "manual_fail"})
+        manual = sum(1 for item in items if str(item["grade"]).startswith("manual_"))
         avg = sum(float(item.get("elapsed_seconds") or 0) for item in items) / max(1, len(items))
         budgets = sorted({str(item.get("reasoning_budget_tokens") or "profile") for item in items})
         lines.append(f"| {mode} | {model} | {verifier} | {', '.join(budgets)} | {len(items)} | {passed} | {failed} | {manual} | {avg:.1f} |")
@@ -663,6 +792,9 @@ def main() -> int:
     parser.add_argument("--reasoning-budget-tokens", type=int)
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--feedback-response-max-tokens", type=int, default=4096)
+    parser.add_argument("--manual-grader-profile", default="")
+    parser.add_argument("--manual-grader-reasoning-budget-tokens", type=int)
+    parser.add_argument("--manual-grader-max-tokens", type=int, default=4096)
     parser.add_argument("--task-id", action="append", default=[])
     parser.add_argument("--limit", type=int)
     parser.add_argument("--output-dir", default="")
@@ -777,8 +909,11 @@ def main() -> int:
             workspace,
             task,
             repo_root=repo_root,
-            docker_post_validation=args.mode == "harness" and args.docker_isolation,
+            docker_post_validation=args.docker_isolation,
             docker_image=cfg["runtime"]["docker_image"] if args.mode == "harness" else "agentic-feedback-coding:local",
+            manual_grader_profile=args.manual_grader_profile or args.implementation_profile,
+            manual_grader_reasoning_budget_tokens=args.manual_grader_reasoning_budget_tokens,
+            manual_grader_max_tokens=args.manual_grader_max_tokens,
         )
         result = {
             "run_mode": args.mode,
@@ -794,9 +929,11 @@ def main() -> int:
             "workspace": str(workspace),
             "returncode": returncode,
             "elapsed_seconds": elapsed,
-            "grade": grade["grade"] if returncode == 0 else "fail",
+            "grade": final_benchmark_grade(task, returncode, grade["grade"]),
             "post_validation": grade["validation_results"],
         }
+        if grade.get("manual_review"):
+            result["manual_review"] = grade["manual_review"]
         if args.mode == "harness":
             result["summary"] = summarize_result(result)
         else:
