@@ -9,7 +9,14 @@ automatic evidence-based pushback, and generated commands run in a separate
 agent container with one writable project mount. Docker reduces the blast
 radius; it does not make arbitrary model-generated work risk-free.
 
-The default local profile is now `Gemma 4 26B A4B QAT MTP`, served by llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395 / Strix Halo. The harness also defines profiles for `Gemma 4 31B QAT MTP` and `Qwen3.6 27B MTP`; the Qwen profile is the available public/local MTP artifact corresponding to the requested Qwen dense slot. Other OpenAI-compatible local or remote models can be configured. Normal work uses two Docker containers for isolation and reproducibility: one model-server container and one agent container on a shared Docker network. The generated project workspace is the agent's only writable host mount; its config is mounted read-only.
+The default local profile is `Gemma 4 26B A4B QAT MTP`, served by
+llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395
+/ Strix Halo. Checked-in profiles also cover Gemma 4 31B QAT MTP, Qwen3.6 27B
+MTP, Qwen3-Coder-Next, and DeepSeek R1 Distill Qwen 7B. Other compatible local
+or remote models can be configured. Normal work uses two Docker containers for
+isolation and reproducibility: one model-server container and one agent
+container on a shared Docker network. The generated project workspace is the
+agent's only writable host mount; its config is mounted read-only.
 
 The project is intentionally config-driven. One JSON file defines the model endpoint, workspace, review strictness, allowed tools, web/offline mode, context-safety limits, and the project prompt.
 
@@ -272,16 +279,22 @@ python -m feedback_agent.model_profiles list
 |---|---|---:|---|---|
 | `gemma4-26b-a4b-qat-mtp` | weak/fast MoE | 8161 | target and MTP draft found under `/mnt/hf/models/gemma4-26b-a4b-it-qat-q4_0-gguf` | Default profile. |
 | `gemma4-31b-qat-mtp` | strong dense | 8162 | target and MTP draft found under `/mnt/hf/models/gemma4-31b-it-qat-gguf` | Higher-quality Gemma slot. |
-| `qwen3.6-27b-mtp` | strong dense | 8163 | profile download target `/mnt/hf/models/qwen3.6-27b-mtp-gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf` | Public MTP artifact corresponding to the requested Qwen dense slot. |
+| `qwen3.6-27b-mtp` | strong dense | 8163 | target found under `/mnt/hf/models/qwen3.6-27b-mtp-gguf` | Public MTP artifact corresponding to the requested Qwen dense slot. |
+| `qwen3-coder-next` | coding MoE | 8164 | four-part Q5_K_M target found under `/mnt/hf/models/qwen3-coder-next-gguf` | Official 80B-total, 3B-active model; non-thinking mode. |
+| `deepseek-r1-distill-qwen-7b` | weak/fast reasoning | 8165 | Q4_K_M target found under `/mnt/hf/models/deepseek-r1-distill-qwen-7b-gguf` | Official Qwen-based distill is 7B, not 8B. |
 
 Start a specific profile:
 
 ```bash
 MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/start_default_model_server.sh
 MODEL_PROFILE=gemma4-31b-qat-mtp bash scripts/start_default_model_server.sh
-MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/download_default_model.sh
 MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/start_default_model_server.sh
+MODEL_PROFILE=qwen3-coder-next bash scripts/start_default_model_server.sh
+MODEL_PROFILE=deepseek-r1-distill-qwen-7b bash scripts/start_default_model_server.sh
 ```
+
+If a configured artifact is missing, run the same command with
+`scripts/download_default_model.sh` first.
 
 The server launcher passes MTP speculative decoding flags to llama.cpp:
 `--spec-type draft-mtp`, `--spec-draft-n-max`, and `--model-draft` when the
@@ -289,7 +302,9 @@ profile has a separate draft GGUF.
 
 Public profile references: [Gemma 4 26B A4B QAT GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF),
 [Gemma 4 31B QAT GGUF](https://huggingface.co/unsloth/gemma-4-31B-it-qat-GGUF),
-and [Qwen3.6 27B MTP GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF).
+[Qwen3.6 27B MTP GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF),
+[Qwen3-Coder-Next GGUF](https://huggingface.co/Qwen/Qwen3-Coder-Next-GGUF),
+and [DeepSeek R1 Distill Qwen 7B GGUF](https://huggingface.co/unsloth/DeepSeek-R1-Distill-Qwen-7B-GGUF).
 
 ## Benchmarks
 
@@ -330,10 +345,11 @@ No hard task deadline was used.
 Long commands remained subject to model-mediated progress review and the
 model-selected command boundary.
 
-The three July 7-9 single-shot baselines are unchanged. They use the same task
-prompts and Docker-isolated graders, but omit analysis, planning, feedback,
-repair, and approach-review loops. No single-shot baseline was run for the two
-new profiles.
+The Gemma and Qwen3.6 zero-shot baselines from July 7-9 are unchanged. Matching
+Coder Next and DeepSeek baselines were added on July 28. The baseline calls each
+model once, asks for one JSON file envelope, and performs Docker-isolated
+grading; it does not run harness analysis, planning, feedback, repair, tools, or
+approach review, and it does not repair a malformed model response.
 
 | Setting | Value |
 |---|---|
@@ -346,8 +362,10 @@ new profiles.
 
 Three graders were demonstrably narrower than their prompts. Only grader/runner
 code was changed, then all three affected tasks were rerun once for all five
-models. Those replacement rows are used below; the original 27 unaffected rows
-remain unchanged.
+harness profiles. Those replacement harness rows are used below; the original
+27 unaffected rows remain unchanged. The July 28 zero-shot runs use the
+corrected graders. The three older zero-shot baselines retain their historical
+grader generation rather than being silently reinterpreted.
 
 | Corrected task | Original grader defect | Corrected independent check |
 |---|---|---|
@@ -357,17 +375,18 @@ remain unchanged.
 
 Manual grades are lower-confidence AI judgments and are labeled `manual pass`
 or `manual fail`. All other grades come from independent return-code and
-artifact checks.
+artifact checks. "Zero-shot" and "single-shot" refer to the same no-harness
+baseline in this document.
 
 #### Summary
 
-| Model | Auto pass | Manual pass | Harness pass | Harness fail | Single-shot pass | Gain vs single | Prior harness | Gain vs prior |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Gemma 4 26B A4B QAT MTP | 22 | 6 | 28 | 2 | 21 | +7 | 25 | +3 |
-| Gemma 4 31B QAT MTP | 21 | 6 | 27 | 3 | 23 | +4 | 24 | +3 |
-| Qwen3.6 27B MTP | 21 | 6 | 27 | 3 | 19 | +8 | 21 | +6 |
-| Qwen3-Coder-Next Q5_K_M | 19 | 6 | 25 | 5 | n/a | n/a | n/a | n/a |
-| DeepSeek R1 Distill Qwen 7B | 0 | 0 | 0 | 30 | n/a | n/a | n/a | n/a |
+| Model | Harness pass | Harness fail | Zero-shot pass | Zero-shot fail | Harness delta | Prior harness | Delta vs prior |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Gemma 4 26B A4B QAT MTP | 28 | 2 | 21 | 9 | +7 | 25 | +3 |
+| Gemma 4 31B QAT MTP | 27 | 3 | 23 | 7 | +4 | 24 | +3 |
+| Qwen3.6 27B MTP | 27 | 3 | 19 | 11 | +8 | 21 | +6 |
+| Qwen3-Coder-Next Q5_K_M | 25 | 5 | 16 | 14 | +9 | n/a | n/a |
+| DeepSeek R1 Distill Qwen 7B | 0 | 30 | 2 | 28 | -2 | n/a | n/a |
 
 | Run | Pass | Fail | Average seconds/task | Total hours |
 |---|---:|---:|---:|---:|
@@ -379,59 +398,101 @@ artifact checks.
 | Single-shot Gemma 26 | 21 | 9 | 47.0 | 0.39 |
 | Single-shot Gemma 31 | 23 | 7 | 80.5 | 0.67 |
 | Single-shot Qwen 27 | 19 | 11 | 106.9 | 0.89 |
+| Single-shot Coder Next | 16 | 14 | 22.2 | 0.19 |
+| Single-shot DeepSeek 7B | 2 | 28 | 56.6 | 0.47 |
 
-#### Per-Task Matrix
+#### Harness Tasks
 
-Times are rounded to the nearest minute. `H` means harness; `single` means the
-unchanged single-shot baseline. The three corrected task IDs are listed in the
-grader table above.
+Times are rounded to the nearest minute. The three corrected task IDs are
+listed in the grader table above.
 
-| Task | G26 H | G31 H | Q27 H | Coder H | DS7 H | G26 single | G31 single | Q27 single |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `algo-001-balanced-grid` | pass 22m | pass 21m | pass 27m | pass 39m | fail 25m | pass 1m | pass 1m | pass 1m |
-| `algo-002-nested-parity` | pass 9m | pass 19m | pass 29m | pass 18m | fail 21m | pass 1m | pass 2m | pass 3m |
-| `algo-003-multiset-path` | pass 45m | pass 17m | pass 20m | pass 14m | fail 15m | pass 1m | pass 1m | pass 2m |
-| `algo-004-layered-filter` | pass 10m | pass 55m | pass 20m | pass 8m | fail 7m | pass 1m | pass 2m | pass 2m |
-| `algo-005-state-machine` | pass 4m | pass 43m | pass 11m | pass 11m | fail 10m | pass 0m | pass 0m | pass 0m |
-| `code-001-slug-cli` | pass 7m | pass 28m | pass 36m | pass 29m | fail 4m | pass 1m | pass 1m | pass 1m |
-| `code-003-interval-merge` | pass 6m | pass 30m | fail 34m | fail 5m | fail 17m | pass 1m | pass 1m | fail 2m |
-| `code-004-config-normalizer` | pass 8m | pass 33m | pass 26m | pass 12m | fail 10m | fail 1m | fail 1m | fail 1m |
-| `code-005-existing-bugfix` | pass 5m | pass 14m | pass 28m | pass 9m | fail 6m | pass 1m | pass 1m | pass 2m |
-| `tool-001-disk-monitor` | pass 14m | pass 23m | pass 19m | pass 17m | fail 6m | fail 1m | pass 3m | fail 1m |
-| `tool-002-log-watch` | pass 8m | fail 33m | pass 37m | fail 16m | fail 7m | fail 1m | pass 2m | pass 3m |
-| `tool-003-output-truncation` | pass 25m | pass 15m | pass 20m | pass 8m | fail 9m | pass 1m | pass 1m | pass 1m |
-| `tool-004-timeout-friendly` | pass 8m | pass 27m | fail 33m | pass 23m | fail 10m | fail 1m | pass 1m | pass 1m |
-| `tool-005-curl-json-safety` | manual pass 5m | manual pass 22m | manual pass 54m | manual pass 6m | manual fail 4m | manual pass 0m | manual pass 1m | manual pass 1m |
-| `web-001-static-accessibility` | pass 5m | pass 23m | pass 44m | pass 11m | fail 7m | pass 1m | fail 2m | fail 4m |
-| `web-002-browser-interaction` | pass 26m | pass 87m | pass 57m | pass 40m | fail 10m | fail 1m | fail 1m | fail 2m |
-| `workflow-001-analysis-first` | manual pass 5m | manual pass 16m | manual pass 18m | manual pass 4m | manual fail 15m | manual pass 1m | manual pass 1m | manual pass 1m |
-| `workflow-002-autonomous-repair` | manual pass 6m | manual pass 14m | manual pass 18m | manual pass 6m | manual fail 4m | manual pass 1m | manual pass 1m | manual pass 1m |
-| `data-001-csv-window` | pass 6m | pass 28m | pass 28m | fail 9m | fail 18m | fail 1m | fail 2m | fail 1m |
-| `data-002-dedupe` | pass 6m | pass 57m | pass 34m | pass 31m | fail 6m | pass 1m | pass 1m | pass 2m |
-| `safety-001-no-destructive-tools` | manual pass 6m | manual pass 23m | manual pass 19m | manual pass 18m | manual fail 5m | manual pass 1m | manual pass 1m | manual pass 1m |
-| `safety-002-context-overflow` | pass 5m | pass 19m | pass 32m | fail 22m | fail 9m | pass 1m | pass 1m | fail 1m |
-| `planning-001-conflict-resolution` | manual pass 7m | manual pass 14m | manual pass 19m | manual pass 7m | manual fail 9m | manual pass 1m | manual pass 1m | manual pass 1m |
-| `planning-002-plan-update` | manual pass 6m | manual pass 13m | manual pass 18m | manual pass 5m | manual fail 8m | manual pass 0m | manual pass 1m | manual pass 1m |
-| `long-001-periodic-summary` | pass 17m | pass 46m | pass 28m | pass 6m | fail 10m | fail 1m | fail 1m | fail 1m |
-| `integration-001-mini-package` | pass 12m | pass 44m | pass 34m | pass 24m | fail 8m | fail 1m | fail 1m | fail 1m |
-| `hist-001-real-palindrome` | pass 9m | pass 29m | pass 40m | pass 17m | fail 19m | pass 1m | pass 1m | pass 2m |
-| `hist-002-real-jsonl-stats` | fail 15m | fail 104m | pass 64m | pass 20m | fail 27m | pass 1m | pass 4m | fail 4m |
-| `hist-003-real-existing-invoice-bugfix` | pass 21m | pass 48m | pass 42m | pass 13m | fail 9m | pass 1m | pass 1m | pass 1m |
-| `hist-006-dotnet-dependency` | fail 91m | fail 256m | fail 30m | fail 24m | fail 5m | fail 1m | fail 4m | fail 7m |
+| Task | Gemma 26 | Gemma 31 | Qwen 27 | Coder Next | DeepSeek 7B |
+|---|---:|---:|---:|---:|---:|
+| `algo-001-balanced-grid` | pass 22m | pass 21m | pass 27m | pass 39m | fail 25m |
+| `algo-002-nested-parity` | pass 9m | pass 19m | pass 29m | pass 18m | fail 21m |
+| `algo-003-multiset-path` | pass 45m | pass 17m | pass 20m | pass 14m | fail 15m |
+| `algo-004-layered-filter` | pass 10m | pass 55m | pass 20m | pass 8m | fail 7m |
+| `algo-005-state-machine` | pass 4m | pass 43m | pass 11m | pass 11m | fail 10m |
+| `code-001-slug-cli` | pass 7m | pass 28m | pass 36m | pass 29m | fail 4m |
+| `code-003-interval-merge` | pass 6m | pass 30m | fail 34m | fail 5m | fail 17m |
+| `code-004-config-normalizer` | pass 8m | pass 33m | pass 26m | pass 12m | fail 10m |
+| `code-005-existing-bugfix` | pass 5m | pass 14m | pass 28m | pass 9m | fail 6m |
+| `tool-001-disk-monitor` | pass 14m | pass 23m | pass 19m | pass 17m | fail 6m |
+| `tool-002-log-watch` | pass 8m | fail 33m | pass 37m | fail 16m | fail 7m |
+| `tool-003-output-truncation` | pass 25m | pass 15m | pass 20m | pass 8m | fail 9m |
+| `tool-004-timeout-friendly` | pass 8m | pass 27m | fail 33m | pass 23m | fail 10m |
+| `tool-005-curl-json-safety` | manual pass 5m | manual pass 22m | manual pass 54m | manual pass 6m | manual fail 4m |
+| `web-001-static-accessibility` | pass 5m | pass 23m | pass 44m | pass 11m | fail 7m |
+| `web-002-browser-interaction` | pass 26m | pass 87m | pass 57m | pass 40m | fail 10m |
+| `workflow-001-analysis-first` | manual pass 5m | manual pass 16m | manual pass 18m | manual pass 4m | manual fail 15m |
+| `workflow-002-autonomous-repair` | manual pass 6m | manual pass 14m | manual pass 18m | manual pass 6m | manual fail 4m |
+| `data-001-csv-window` | pass 6m | pass 28m | pass 28m | fail 9m | fail 18m |
+| `data-002-dedupe` | pass 6m | pass 57m | pass 34m | pass 31m | fail 6m |
+| `safety-001-no-destructive-tools` | manual pass 6m | manual pass 23m | manual pass 19m | manual pass 18m | manual fail 5m |
+| `safety-002-context-overflow` | pass 5m | pass 19m | pass 32m | fail 22m | fail 9m |
+| `planning-001-conflict-resolution` | manual pass 7m | manual pass 14m | manual pass 19m | manual pass 7m | manual fail 9m |
+| `planning-002-plan-update` | manual pass 6m | manual pass 13m | manual pass 18m | manual pass 5m | manual fail 8m |
+| `long-001-periodic-summary` | pass 17m | pass 46m | pass 28m | pass 6m | fail 10m |
+| `integration-001-mini-package` | pass 12m | pass 44m | pass 34m | pass 24m | fail 8m |
+| `hist-001-real-palindrome` | pass 9m | pass 29m | pass 40m | pass 17m | fail 19m |
+| `hist-002-real-jsonl-stats` | fail 15m | fail 104m | pass 64m | pass 20m | fail 27m |
+| `hist-003-real-existing-invoice-bugfix` | pass 21m | pass 48m | pass 42m | pass 13m | fail 9m |
+| `hist-006-dotnet-dependency` | fail 91m | fail 256m | fail 30m | fail 24m | fail 5m |
+
+#### Zero-Shot Tasks
+
+`0m` means under 30 seconds. The first three columns retain the original July
+7-9 baseline graders; Coder Next and DeepSeek use the corrected July 28 grader
+generation described above.
+
+| Task | Gemma 26 | Gemma 31 | Qwen 27 | Coder Next | DeepSeek 7B |
+|---|---:|---:|---:|---:|---:|
+| `algo-001-balanced-grid` | pass 1m | pass 1m | pass 1m | fail 0m | fail 2m |
+| `algo-002-nested-parity` | pass 1m | pass 2m | pass 3m | fail 0m | fail 1m |
+| `algo-003-multiset-path` | pass 1m | pass 1m | pass 2m | fail 0m | fail 1m |
+| `algo-004-layered-filter` | pass 1m | pass 2m | pass 2m | fail 0m | fail 1m |
+| `algo-005-state-machine` | pass 0m | pass 0m | pass 0m | fail 0m | fail 0m |
+| `code-001-slug-cli` | pass 1m | pass 1m | pass 1m | pass 0m | pass 0m |
+| `code-003-interval-merge` | pass 1m | pass 1m | fail 2m | pass 1m | pass 0m |
+| `code-004-config-normalizer` | fail 1m | fail 1m | fail 1m | pass 0m | fail 0m |
+| `code-005-existing-bugfix` | pass 1m | pass 1m | pass 2m | pass 0m | fail 0m |
+| `tool-001-disk-monitor` | fail 1m | pass 3m | fail 1m | fail 0m | fail 0m |
+| `tool-002-log-watch` | fail 1m | pass 2m | pass 3m | fail 0m | fail 1m |
+| `tool-003-output-truncation` | pass 1m | pass 1m | pass 1m | fail 0m | fail 0m |
+| `tool-004-timeout-friendly` | fail 1m | pass 1m | pass 1m | fail 1m | fail 3m |
+| `tool-005-curl-json-safety` | manual pass 0m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
+| `web-001-static-accessibility` | pass 1m | fail 2m | fail 4m | fail 1m | fail 1m |
+| `web-002-browser-interaction` | fail 1m | fail 1m | fail 2m | fail 0m | fail 1m |
+| `workflow-001-analysis-first` | manual pass 1m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
+| `workflow-002-autonomous-repair` | manual pass 1m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
+| `data-001-csv-window` | fail 1m | fail 2m | fail 1m | pass 0m | fail 0m |
+| `data-002-dedupe` | pass 1m | pass 1m | pass 2m | pass 0m | fail 0m |
+| `safety-001-no-destructive-tools` | manual pass 1m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
+| `safety-002-context-overflow` | pass 1m | pass 1m | fail 1m | fail 0m | fail 0m |
+| `planning-001-conflict-resolution` | manual pass 1m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
+| `planning-002-plan-update` | manual pass 0m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
+| `long-001-periodic-summary` | fail 1m | fail 1m | fail 1m | pass 0m | fail 0m |
+| `integration-001-mini-package` | fail 1m | fail 1m | fail 1m | pass 0m | fail 10m |
+| `hist-001-real-palindrome` | pass 1m | pass 1m | pass 2m | pass 0m | fail 0m |
+| `hist-002-real-jsonl-stats` | pass 1m | pass 4m | fail 4m | fail 2m | fail 1m |
+| `hist-003-real-existing-invoice-bugfix` | pass 1m | pass 1m | pass 1m | pass 0m | fail 2m |
+| `hist-006-dotnet-dependency` | fail 1m | fail 4m | fail 7m | fail 1m | fail 0m |
 
 #### Findings
 
-- The harness is net positive on all three directly comparable profiles:
-  `+7`, `+4`, and `+8` passes over single-shot, and `+3`, `+3`, and `+6`
-  over the prior harness revision.
-- Quality costs substantial time. The comparable harness runs averaged about
-  17 to 30 times the single-shot wall time per task.
-- Coder Next passed 25/30 externally, but often returned internal
-  `cannot_resolve` after producing a passing artifact. Its protocol-repair and
-  false-negative review overhead remain inefficient.
-- DeepSeek 7B passed 0/30 because it repeatedly failed the analysis/review JSON
-  protocol before execution. This establishes incompatibility with this
-  workflow/profile, not that the base model cannot solve any task single-shot.
+- The harness is net positive on four of five profiles: Gemma 26 `+7`, Gemma 31
+  `+4`, Qwen3.6 `+8`, and Coder Next `+9` passes over zero-shot. The original
+  three also improve by `+3`, `+3`, and `+6` over the prior harness revision.
+- The quality gain costs substantial time. Positive profiles averaged about 17
+  to 43 times their zero-shot wall time per task.
+- Coder Next is the strongest demonstration of useful repair: 16/30 zero-shot
+  became 25/30 with the harness. It nevertheless often returned internal
+  `cannot_resolve` after producing a passing artifact, so protocol repair and
+  false-negative review remain inefficient.
+- DeepSeek is the counterexample: 2/30 zero-shot became 0/30 while taking about
+  11 times longer. It repeatedly failed exact analysis/review JSON before
+  execution. The harness should reject or adapt an incompatible control profile
+  early rather than spending hours without reaching task work.
 - A generic frozen-harness defect was reproduced: a model tool response with
   `"timeout_seconds": null` raises `TypeError` during evidence normalization.
   It caused the corrected Qwen .NET row to fail and also appeared in Coder
@@ -471,7 +532,9 @@ Use `--mode single-shot` for the no-harness path. The runner writes
 `workspaces/benchmarks/<timestamp>/`. Both are intentionally ignored by git.
 The normalized publication results are recorded in the tables above. Local raw
 evidence for this run is under `runs/publication-20260725-final/`, with uniform
-grader reruns under its `grader-corrections/` directory.
+grader reruns under its `grader-corrections/` directory. The added Coder Next
+and DeepSeek zero-shot evidence is under
+`runs/publication-20260728-zero-shot/`.
 
 Before the first task, the runner normally rebuilds the agent image from the
 current source. The runtime image excludes benchmark prompts, graders,
@@ -491,7 +554,8 @@ evidence.
 | Config validation | All 15 checked-in configs loaded through production validation. |
 | Corpus integrity | 44 unique task IDs; publication, calibration, and correction suites dry-loaded 30, 5, and 3 tasks. |
 | Docker runtime | Frozen image digest matched the receipt and `python -m feedback_agent.cli --help` passed inside it. |
-| Model isolation | All five profiles ran sequentially, one model server plus one agent container. |
+| Harness isolation | All five profiles ran sequentially, one model server plus one agent container. |
+| Zero-shot coverage | All five profiles now have 30-task baselines; Coder Next and DeepSeek were added July 28. |
 
 ## Safety Model
 
