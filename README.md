@@ -493,10 +493,11 @@ generation described above.
   11 times longer. It repeatedly failed exact analysis/review JSON before
   execution. The harness should reject or adapt an incompatible control profile
   early rather than spending hours without reaching task work.
-- A generic frozen-harness defect was reproduced: a model tool response with
-  `"timeout_seconds": null` raises `TypeError` during evidence normalization.
-  It caused the corrected Qwen .NET row and Coder Next's log-watch row to fail
-  after the models had already completed substantial task work.
+- A generic frozen-harness defect was reproduced: an explicitly unlimited
+  command (`"timeout_seconds": 0`) is recorded as `null`, then evidence
+  reconstruction calls `int(null)` and raises `TypeError`. It caused the
+  corrected Qwen .NET row and Coder Next's log-watch row to fail after the
+  models had already completed substantial task work.
 - Unlimited task duration worked as intended: Gemma 31's corrected .NET run
   continued for 256 minutes and exhausted model-led repairs rather than a hard
   deadline. It still failed, showing that more time alone does not guarantee
