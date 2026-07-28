@@ -495,8 +495,8 @@ generation described above.
   early rather than spending hours without reaching task work.
 - A generic frozen-harness defect was reproduced: a model tool response with
   `"timeout_seconds": null` raises `TypeError` during evidence normalization.
-  It caused the corrected Qwen .NET row to fail after the model had already
-  completed substantial task work.
+  It caused the corrected Qwen .NET row and Coder Next's log-watch row to fail
+  after the models had already completed substantial task work.
 - Unlimited task duration worked as intended: Gemma 31's corrected .NET run
   continued for 256 minutes and exhausted model-led repairs rather than a hard
   deadline. It still failed, showing that more time alone does not guarantee
