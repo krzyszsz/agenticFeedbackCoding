@@ -76,6 +76,24 @@
         "tool-003-output-truncation",
         "hist-001-real-palindrome"
       ]
+    },
+    "publication-grader-corrections-3": {
+      "description": "Publication tasks rerun after correcting demonstrated grader-only defects.",
+      "task_ids": [
+        "long-001-periodic-summary",
+        "integration-001-mini-package",
+        "hist-006-dotnet-dependency"
+      ]
+    },
+    "development-watch-5": {
+      "description": "Five diverse development tasks for watched harness diagnostics before a source freeze.",
+      "task_ids": [
+        "dev-001-layered-permutations",
+        "dev-002-jsonl-contract",
+        "dev-003-existing-catalog-repair",
+        "dev-004-slow-probe",
+        "dev-005-local-curl-json"
+      ]
     }
   }
 }

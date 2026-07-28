@@ -25,7 +25,5 @@ RUN set -eux; \
 
 WORKDIR /app
 COPY feedback_agent /app/feedback_agent
-COPY tests /app/tests
-COPY config.example.json /app/config.example.json
 
 ENTRYPOINT ["python", "-m", "feedback_agent.cli"]

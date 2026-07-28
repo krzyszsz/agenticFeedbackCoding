@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-import shlex
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .bounds import run_bounded_process
 
@@ -63,14 +63,18 @@ SKIPPED_WORKSPACE_DIRS = {
     ".ruff_cache",
     ".venv",
     "__pycache__",
+    "node_modules",
+    "venv",
+}
+
+
+LOW_PRIORITY_WORKSPACE_DIRS = {
     "bin",
     "build",
     "dist",
-    "node_modules",
     "obj",
     "out",
     "target",
-    "venv",
 }
 
 
@@ -88,134 +92,66 @@ def append_plan_note(workspace: Path, note: str, plan_filename: str = "PLAN.md")
         f.write(f"\n- {note.strip()}\n")
 
 
-def _json_object_candidates(text: str) -> list[tuple[int, int, str]]:
-    """Return balanced JSON-object-looking substrings from noisy model output."""
-    candidates: list[tuple[int, int, str]] = []
-    in_string = False
-    escaped = False
-    starts: list[int] = []
-    for index, char in enumerate(text):
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-            continue
-        if char == "{":
-            starts.append(index)
-    for start in starts:
-        depth = 0
-        in_string = False
-        escaped = False
-        for index in range(start, len(text)):
-            char = text[index]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    in_string = False
-                continue
-            if char == '"':
-                in_string = True
-                continue
-            if char == "{":
-                depth += 1
-                continue
-            if char == "}" and depth:
-                depth -= 1
-                if depth == 0:
-                    candidates.append((start, index + 1, text[start:index + 1]))
-                    break
-    return candidates
-
-
 def _strip_common_model_wrappers(text: str) -> str:
-    """Remove chat-template debris without changing the model's JSON content."""
+    """Remove server transport debris without accepting model-authored prose."""
     stripped = text.strip()
     stripped = re.sub(r"^\s*<\|channel\>[^<]*<channel\|>\s*", "", stripped)
     stripped = re.sub(r"^\s*<\|[^>]+?\|>\s*", "", stripped)
     stripped = _strip_complete_think_blocks(stripped)
-    if stripped.startswith("```"):
-        stripped = stripped.strip("`")
-        if stripped.startswith("json"):
-            stripped = stripped[4:].strip()
     return stripped
 
 
 def _strip_complete_think_blocks(text: str) -> str:
     """Remove completed thinking blocks before structured-output parsing.
 
-    Thinking is intentionally preserved in transcripts for later model context,
-    but JSON extraction should not let an unfinished `{` inside `<think>` poison
-    the parse of the final structured response.
+    The current phase can inspect a complete reasoning block before parsing, but
+    durable active history omits it. JSON extraction must not let an unfinished
+    `{` inside `<think>` poison the parse of the final structured response.
     """
-    return re.sub(r"<think\b[^>]*>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    return re.sub(
+        r"^\s*(?:<think\b[^>]*>.*?</think>\s*)+",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
 
 def extract_json_object(text: str) -> dict:
+    if re.search(r"^\s*<think\b", text, flags=re.IGNORECASE) and not re.search(
+        r"</think>", text, flags=re.IGNORECASE
+    ):
+        raise ValueError("Model output contains an unclosed reasoning block; request a clean JSON response.")
     stripped = _strip_common_model_wrappers(text)
-    if stripped.startswith("```"):
-        stripped = stripped.strip("`")
-        if stripped.startswith("json"):
-            stripped = stripped[4:].strip()
-    # Qwen-family models often prepend reasoning even when asked for JSON.
-    # We do not treat that as success, but the parser can still recover the
-    # first complete object so the orchestration loop can keep moving.
-    candidates = _json_object_candidates(stripped)
-    parsed: list[tuple[int, int, dict]] = []
-    for start, end, candidate in candidates:
-        for variant in (candidate, _repair_common_model_json_escapes(candidate)):
-            try:
-                value = json.loads(variant)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                parsed.append((start, end, value))
-                break
-    if parsed:
-        # Local models sometimes emit an initial JSON object, then say "wait"
-        # and emit the corrected object. The last parseable object is usually
-        # the one the model intended us to use. Ignore parseable nested objects
-        # even when the containing object failed to parse: accepting a nested
-        # planning_confirmation or command fragment as the phase payload silently
-        # corrupts the workflow state and hides the real malformed response.
-        top_level = [
-            item for item in parsed
-            if not any(
-                other_start < item[0] and item[1] < other_end
-                for other_start, other_end, _candidate in candidates
-            )
-        ]
-        if top_level:
-            return top_level[-1][2]
-        raise ValueError("Only nested JSON objects were parseable inside a malformed larger object.")
-    raise ValueError(f"No JSON object found in model output: {text[:200]}")
-
-
-def _repair_common_model_json_escapes(candidate: str) -> str:
-    r"""Repair common invalid escapes in otherwise JSON-looking model output.
-
-    Qwen/Gemma-style local models sometimes write strings like `</div\>` while
-    discussing HTML. JSON only permits a small escape alphabet, so that one
-    character can make a useful review impossible to parse. Removing the stray
-    backslash preserves the model's intended text without accepting arbitrary
-    non-JSON syntax.
-    """
-    return re.sub(r'\\([^"\\/bfnrtu])', r"\1", candidate)
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Model output was not exactly one valid JSON object; request the same answer again in the protocol. "
+            f"JSON error: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ValueError("Model output JSON must be an object.")
+    return value
 
 
 def _safe_relpath(path_text: str) -> Path:
     rel = Path(path_text)
-    if rel.is_absolute() or ".." in rel.parts:
+    if not path_text.strip() or rel == Path(".") or rel.is_absolute() or ".." in rel.parts:
         raise ValueError(f"Unsafe file path from model: {rel}")
+    if rel.parts[0] in {".agent_state", ".git"}:
+        raise ValueError(f"Model file path targets harness or repository control state: {rel}")
     return rel
+
+
+def _workspace_target(workspace: Path, rel: Path) -> Path:
+    """Resolve existing symlinks and reject paths that escape the workspace."""
+    root = workspace.resolve()
+    target = (root / rel).resolve(strict=False)
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"Unsafe file path from model resolves outside workspace: {rel}") from exc
+    return target
 
 
 def write_files(workspace: Path, files: list[dict]) -> list[str]:
@@ -228,7 +164,7 @@ def write_files(workspace: Path, files: list[dict]) -> list[str]:
     written: list[str] = []
     for item in files:
         rel = _safe_relpath(str(item["path"]))
-        target = workspace / rel
+        target = _workspace_target(workspace, rel)
         target.parent.mkdir(parents=True, exist_ok=True)
         content = item.get("content", "")
         if isinstance(content, str):
@@ -246,7 +182,7 @@ def write_files(workspace: Path, files: list[dict]) -> list[str]:
 
 
 def _command_parts_and_timeout(
-    command: list[Any] | str | dict[str, Any],
+    command: list[Any] | dict[str, Any],
     default_timeout_seconds: int,
     max_timeout_seconds: int,
 ) -> tuple[list[str], int, int]:
@@ -257,40 +193,42 @@ def _command_parts_and_timeout(
     it may also use {"cmd": [...], "expected_returncode": 2}. Positive requested
     timeouts are clamped by a positive max timeout. A requested/default timeout
     of 0 disables the hard command deadline so progress review, not elapsed time
-    alone, decides whether the process should keep running. If a local model
-    returns a plain string despite the schema, split it as a shell-like command
-    but still execute it without a shell.
+    alone, decides whether the process should keep running. The execution
+    boundary accepts the same explicit argv protocol that model turns are asked
+    to use; malformed command shapes must be repaired conversationally before
+    execution rather than being guessed here.
     """
     if isinstance(command, dict):
-        parts = command.get("cmd") or command.get("command") or []
-        requested_timeout = int(command.get("timeout_seconds", default_timeout_seconds))
-        expected_returncode = int(command.get("expected_returncode", 0))
+        if "cmd" not in command:
+            raise ValueError("command object must contain a list-valued cmd")
+        parts = command["cmd"]
+        timeout_value = command.get("timeout_seconds", default_timeout_seconds)
+        returncode_value = command.get("expected_returncode", 0)
+        if isinstance(timeout_value, bool) or not isinstance(timeout_value, int):
+            raise ValueError("timeout_seconds must be an integer")
+        if isinstance(returncode_value, bool) or not isinstance(returncode_value, int):
+            raise ValueError("expected_returncode must be an integer")
+        requested_timeout = timeout_value
+        expected_returncode = returncode_value
     else:
         parts = command
         requested_timeout = default_timeout_seconds
         expected_returncode = 0
-    if isinstance(parts, str):
-        parts = shlex.split(parts)
+    if not isinstance(parts, list):
+        raise ValueError("command must be an argv list or an object with a list-valued cmd")
+    if not parts:
+        raise ValueError("command argv must not be empty")
+    if not all(isinstance(part, str) and part for part in parts):
+        raise ValueError("command argv must contain only non-empty strings")
+    if any("\x00" in part for part in parts):
+        raise ValueError("command argv must not contain NUL bytes")
     if requested_timeout <= 0:
         timeout = 0
     elif max_timeout_seconds <= 0:
         timeout = requested_timeout
     else:
         timeout = max(1, min(requested_timeout, max_timeout_seconds))
-    return [str(part) for part in parts], timeout, expected_returncode
-
-
-def _server_only_command_reason(parts: list[str]) -> str:
-    joined = " ".join(parts).lower()
-    if len(parts) >= 3 and parts[0].endswith("python") and parts[1] == "-m" and parts[2] == "http.server":
-        return "python -m http.server starts a long-running server but does not assert behavior"
-    if "python -m http.server" in joined:
-        return "python -m http.server starts a long-running server but does not assert behavior"
-    if parts and parts[0] in {"http-server", "live-server", "vite"} and not any(
-        marker in joined for marker in ("test", "validate", "check", "playwright", "selenium")
-    ):
-        return f"{parts[0]} starts a long-running server but does not assert behavior"
-    return ""
+    return list(parts), timeout, expected_returncode
 
 
 def _git_mutation_reason(parts: list[str]) -> str:
@@ -301,7 +239,7 @@ def _git_mutation_reason(parts: list[str]) -> str:
     them to commit during an implementation attempt hides the diff from the
     feedback agent and breaks the accepted-step commit protocol.
     """
-    if not parts or parts[0] != "git":
+    if not parts or Path(parts[0]).name != "git":
         return ""
     readonly = {
         "status",
@@ -310,8 +248,6 @@ def _git_mutation_reason(parts: list[str]) -> str:
         "show",
         "rev-parse",
         "ls-files",
-        "branch",
-        "config",
     }
     subcommand = ""
     for part in parts[1:]:
@@ -320,6 +256,24 @@ def _git_mutation_reason(parts: list[str]) -> str:
             break
     if not subcommand or subcommand in readonly:
         return ""
+    subcommand_index = parts.index(subcommand)
+    subcommand_args = parts[subcommand_index + 1:]
+    if subcommand == "branch" and all(
+        part in {"--list", "-l", "--show-current", "--contains", "--no-contains", "--merged", "--no-merged"}
+        or part.startswith("--format=")
+        for part in subcommand_args
+    ):
+        return ""
+    if subcommand == "config":
+        read_options = {"--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l"}
+        mutating_options = {"--add", "--replace-all", "--unset", "--unset-all", "--remove-section", "--rename-section"}
+        if any(part in mutating_options for part in subcommand_args):
+            return (
+                "git config mutation is not allowed in model-requested commands. "
+                "The harness owns repository configuration"
+            )
+        if subcommand_args and subcommand_args[0] in read_options:
+            return ""
     return (
         f"git {subcommand} mutates repository state. The harness owns staging, "
         "commits, and final reset policy after feedback accepts a step"
@@ -336,6 +290,7 @@ def run_commands(
     progress_callback: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     progress_interval_seconds: int = 0,
     progress_min_interval_seconds: int = 1,
+    progress_max_interval_seconds: int = 0,
 ) -> list[dict]:
     """Run bounded validation commands inside the workspace.
 
@@ -346,26 +301,29 @@ def run_commands(
     results: list[dict] = []
     max_timeout = timeout_seconds if max_timeout_seconds is None else max_timeout_seconds
     for index, command in enumerate(commands):
-        if not command:
-            continue
-        parts, command_timeout, expected_returncode = _command_parts_and_timeout(command, timeout_seconds, max_timeout)
-        if not parts:
-            continue
-        server_reason = _server_only_command_reason(parts)
-        if server_reason:
+        command_metadata = {
+            "timeout_explicit": isinstance(command, dict) and "timeout_seconds" in command,
+        }
+        declared_validation = isinstance(command, dict) and command.get("validation") is True
+        final_state = not (isinstance(command, dict) and command.get("final_state") is False)
+        try:
+            parts, command_timeout, expected_returncode = _command_parts_and_timeout(
+                command,
+                timeout_seconds,
+                max_timeout,
+            )
+        except (TypeError, ValueError) as exc:
             results.append({
-                "command": parts,
-                "timeout_seconds": command_timeout,
+                "command": command,
+                "command_index": index,
+                "timeout_seconds": timeout_seconds,
                 "returncode": 125,
-                "expected_returncode": expected_returncode,
-                "returncode_matches_expected": 125 == expected_returncode,
+                "expected_returncode": 0,
+                "returncode_matches_expected": False,
                 "stdout": "",
-                "stderr": (
-                    f"{server_reason}. Put server startup inside a validation script "
-                    "that starts the server, performs assertions, then exits."
-                ),
+                "stderr": f"Invalid command payload: {exc}",
                 "timed_out": False,
-                "skipped_as_non_verifying_server": True,
+                "invalid_command": True,
             })
             continue
         if not allow_git_mutation:
@@ -381,6 +339,9 @@ def run_commands(
                     "stderr": git_reason,
                     "timed_out": False,
                     "blocked_git_mutation": True,
+                    "declared_validation": declared_validation,
+                    "final_state": final_state,
+                    "command_metadata": command_metadata,
                 })
                 continue
         command_progress_callback = None
@@ -398,9 +359,13 @@ def run_commands(
             progress_callback=command_progress_callback,
             progress_interval_seconds=progress_interval_seconds,
             progress_min_interval_seconds=progress_min_interval_seconds,
+            progress_max_interval_seconds=progress_max_interval_seconds,
         )
         result["expected_returncode"] = expected_returncode
         result["returncode_matches_expected"] = result["returncode"] == expected_returncode
+        result["declared_validation"] = declared_validation
+        result["final_state"] = final_state
+        result["command_metadata"] = command_metadata
         results.append(result)
     return results
 
@@ -413,8 +378,10 @@ def normalize_step(step: dict[str, Any], index: int) -> dict[str, Any]:
         "description": str(step.get("description") or ""),
         "depends_on": [str(x) for x in step.get("depends_on", [])],
         "acceptance_criteria": [str(x) for x in step.get("acceptance_criteria", [])],
+        "validation_method": str(step.get("validation_method") or ""),
         "validation_commands": step.get("validation_commands", []),
-        "status": str(step.get("status") or "pending"),
+        # Execution state belongs to the harness, never to model-authored plan JSON.
+        "status": "pending",
     }
 
 
@@ -466,7 +433,7 @@ def write_requirements_doc(
     if review:
         lines.append("")
         lines.append("## Last Requirements Review")
-        lines.append(f"- Status: {review.get('status') or ('needs_rework' if review.get('needs_rework') else 'resolved')}")
+        lines.append(f"- Status: {review.get('status') or 'unknown'}")
         lines.append(f"- Summary: {review.get('summary', 'no summary')}")
     (workspace / requirements_filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -533,6 +500,8 @@ def write_plan_doc(
             lines.append("  - Acceptance criteria:")
             for criterion in step["acceptance_criteria"]:
                 lines.append(f"    - {criterion}")
+        if step.get("validation_method"):
+            lines.append(f"  - Validation method: {step['validation_method']}")
         if step.get("validation_commands"):
             lines.append("  - Validation commands:")
             for command in step["validation_commands"]:
@@ -548,31 +517,140 @@ def write_plan_doc(
     (workspace / plan_filename).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def collect_workspace_files(workspace: Path, max_file_bytes: int = 20000) -> list[dict[str, Any]]:
+def collect_workspace_files(
+    workspace: Path,
+    max_file_bytes: int = 20000,
+    *,
+    max_files: int = 1000,
+    max_total_chars: int = 2_000_000,
+) -> list[dict[str, Any]]:
+    """Collect a bounded project snapshot for model evidence.
+
+    Per-file clipping is insufficient when a tool creates thousands of small
+    files. This boundary also caps the number and aggregate represented text of
+    files before the snapshot is retained in run state. Common build-output
+    directories are considered after ordinary source paths rather than hidden,
+    because they may be the requested deliverable.
+    """
     files: list[dict[str, Any]] = []
-    for path in sorted(workspace.rglob("*")):
-        if not path.is_file() or any(part in SKIPPED_WORKSPACE_DIRS for part in path.relative_to(workspace).parts):
+    root = workspace.resolve()
+    represented_chars = 0
+
+    def path_priority(path: Path) -> tuple[int, str]:
+        rel_parts = path.relative_to(root).parts
+        low_priority = int(any(part in LOW_PRIORITY_WORKSPACE_DIRS for part in rel_parts))
+        return low_priority, path.as_posix()
+
+    def candidate_paths() -> Iterator[Path]:
+        deferred_roots: list[Path] = []
+        for current, directory_names, file_names in os.walk(root, topdown=True, followlinks=False):
+            current_path = Path(current)
+            ordinary_directories: list[str] = []
+            for name in sorted(directory_names):
+                if name in SKIPPED_WORKSPACE_DIRS:
+                    continue
+                child = current_path / name
+                if name in LOW_PRIORITY_WORKSPACE_DIRS and not child.is_symlink():
+                    deferred_roots.append(child)
+                else:
+                    ordinary_directories.append(name)
+            directory_names[:] = ordinary_directories
+            for name in sorted(file_names):
+                yield current_path / name
+
+        for deferred_root in sorted(set(deferred_roots), key=path_priority):
+            for current, directory_names, file_names in os.walk(
+                deferred_root,
+                topdown=True,
+                followlinks=False,
+            ):
+                directory_names[:] = sorted(
+                    name for name in directory_names
+                    if name not in SKIPPED_WORKSPACE_DIRS
+                )
+                current_path = Path(current)
+                for name in sorted(file_names):
+                    yield current_path / name
+
+    def append_boundary(reason: str, first_omitted_path: Path) -> None:
+        nonlocal represented_chars
+        omitted_path = str(first_omitted_path.relative_to(root))
+        content = (
+            f"[workspace snapshot truncated: {reason}; first omitted path: "
+            f"{omitted_path}; additional files may exist]"
+        )
+        if max_total_chars > 0:
+            remaining = max(0, max_total_chars - represented_chars)
+            content = content[:remaining]
+        files.append({
+            "path": "[workspace snapshot boundary]",
+            "content": content,
+            "size": 0,
+            "truncated": True,
+            "snapshot_boundary": True,
+            "snapshot_boundary_reason": reason,
+            "first_omitted_path": omitted_path,
+        })
+        represented_chars += len(content)
+
+    def exceeds_total_limit(item_chars: int) -> bool:
+        return max_total_chars > 0 and represented_chars + item_chars > max_total_chars
+
+    for path in candidate_paths():
+        if not path.is_file():
             continue
-        rel = path.relative_to(workspace)
+        if max_files > 0 and len(files) >= max_files:
+            append_boundary(f"kept at most {max_files} files", path)
+            break
+        rel = path.relative_to(root)
+        try:
+            path.resolve(strict=True).relative_to(root)
+        except (OSError, ValueError):
+            item = {
+                "path": str(rel),
+                "content": "[workspace file omitted: path resolves outside workspace or became unavailable]",
+                "size": 0,
+                "truncated": False,
+                "unsafe_path": True,
+            }
+            item_chars = len(item["content"])
+            if exceeds_total_limit(item_chars):
+                append_boundary(f"kept at most {max_total_chars} represented characters", path)
+                break
+            files.append(item)
+            represented_chars += item_chars
+            continue
         size = path.stat().st_size
         with path.open("rb") as f:
             sample = f.read(min(size, 4096))
         if _looks_like_binary_file(path, sample):
-            files.append({
+            item = {
                 "path": str(rel),
                 "content": f"[binary artifact omitted from prompt; size={size} bytes]",
                 "size": size,
                 "truncated": False,
                 "binary": True,
-            })
+            }
+            item_chars = len(item["content"])
+            if exceeds_total_limit(item_chars):
+                append_boundary(f"kept at most {max_total_chars} represented characters", path)
+                break
+            files.append(item)
+            represented_chars += item_chars
             continue
         if size <= max_file_bytes:
-            files.append({
+            item = {
                 "path": str(rel),
                 "content": path.read_text(encoding="utf-8", errors="replace"),
                 "size": size,
                 "truncated": False,
-            })
+            }
+            item_chars = len(item["content"])
+            if exceeds_total_limit(item_chars):
+                append_boundary(f"kept at most {max_total_chars} represented characters", path)
+                break
+            files.append(item)
+            represented_chars += item_chars
             continue
         with path.open("rb") as f:
             head = f.read(max_file_bytes // 2)
@@ -583,7 +661,11 @@ def collect_workspace_files(workspace: Path, max_file_bytes: int = 20000) -> lis
             + f"\n\n[workspace file truncated: kept first and last {max_file_bytes // 2} bytes of {size}]\n\n"
             + tail.decode("utf-8", errors="replace")
         )
+        if exceeds_total_limit(len(content)):
+            append_boundary(f"kept at most {max_total_chars} represented characters", path)
+            break
         files.append({"path": str(rel), "content": content, "size": size, "truncated": True})
+        represented_chars += len(content)
     return files
 
 

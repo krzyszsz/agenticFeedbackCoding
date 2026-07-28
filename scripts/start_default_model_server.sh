@@ -13,7 +13,9 @@ SERVER_IMAGE="${SERVER_IMAGE:-agentic-feedback-llama-vulkan:local}"
 CONTAINER="${CONTAINER:-agentic-gemma4-26b-mtp-server}"
 MODEL_PATH="${MODEL_PATH:-$QWEN36_LOCAL_DIR/$QWEN36_MODEL_FILE}"
 MODEL_DRAFT_PATH="${MODEL_DRAFT_PATH:-}"
-MMPROJ_PATH="${MMPROJ_PATH:-$QWEN36_LOCAL_DIR/$QWEN36_MMPROJ_FILE}"
+# Profiles use an explicit empty value to mean that no projector belongs to the
+# model. Fall back only when the variable is truly unset.
+MMPROJ_PATH="${MMPROJ_PATH-$QWEN36_LOCAL_DIR/$QWEN36_MMPROJ_FILE}"
 PORT="${PORT:-8161}"
 PUBLISH_HOST="${PUBLISH_HOST:-127.0.0.1}"
 PUBLISH_PORT="${PUBLISH_PORT:-$PORT}"

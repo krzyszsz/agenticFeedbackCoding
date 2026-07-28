@@ -1,12 +1,14 @@
 {
   "implementation_model": {
-    "name": "qwen3.6-27b-q4km",
-    "base_url": "http://127.0.0.1:8161/v1",
+    "name": "qwen3.6-27b-mtp",
+    "base_url": "http://127.0.0.1:8163/v1",
     "api_key": "not-needed",
     "model": "local-gguf",
-    "context_window": 76800,
+    "context_window": 131072,
     "max_tokens": 32768,
-    "temperature": 0.2,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
     "retry_sleep_seconds": 30,
@@ -26,7 +28,7 @@
     "plan_file": "AGENT_PLAN.md",
     "requirements_file": "AGENT_REQUIREMENTS.md",
     "research_file": "AGENT_RESEARCH.md",
-    "command_timeout_seconds": 120,
+    "command_timeout_seconds": 0,
     "print_transcript": true,
     "live_turn_max_chars": 30000,
     "color_transcript": true,
@@ -45,11 +47,11 @@
     "transcript_review_max_chars": 24000
   },
   "loop": {
-    "max_iterations": 3
+    "max_approach_reattempts": 5
   },
   "project_design": {
     "title": "Existing invoice calculator bug fix",
-    "prompt": "An existing Python project already lives in this workspace. Do not rebuild it from scratch. Investigate the failing test suite, preserve the public API, fix the banal syntax/import problem first if present, then fix the logic error exposed by tests. Keep changes focused. Add BUGFIX_NOTES.md summarizing root causes and validation evidence. Maintain the configured agent plan file during the work. Validation must include running python -m unittest discover -v."
+    "prompt": "An existing Python project already lives in this workspace. Do not rebuild it from scratch. Investigate the failing test suite, preserve the public API, fix the banal syntax/import problem first if present, then fix the logic error exposed by tests. Keep changes focused. Add BUGFIX_NOTES.md summarizing root causes and validation evidence. Validation must include running python -m unittest discover -v."
   },
   "phases": {
     "requirements_refinement": {
@@ -64,13 +66,11 @@
   },
   "resolution_policy": {
     "max_same_error_repeats": 2,
-    "allow_requirement_dilution": true,
     "allow_skip_with_note": true,
     "stop_on_cannot_resolve": false
   },
   "quality_policy": {
-    "assume_code_quality_when_unspecified": true,
-    "require_research_and_structure_step": true
+    "assume_code_quality_when_unspecified": true
   },
   "review_policy": {
     "hard_pushback_iterations": 3,

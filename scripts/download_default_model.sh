@@ -68,6 +68,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -79,6 +80,23 @@ verify_json = Path(os.environ["VERIFY_JSON"]).expanduser().resolve()
 
 api = HfApi(token=token)
 tree = {item.path: item for item in api.list_repo_tree(repo_id, repo_type="model", recursive=True, expand=True)}
+
+# A profile names the first GGUF shard used to launch llama.cpp. Discover the
+# remaining shards from that standard filename so a fresh download is complete.
+shard_pattern = re.compile(r"^(.*)-(\d{5})-of-(\d{5})(\.gguf)$")
+expanded_files = list(files)
+for rel in files:
+    match = shard_pattern.match(rel)
+    if not match or int(match.group(2)) != 1:
+        continue
+    prefix, _, count, suffix = match.groups()
+    for index in range(2, int(count) + 1):
+        sibling = f"{prefix}-{index:05d}-of-{count}{suffix}"
+        if sibling not in tree:
+            raise SystemExit(f"Missing expected GGUF shard in {repo_id}: {sibling}")
+        if sibling not in expanded_files:
+            expanded_files.append(sibling)
+files = expanded_files
 
 def sha256_file(path: Path) -> str:
     hasher = hashlib.sha256()

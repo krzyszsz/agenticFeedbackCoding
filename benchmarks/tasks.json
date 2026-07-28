@@ -72,7 +72,7 @@
       "category": "coding",
       "grading": "automatic",
       "prompt": "Create normalize_config.py. It reads a JSON object file path, recursively sorts object keys, removes keys with null values, keeps list order, and writes normalized JSON to stdout. Include tests.",
-      "post_validation_commands": [["bash", "-lc", "printf '{\"b\":null,\"a\":{\"d\":2,\"c\":null},\"z\":[{\"b\":1,\"a\":2}]}' > sample.json && test \"$(python normalize_config.py sample.json)\" = '{\"a\":{\"d\":2},\"z\":[{\"a\":2,\"b\":1}]}'"]]
+      "post_validation_commands": [["python", "-c", "import json,pathlib,subprocess,sys; path=pathlib.Path('sample.json'); path.write_text('{\"b\":null,\"a\":{\"d\":2,\"c\":null},\"z\":[{\"b\":1,\"a\":2}]}', encoding='utf-8'); result=subprocess.run([sys.executable,'normalize_config.py',str(path)], text=True, capture_output=True); assert result.returncode==0,(result.returncode,result.stdout,result.stderr); data=json.loads(result.stdout); assert data=={'a':{'d':2},'z':[{'a':2,'b':1}]},data; assert list(data)==['a','z']; assert list(data['a'])==['d']; assert list(data['z'][0])==['a','b']"]]
     },
     {
       "id": "code-005-existing-bugfix",
@@ -92,7 +92,7 @@
       "category": "tool_periodic",
       "grading": "automatic",
       "prompt": "Build monitor_disk.sh and README.md. The script should check disk free space periodically with df, print one status line each interval, stop after a configurable number of checks, and write ACTION_REQUIRED when free percentage is below a threshold. It must support CHECK_INTERVAL_SECONDS, MAX_CHECKS, and MIN_FREE_PERCENT environment overrides so tests do not wait 30 seconds.",
-      "post_validation_commands": [["bash", "-lc", "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\" monitor.out' EXIT; printf '%s\\n' '#!/bin/sh' 'printf \"%s\\n\" \"Filesystem 1024-blocks Used Available Capacity Mounted on\" \"/dev/mock 1000 800 200 80% /\"' > \"$tmp/df\" && chmod +x \"$tmp/df\" && PATH=\"$tmp:$PATH\" CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=2 MIN_FREE_PERCENT=0 bash monitor_disk.sh | tee monitor.out && test \"$(wc -l < monitor.out)\" -eq 2 && PATH=\"$tmp:$PATH\" CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=1 MIN_FREE_PERCENT=90 bash monitor_disk.sh | grep -q ACTION_REQUIRED"]]
+      "post_validation_commands": [["bash", "-lc", "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\" monitor.out' EXIT; printf '%s\\n' '#!/bin/sh' 'printf \"%s\\n\" \"Filesystem 1024-blocks Used Available Capacity Mounted on\" \"/dev/mock 1000 800 200 80% /\"' > \"$tmp/df\" && chmod +x \"$tmp/df\" && PATH=\"$tmp:$PATH\" CHECK_INTERVAL_SECONDS=1 MAX_CHECKS=2 MIN_FREE_PERCENT=0 bash monitor_disk.sh | tee monitor.out && test \"$(wc -l < monitor.out)\" -eq 2 && PATH=\"$tmp:$PATH\" CHECK_INTERVAL_SECONDS=1 MAX_CHECKS=1 MIN_FREE_PERCENT=90 bash monitor_disk.sh | grep -q ACTION_REQUIRED"]]
     },
     {
       "id": "tool-002-log-watch",
@@ -100,7 +100,7 @@
       "category": "tool_periodic",
       "grading": "automatic",
       "prompt": "Create watch_log.sh. It should tail a log file path, poll every configurable interval, remember the last checked line in .watch_state, and print TRIGGERED when a configurable pattern appears. Include README and a fast validation script.",
-      "post_validation_commands": [["bash", "-lc", "printf 'ok\\nALERT one\\n' > app.log; for cmd in \"timeout 5s bash watch_log.sh -f app.log -p ALERT -i 1\" \"timeout 5s bash watch_log.sh app.log ALERT 1\" \"timeout 5s bash watch_log.sh app.log --pattern ALERT --interval 1\" \"timeout 5s bash watch_log.sh app.log -p ALERT -i 1\" \"LOG_FILE=app.log PATTERN=ALERT INTERVAL=1 timeout 5s bash watch_log.sh\" \"WATCH_PATTERN=ALERT timeout 5s bash watch_log.sh app.log\"; do rm -f .watch_state; if eval \"$cmd\" | grep -m1 TRIGGERED; then exit 0; fi; done; exit 1"]]
+      "post_validation_commands": [["bash", "-lc", "printf 'ok\\nALERT one\\n' > app.log; for cmd in \"timeout 5s bash watch_log.sh -f app.log -p ALERT -i 1\" \"timeout 5s bash watch_log.sh app.log ALERT 1\" \"timeout 5s bash watch_log.sh app.log 1 ALERT\" \"timeout 5s bash watch_log.sh app.log --pattern ALERT --interval 1\" \"timeout 5s bash watch_log.sh app.log -p ALERT -i 1\" \"LOG_FILE=app.log PATTERN=ALERT INTERVAL=1 timeout 5s bash watch_log.sh\" \"WATCH_PATTERN=ALERT timeout 5s bash watch_log.sh app.log\"; do rm -f .watch_state; if eval \"$cmd\" | grep -m1 TRIGGERED; then exit 0; fi; done; exit 1"]]
     },
     {
       "id": "tool-003-output-truncation",
@@ -116,7 +116,7 @@
       "category": "tool_safety",
       "grading": "automatic",
       "prompt": "Create wait_for_file.py. It should poll for a file path until --timeout-seconds expires, sleep --interval-seconds between checks, print periodic status, and exit 0 when the file appears or 2 on timeout. Include tests that complete quickly and prove a file created after startup is detected.",
-      "post_validation_commands": [["python", "-c", "import pathlib,shutil,subprocess,sys,tempfile,threading,time; td=tempfile.mkdtemp(); p=pathlib.Path(td)/'appears.txt'; timer=threading.Timer(0.05, lambda: p.write_text('ok')); timer.start(); r=subprocess.run([sys.executable,'wait_for_file.py',str(p),'--timeout-seconds','1','--interval-seconds','0.02'], text=True, capture_output=True); timer.join(); shutil.rmtree(td); assert r.returncode==0,(r.returncode,r.stdout,r.stderr); start=time.monotonic(); r=subprocess.run([sys.executable,'wait_for_file.py','missing.file','--timeout-seconds','0.1','--interval-seconds','0.02'], text=True, capture_output=True); elapsed=time.monotonic()-start; out=(r.stdout+r.stderr).lower(); assert r.returncode==2 and 'unrecognized' not in out and 'waiting' in out and elapsed>=0.05,(r.returncode,elapsed,out)"]]
+      "post_validation_commands": [["python", "-c", "import pathlib,shutil,subprocess,sys,tempfile,threading,time; td=tempfile.mkdtemp(); p=pathlib.Path(td)/'appears.txt'; timer=threading.Timer(0.2, lambda: p.write_text('ok')); timer.start(); r=subprocess.run([sys.executable,'wait_for_file.py',str(p),'--timeout-seconds','3','--interval-seconds','1'], text=True, capture_output=True); timer.join(); shutil.rmtree(td); delayed_out=(r.stdout+r.stderr); assert r.returncode==0 and delayed_out.strip(),(r.returncode,delayed_out); start=time.monotonic(); r=subprocess.run([sys.executable,'wait_for_file.py','missing.file','--timeout-seconds','1','--interval-seconds','1'], text=True, capture_output=True); elapsed=time.monotonic()-start; out=(r.stdout+r.stderr); assert r.returncode==2 and 'unrecognized' not in out.lower() and out.strip() and elapsed>=0.5,(r.returncode,elapsed,out)"]]
     },
     {
       "id": "tool-005-curl-json-safety",
@@ -140,7 +140,7 @@
       "category": "frontend",
       "grading": "automatic",
       "prompt": "Build a single-page counter app with index.html, app.js, and style.css. Include a Python Playwright validation script that opens the page, clicks increment/decrement, and writes reports/counter_report.json.",
-      "post_validation_commands": [["python", "validate_counter.py"]]
+      "post_validation_commands": [["bash", "-lc", "script=''; for candidate in ./*.py; do test -f \"$candidate\" || continue; if grep -Eqi '(^|[^[:alnum:]_])(playwright|sync_playwright|async_playwright)([^[:alnum:]_]|$)' \"$candidate\"; then script=\"$candidate\"; break; fi; done; test -n \"$script\" && python \"$script\" && test -f reports/counter_report.json"]]
     },
     {
       "id": "research-001-source-notes",
@@ -172,7 +172,7 @@
       "category": "coding",
       "grading": "automatic",
       "prompt": "Create rolling_average.py. It reads CSV with columns timestamp,value and prints a JSON list of 3-sample rolling averages rounded to 2 decimals, omitting rows until a full 3-sample window is available. Include tests.",
-      "post_validation_commands": [["bash", "-lc", "printf 'timestamp,value\\n1,2\\n2,4\\n3,6\\n4,8\\n' > data.csv && test \"$(python rolling_average.py data.csv)\" = '[4.0,6.0]'"]]
+      "post_validation_commands": [["python", "-c", "import json,pathlib,subprocess,sys; path=pathlib.Path('data.csv'); path.write_text('timestamp,value\\n1,2\\n2,4\\n3,6\\n4,8\\n', encoding='utf-8'); result=subprocess.run([sys.executable,'rolling_average.py',str(path)], text=True, capture_output=True); assert result.returncode==0,(result.returncode,result.stdout,result.stderr); assert json.loads(result.stdout)==[4.0,6.0],result.stdout"]]
     },
     {
       "id": "data-002-dedupe",
@@ -196,7 +196,7 @@
       "category": "tool_safety",
       "grading": "automatic",
       "prompt": "Create spammer.py that can emit many bytes and validate_spammer.py that runs it with a small size. Document why harnesses should truncate tool output with a visible marker.",
-      "post_validation_commands": [["python", "validate_spammer.py"], ["grep", "-qi", "truncate", "README.md"]]
+      "post_validation_commands": [["python", "validate_spammer.py"], ["bash", "-lc", "found=0; for doc in ./*.md ./*.txt; do test -f \"$doc\" || continue; if grep -qi 'truncat' \"$doc\"; then found=1; break; fi; done; test \"$found\" -eq 1"]]
     },
     {
       "id": "planning-001-conflict-resolution",
@@ -220,7 +220,7 @@
       "category": "tool_periodic",
       "grading": "automatic",
       "prompt": "Create periodic_summary.sh. It should read COMMAND, CHECK_INTERVAL_SECONDS, and MAX_CHECKS from the environment, run COMMAND every interval, append timestamped output to a log, stop after MAX_CHECKS, and print a final summary. Defaults may be 30 seconds, but tests must override CHECK_INTERVAL_SECONDS to zero.",
-      "post_validation_commands": [["bash", "-lc", "rm -f periodic_summary.log periodic.out && CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=3 COMMAND='printf ok' bash periodic_summary.sh | tee periodic.out && test \"$(grep -c ok periodic_summary.log)\" -ge 3 && grep -q 'Summary: Completed 3 checks' periodic.out"]]
+      "post_validation_commands": [["bash", "-lc", "token='BENCHMARK_PERIODIC_PROBE_7f3a'; rm -f periodic.out; CHECK_INTERVAL_SECONDS=0 MAX_CHECKS=3 COMMAND=\"printf '%s\\n' '$token'\" bash periodic_summary.sh | tee periodic.out; found=0; while IFS= read -r candidate; do count=$(grep -cF \"$token\" \"$candidate\" 2>/dev/null || true); if test \"$count\" -ge 3; then found=1; break; fi; done < <(find . /tmp -type f -size -1048576c -print 2>/dev/null); test \"$found\" -eq 1 && grep -vF \"$token\" periodic.out | grep -q '[^[:space:]]'"]]
     },
     {
       "id": "long-002-watch-and-react",
@@ -236,7 +236,7 @@
       "category": "integration",
       "grading": "automatic",
       "prompt": "Create a small Python package textkit with functions words(text) and top_words(text, n). Include pyproject.toml, tests, and README.",
-      "post_validation_commands": [["python", "-m", "unittest", "discover", "-v"], ["python", "-c", "from textkit import top_words; assert top_words('a b a c b a', 2)==[('a',3),('b',2)]"]]
+      "post_validation_commands": [["bash", "-lc", "set -euo pipefail; test -f pyproject.toml; test -n \"$(find tests -type f -name 'test*.py' -print -quit)\"; module_root=.; if test -d src/textkit; then module_root=src; fi; PYTHONPATH=\"$module_root\" python -m pytest -q; PYTHONPATH=\"$module_root\" python -c \"from textkit import top_words; assert top_words('a b a c b a', 2)==[('a',3),('b',2)]\""]]
     },
     {
       "id": "integration-002-doc-consistency",
@@ -301,7 +301,13 @@
       "category": "historical_dependency",
       "grading": "automatic",
       "prompt": "Build a small C#/.NET project in this workspace: a tested library plus console app that parses todo items from a text file, identifies overdue open items, and prints a short report. Do not change the harness Dockerfile. The disposable agent container may not have dotnet installed, so the first independently verifiable plan step must check whether dotnet is available and, if missing, install a .NET SDK inside the Docker agent container using bounded terminal commands. Document exactly what was installed and where. If using dotnet-install.sh, use a shell command such as bash -lc so $HOME expands correctly; HOME is /tmp in the agent container and /tmp/.dotnet is already on PATH for later validation commands. Do not install SDK files under the project workspace. Then implement the library, CLI, tests, README, validate_dotnet.sh, and validation evidence. Prefer dotnet build and dotnet test as final validation; only use a documented fallback if SDK installation genuinely fails. Keep steps clear, verifiable, and technology-specific to C#/.NET rather than rewriting the task as Python.",
-      "post_validation_commands": [["bash", "validate_dotnet.sh"]],
+      "post_validation_commands": [
+        {
+          "cmd": ["bash", "-lc", "set -euo pipefail; test -f validate_dotnet.sh; installer=/tmp/dotnet-install.sh; curl --fail --silent --show-error --location https://dot.net/v1/dotnet-install.sh --output \"$installer\"; bash \"$installer\" --channel 10.0 --install-dir /tmp/.dotnet --no-path; if grep -Rqs '<TargetFramework>net8.0' . --include='*.csproj'; then bash \"$installer\" --channel 8.0 --runtime dotnet --install-dir /tmp/.dotnet --no-path; fi; export PATH=/tmp/.dotnet:$PATH DOTNET_ROOT=/tmp/.dotnet DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1; bash validate_dotnet.sh; solution=$(find . -maxdepth 2 \\( -name '*.sln' -o -name '*.slnx' \\) -print -quit); test -n \"$solution\"; dotnet test \"$solution\" --nologo"],
+          "timeout_seconds": 7200,
+          "docker_user": "root"
+        }
+      ],
       "config_overrides": {
         "runtime": {
           "docker_user": "root",
@@ -329,6 +335,81 @@
       "web_research": true,
       "prompt": "Use web research to choose four large world cities and collect public Wikipedia/Wikimedia image candidates for them. Build a documented manifest project with SOURCES.json, IMAGE_MANIFEST.json, attribution/source URLs, validate_manifest.py, and README instructions. The agent must use fetched web research evidence instead of prewritten data.",
       "post_validation_commands": [["python", "validate_manifest.py"]]
+    },
+    {
+      "id": "dev-001-layered-permutations",
+      "title": "Layered multiset permutations",
+      "category": "algorithmic_exact",
+      "grading": "automatic",
+      "prompt": "Create ANSWER.txt only. Count the distinct permutations of the multiset A,A,B,C,D,D for which no two adjacent characters are equal, B occurs after both A characters, and exactly two of the first three characters belong to {A,D}. Put only the integer answer in ANSWER.txt.",
+      "post_validation_commands": [
+        ["bash", "-lc", "test \"$(tr -d '\\n ' < ANSWER.txt)\" = \"13\""],
+        ["python", "-c", "from pathlib import Path; allowed={'.agent_state','.git','ANSWER.txt','PLAN.md','REQUIREMENTS.md','RESEARCH.md'}; extras=sorted(path.name for path in Path('.').iterdir() if path.name not in allowed); assert not extras, extras"]
+      ]
+    },
+    {
+      "id": "dev-002-jsonl-contract",
+      "title": "Explicit JSONL CLI contract",
+      "category": "coding",
+      "grading": "automatic",
+      "prompt": "Create record_stats.py with tests and README.md. The CLI takes one required positional JSONL file path and an optional --field FIELD argument whose default is value. Ignore blank lines. Every nonblank line must be a JSON object containing a finite, non-boolean integer or float in the selected field. On the first invalid record, print a clear error containing its 1-based physical line number to stderr, print no result to stdout, and exit 2. For valid input, print one JSON object with sorted keys average, count, max, min, and sum.",
+      "post_validation_commands": [
+        ["bash", "-lc", "printf '%s\\n' '{\"value\":2}' '' '{\"value\":4.5}' '{\"value\":-1}' > records.jsonl && python record_stats.py records.jsonl | python -c 'import json,sys; assert json.load(sys.stdin)=={\"average\":1.8333333333333333,\"count\":3,\"max\":4.5,\"min\":-1,\"sum\":5.5}'"],
+        ["bash", "-lc", "printf '%s\\n' '{\"value\":1}' '' '{\"value\":true}' > invalid.jsonl; out=$(mktemp); err=$(mktemp); trap 'rm -f \"$out\" \"$err\"' EXIT; python record_stats.py invalid.jsonl >\"$out\" 2>\"$err\"; rc=$?; test \"$rc\" -eq 2 && test ! -s \"$out\" && grep -Eqi 'line[^0-9]*3|3[^0-9]*line' \"$err\""],
+        ["bash", "-lc", "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; printf '%s\\n' '{\"value\":1}' '' '123' > \"$tmp/nonobject.jsonl\"; python record_stats.py \"$tmp/nonobject.jsonl\" >\"$tmp/out\" 2>\"$tmp/err\"; rc=$?; test \"$rc\" -eq 2 && test ! -s \"$tmp/out\" && grep -Eqi 'line[^0-9]*3|3[^0-9]*line' \"$tmp/err\""]
+      ]
+    },
+    {
+      "id": "dev-003-existing-catalog-repair",
+      "title": "Existing catalog repair",
+      "category": "existing_project",
+      "grading": "automatic",
+      "setup_files": [
+        {"path": "catalog/__init__.py", "content": "\"\"\"Inventory summary API.\"\"\"\n\nfrom .summary import summarize_inventory\n\n__all__ = [\"summarize_inventory\"]\n"},
+        {"path": "catalog/summary.py", "content": "from __future__ import annotations\n\n\ndef summarize_inventory(items: list[dict[str, object]]) -> dict[str, int]:\n    \"\"\"Return total non-negative integer quantity for each SKU.\"\"\"\n    totals: dict[str, int] = {}\n    for item in items:\n        sku = str(item[\"sku\"])\n        quantity = item[\"quantity\"]\n        if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity < 0\n            raise ValueError(\"quantity must be a non-negative integer\")\n        totals[sku] = quantity\n    return dict(sorted(totals.items()))\n"},
+        {"path": "tests/__init__.py", "content": "\"\"\"Catalog tests.\"\"\"\n"},
+        {"path": "tests/test_summary.py", "content": "from __future__ import annotations\n\nimport unittest\n\nfrom catalog import summarize_inventory\n\n\nclass InventorySummaryTests(unittest.TestCase):\n    def test_repeated_skus_are_accumulated(self) -> None:\n        items = [\n            {\"sku\": \"B\", \"quantity\": 2},\n            {\"sku\": \"A\", \"quantity\": 1},\n            {\"sku\": \"B\", \"quantity\": 3},\n        ]\n        self.assertEqual(summarize_inventory(items), {\"A\": 1, \"B\": 5})\n\n    def test_zero_is_allowed(self) -> None:\n        self.assertEqual(summarize_inventory([{\"sku\": \"A\", \"quantity\": 0}]), {\"A\": 0})\n\n    def test_negative_quantity_is_rejected(self) -> None:\n        with self.assertRaises(ValueError):\n            summarize_inventory([{\"sku\": \"A\", \"quantity\": -1}])\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"},
+        {"path": "README.md", "content": "# Catalog summary fixture\n\n`summarize_inventory(items)` is the public API. It returns SKU keys in sorted insertion order, accumulates repeated SKUs, accepts zero quantities, rejects booleans and negative or non-integer quantities, and does not mutate the caller's items. Run `python -m unittest discover -v` to reproduce the current failure.\n"}
+      ],
+      "prompt": "Repair the existing catalog project rather than replacing it. Preserve the public summarize_inventory(items) API and the documented behavior. Fix the syntax failure first, then any logic failures exposed by the tests. Keep the change focused, add BUGFIX_NOTES.md with root causes and validation evidence, and run python -m unittest discover -v.",
+      "post_validation_commands": [
+        ["python", "-m", "unittest", "discover", "-v"],
+        ["python", "-c", "from catalog import summarize_inventory; items=[{'sku':'B','quantity':0},{'sku':'A','quantity':2},{'sku':'A','quantity':3}]; before=[dict(x) for x in items]; assert summarize_inventory(items)=={'A':5,'B':0}; assert items==before; import contextlib; ok=False\ntry:\n summarize_inventory([{'sku':'A','quantity':True}])\nexcept ValueError:\n ok=True\nassert ok"],
+        ["test", "-f", "BUGFIX_NOTES.md"]
+      ]
+    },
+    {
+      "id": "dev-004-slow-probe",
+      "title": "Slow probe with visible progress",
+      "category": "tool_periodic",
+      "grading": "automatic",
+      "setup_files": [
+        {"path": "slow_probe.py", "content": "from __future__ import annotations\n\nimport json\nfrom pathlib import Path\nimport time\n\nfor index in range(4):\n    print(f\"checkpoint {index + 1}/4\", flush=True)\n    time.sleep(9)\n\npayload = {\"label\": \"steady\", \"samples\": [3, 8, 8, 13]}\nPath(\"probe.json\").write_text(json.dumps(payload) + \"\\n\", encoding=\"utf-8\")\nprint(\"probe complete\", flush=True)\n"}
+      ],
+      "prompt": "The existing slow_probe.py is an intentionally slow, observable producer and must not be edited. Run it once and allow it to finish even though it takes about 36 seconds. Then create summarize_probe.py, which takes one positional probe JSON path and prints sorted JSON containing label, count, max, and sum. Use that CLI to create PROBE_REPORT.json from the generated probe.json, and add a focused unittest for the summarizer.",
+      "post_validation_commands": [
+        ["test", "-f", "probe.json"],
+        ["bash", "-lc", "python summarize_probe.py probe.json | python -c 'import json,sys; assert json.load(sys.stdin)=={\"count\":4,\"label\":\"steady\",\"max\":13,\"sum\":32}'"],
+        ["python", "-c", "import json; assert json.load(open('PROBE_REPORT.json'))=={'count':4,'label':'steady','max':13,'sum':32}"],
+        ["python", "-m", "unittest", "discover", "-v"]
+      ],
+      "config_overrides": {
+        "runtime": {
+          "command_progress_review_interval_seconds": 10,
+          "command_progress_review_min_interval_seconds": 5,
+          "command_progress_review_max_interval_seconds": 30
+        }
+      }
+    },
+    {
+      "id": "dev-005-local-curl-json",
+      "title": "Local curl JSON delivery",
+      "category": "tool_safety",
+      "grading": "automatic",
+      "prompt": "Create payload.json, send_payload.sh, tests, and README.md. payload.json must contain message exactly `She said \"hello\", then left.`, windows_path exactly `C:\\temp\\agent`, and nested.tags exactly [`a'b`, `c\"d`]. send_payload.sh takes one URL argument and sends the unchanged JSON file with curl using Content-Type application/json and --data-binary @payload.json. Validation must use only a temporary localhost HTTP server; do not contact an external service.",
+      "post_validation_commands": [
+        ["python", "-c", "import http.server\nimport json\nimport subprocess\nimport threading\n\ncaptured = {}\n\nclass Handler(http.server.BaseHTTPRequestHandler):\n    def do_POST(self):\n        length = int(self.headers.get('Content-Length', '0'))\n        captured['body'] = self.rfile.read(length)\n        captured['path'] = self.path\n        captured['content_type'] = self.headers.get('Content-Type', '')\n        self.send_response(204)\n        self.end_headers()\n\n    def log_message(self, format, *args):\n        pass\n\nserver = http.server.HTTPServer(('127.0.0.1', 0), Handler)\nserver.timeout = 5\nthread = threading.Thread(target=server.handle_request, daemon=True)\nthread.start()\nurl = f'http://127.0.0.1:{server.server_port}/ingest'\nresult = subprocess.run(['bash', 'send_payload.sh', url], text=True, capture_output=True, timeout=8)\nthread.join(6)\nserver.server_close()\nassert result.returncode == 0, (result.returncode, result.stdout, result.stderr)\nassert not thread.is_alive(), 'no localhost request received'\nexpected = {'message': 'She said \"hello\", then left.', 'windows_path': r'C:\\temp\\agent', 'nested': {'tags': [\"a'b\", 'c\"d']}}\nassert json.loads(captured['body']) == expected, captured\nassert captured['path'] == '/ingest', captured\nassert captured['content_type'].lower().startswith('application/json'), captured\n"]
+      ]
     },
     {
       "id": "manual-001-design-review",

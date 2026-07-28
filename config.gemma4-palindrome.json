@@ -1,12 +1,14 @@
 {
   "implementation_model": {
-    "name": "gemma4-26b-a4b-q4km",
+    "name": "gemma4-26b-a4b-qat-mtp",
     "base_url": "http://127.0.0.1:8161/v1",
     "api_key": "not-needed",
     "model": "local-gguf",
-    "context_window": 76800,
+    "context_window": 131072,
     "max_tokens": 32768,
-    "temperature": 0.2,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 64,
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
     "retry_sleep_seconds": 30,
@@ -23,7 +25,7 @@
     "docker_image": "agentic-feedback-coding:local",
     "docker_user": "host",
     "workspace": "workspaces/gemma4-palindrome",
-    "command_timeout_seconds": 120,
+    "command_timeout_seconds": 0,
     "print_transcript": true,
     "live_turn_max_chars": 0,
     "color_transcript": true,
@@ -42,11 +44,11 @@
     "transcript_review_max_chars": 24000
   },
   "loop": {
-    "max_iterations": 3
+    "max_approach_reattempts": 5
   },
   "project_design": {
     "title": "Gemma4 palindrome CLI benchmark",
-    "prompt": "Build a Python CLI tool that checks whether a provided string is a palindrome, ignoring case, punctuation, and spaces. It must include a core function, a CLI script, unit tests, README documentation, and a notes file explaining the design choices. Keep it complete, well structured, and easy to validate. Maintain PLAN.md during the work. Choose independently verifiable implementation steps that fit the work without artificial fragmentation."
+    "prompt": "Build a Python CLI tool that checks whether a provided string is a palindrome, ignoring case, punctuation, and spaces. It must include a core function, a CLI script, unit tests, README documentation, and a notes file explaining the design choices. Keep it complete, well structured, and easy to validate. Choose independently verifiable implementation steps that fit the work without artificial fragmentation."
   },
   "phases": {
     "requirements_refinement": {
@@ -61,13 +63,11 @@
   },
   "resolution_policy": {
     "max_same_error_repeats": 2,
-    "allow_requirement_dilution": true,
     "allow_skip_with_note": true,
     "stop_on_cannot_resolve": false
   },
   "quality_policy": {
-    "assume_code_quality_when_unspecified": true,
-    "require_research_and_structure_step": true
+    "assume_code_quality_when_unspecified": true
   },
   "review_policy": {
     "hard_pushback_iterations": 3,

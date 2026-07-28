@@ -20,6 +20,11 @@ class ModelProfile:
     port: int
     context_window: int
     memory_limit: str
+    memory_reservation: str
+    temperature: float
+    top_p: float | None
+    top_k: int | None
+    reasoning_mode: str
     reasoning_format: str
     reasoning_budget_tokens: int
     spec_type: str
@@ -56,6 +61,11 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         port=8161,
         context_window=131072,
         memory_limit="75g",
+        memory_reservation="67g",
+        temperature=1.0,
+        top_p=0.95,
+        top_k=64,
+        reasoning_mode="on",
         reasoning_format="deepseek",
         reasoning_budget_tokens=4096,
         spec_type="draft-mtp",
@@ -74,6 +84,11 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         port=8162,
         context_window=131072,
         memory_limit="75g",
+        memory_reservation="67g",
+        temperature=1.0,
+        top_p=0.95,
+        top_k=64,
+        reasoning_mode="on",
         reasoning_format="deepseek",
         reasoning_budget_tokens=4096,
         spec_type="draft-mtp",
@@ -92,6 +107,11 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         port=8163,
         context_window=131072,
         memory_limit="75g",
+        memory_reservation="67g",
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        reasoning_mode="on",
         reasoning_format="deepseek",
         reasoning_budget_tokens=4096,
         spec_type="draft-mtp",
@@ -99,6 +119,59 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         notes=(
             "Qwen3.6 27B MTP profile. This replaces the requested 'Qwen 26B QAT MTP' "
             "name because the public/local MTP artifact is Qwen3.6-27B-MTP-GGUF."
+        ),
+    ),
+    "qwen3-coder-next": ModelProfile(
+        name="qwen3-coder-next",
+        role="strong_coding_moe",
+        repo_id="Qwen/Qwen3-Coder-Next-GGUF",
+        local_dir="/mnt/hf/models/qwen3-coder-next-gguf",
+        model_file="Qwen3-Coder-Next-Q5_K_M/Qwen3-Coder-Next-Q5_K_M-00001-of-00004.gguf",
+        draft_file=None,
+        mmproj_file=None,
+        container_name="agentic-qwen3-coder-next-server",
+        port=8164,
+        context_window=131072,
+        memory_limit="88g",
+        memory_reservation="80g",
+        temperature=1.0,
+        top_p=0.95,
+        top_k=40,
+        reasoning_mode="off",
+        reasoning_format="deepseek",
+        reasoning_budget_tokens=0,
+        spec_type="",
+        spec_draft_n_max=0,
+        notes=(
+            "Coding-specialized Qwen3-Coder-Next Q5_K_M. The official model is an "
+            "80B-total, 3B-active MoE and supports only non-thinking mode; it is "
+            "not a 32B dense model."
+        ),
+    ),
+    "deepseek-r1-distill-qwen-7b": ModelProfile(
+        name="deepseek-r1-distill-qwen-7b",
+        role="weak_fast_reasoning",
+        repo_id="unsloth/DeepSeek-R1-Distill-Qwen-7B-GGUF",
+        local_dir="/mnt/hf/models/deepseek-r1-distill-qwen-7b-gguf",
+        model_file="DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
+        draft_file=None,
+        mmproj_file=None,
+        container_name="agentic-deepseek-r1-distill-qwen-7b-server",
+        port=8165,
+        context_window=131072,
+        memory_limit="20g",
+        memory_reservation="16g",
+        temperature=0.6,
+        top_p=0.95,
+        top_k=None,
+        reasoning_mode="on",
+        reasoning_format="deepseek",
+        reasoning_budget_tokens=4096,
+        spec_type="",
+        spec_draft_n_max=0,
+        notes=(
+            "Fast DeepSeek-R1 reasoning distill on Qwen2.5-Math-7B. DeepSeek does "
+            "not publish an 8B Qwen distill; its official 8B distill is Llama-based."
         ),
     ),
 }
@@ -111,6 +184,11 @@ ALIASES = {
     "qwen26b-qat-mtp": "qwen3.6-27b-mtp",
     "qwen-26b-qat-mtp": "qwen3.6-27b-mtp",
     "qwen27": "qwen3.6-27b-mtp",
+    "qwen3-coder-next-32b-dense": "qwen3-coder-next",
+    "qwen-coder-next": "qwen3-coder-next",
+    "deepseek-r1-distill-qwen-8b": "deepseek-r1-distill-qwen-7b",
+    "deepseek-qwen-8b": "deepseek-r1-distill-qwen-7b",
+    "deepseek7": "deepseek-r1-distill-qwen-7b",
 }
 
 
@@ -140,6 +218,8 @@ def profile_to_env(profile: ModelProfile) -> dict[str, str]:
         "CTX_SIZE": str(profile.context_window),
         "MEM_LIMIT": profile.memory_limit,
         "MEMORY_SWAP": profile.memory_limit,
+        "MEM_RESERVATION": profile.memory_reservation,
+        "REASONING_MODE": profile.reasoning_mode,
         "REASONING_FORMAT": profile.reasoning_format,
         "REASONING_BUDGET": str(profile.reasoning_budget_tokens),
         "SPEC_TYPE": profile.spec_type,

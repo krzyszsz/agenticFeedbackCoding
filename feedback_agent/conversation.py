@@ -3,9 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 import json
 from pathlib import Path
+import re
 import sys
+from collections.abc import Iterable, Iterator
 
 from .bounds import clamp_text, estimate_tokens
+from .protocol import (
+    HARNESS_EFFECTIVE_REVIEW_MARKER,
+    HARNESS_RESPONSE_OMISSION_MARKER,
+    VALIDATED_FEEDBACK_DECISION_MARKER,
+)
 
 
 @dataclass
@@ -36,18 +43,122 @@ class Conversation:
         self.echo = echo
         self.echo_limit_chars = echo_limit_chars
         self.color = color and sys.stdout.isatty()
+        self._repair_final_record(path)
+        if self.full_path and self.full_path != path:
+            self._repair_final_record(self.full_path)
         self.turns: list[Turn] = self._load_turns(path)
         if self.full_path and not self.full_path.exists() and self.turns:
             self._write_turns(self.full_path, self.turns)
 
     def _load_turns(self, path: Path) -> list[Turn]:
-        turns: list[Turn] = []
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    item = json.loads(line)
-                    turns.append(Turn(role=item["role"], content=item["content"]))
-        return turns
+        return list(self._iter_turns(path))
+
+    @staticmethod
+    def _repair_final_record(path: Path) -> None:
+        """Remove only a torn final JSONL record before the next append.
+
+        A process interruption can leave the final append incomplete. Ignoring
+        it while loading is insufficient: a later append would join new JSON to
+        those bytes and turn recoverable tail damage into a malformed middle
+        record. This check reads only the final physical line, truncates it when
+        invalid, and preserves every earlier byte.
+        """
+        if not path.exists() or path.stat().st_size == 0:
+            return
+        whitespace = b" \t\r\n"
+        with path.open("r+b") as stream:
+            size = stream.seek(0, 2)
+            position = size
+            record_end = 0
+            while position > 0 and record_end == 0:
+                start = max(0, position - 8192)
+                stream.seek(start)
+                chunk = stream.read(position - start)
+                for index in range(len(chunk) - 1, -1, -1):
+                    if chunk[index] not in whitespace:
+                        record_end = start + index + 1
+                        break
+                position = start
+            if record_end == 0:
+                return
+
+            position = record_end
+            record_start = 0
+            while position > 0:
+                start = max(0, position - 8192)
+                stream.seek(start)
+                chunk = stream.read(position - start)
+                newline = chunk.rfind(b"\n")
+                if newline >= 0:
+                    record_start = start + newline + 1
+                    break
+                position = start
+
+            stream.seek(record_start)
+            raw = stream.read(record_end - record_start)
+            try:
+                item = json.loads(raw.decode("utf-8"))
+                if not isinstance(item, dict):
+                    raise TypeError("record must be an object")
+                if not isinstance(item.get("role"), str) or not isinstance(item.get("content"), str):
+                    raise TypeError("role and content must be strings")
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                stream.truncate(record_start)
+                print(
+                    f"[conversation] discarded incomplete final JSONL record at {path}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+
+            stream.seek(0, 2)
+            if size > 0:
+                stream.seek(-1, 2)
+                if stream.read(1) != b"\n":
+                    stream.seek(0, 2)
+                    stream.write(b"\n")
+
+    @staticmethod
+    def _iter_turns(path: Path) -> Iterator[Turn]:
+        if not path.exists():
+            return
+        pending: tuple[int, str] | None = None
+        with path.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if not line.strip():
+                    continue
+                if pending is not None:
+                    yield Conversation._decode_turn(path, *pending, allow_incomplete=False)
+                pending = (line_number, line)
+        if pending is not None:
+            turn = Conversation._decode_turn(path, *pending, allow_incomplete=True)
+            if turn is not None:
+                yield turn
+
+    @staticmethod
+    def _decode_turn(
+        path: Path,
+        line_number: int,
+        line: str,
+        *,
+        allow_incomplete: bool,
+    ) -> Turn | None:
+        try:
+            item = json.loads(line)
+            role = item["role"]
+            content = item["content"]
+            if not isinstance(role, str) or not isinstance(content, str):
+                raise TypeError("role and content must be strings")
+            return Turn(role=role, content=content)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            if allow_incomplete:
+                print(
+                    f"[conversation] ignored incomplete final JSONL record at {path}:{line_number}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
+            raise ValueError(f"Malformed conversation JSONL at {path}:{line_number}: {exc}") from exc
 
     def _append_turn_to_path(self, path: Path, turn: Turn) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,33 +167,47 @@ class Conversation:
 
     def _write_turns(self, path: Path, turns: list[Turn]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(
             "".join(json.dumps(asdict(t), ensure_ascii=False) + "\n" for t in turns),
             encoding="utf-8",
         )
+        temporary.replace(path)
 
-    def append(self, role: str, content: str) -> None:
+    def append(self, role: str, content: str, *, full_content: str | None = None) -> None:
+        """Append active context and, when supplied, a raw audit representation."""
         turn = Turn(role=role, content=content)
         self.turns.append(turn)
         self._append_turn_to_path(self.path, turn)
         if self.full_path and self.full_path != self.path:
-            self._append_turn_to_path(self.full_path, turn)
+            self._append_turn_to_path(
+                self.full_path,
+                Turn(role=role, content=full_content if full_content is not None else content),
+            )
         if self.echo:
             self._print_turn(turn)
 
-    def replace_last_turn(self, *, role: str, content_prefix: str, new_content: str) -> bool:
+    def replace_last_turn(
+        self,
+        *,
+        role: str,
+        content_prefix: str,
+        new_content: str,
+        replacement_role: str | None = None,
+    ) -> bool:
         """Replace the active-context copy of the latest turn when it is unsafe.
 
         The append-only full transcript remains the audit log. The compact active
-        transcript is allowed to replace pathological content with a bounded note
-        so later model calls do not inherit malformed or repetitive output.
+        transcript is allowed to replace pathological content with a bounded,
+        explicitly harness-owned turn so later model calls do not inherit
+        malformed output or mistake the replacement for model speech.
         """
         if not self.turns:
             return False
         latest = self.turns[-1]
         if latest.role != role or not latest.content.startswith(content_prefix):
             return False
-        self.turns[-1] = Turn(role=role, content=new_content)
+        self.turns[-1] = Turn(role=replacement_role or role, content=new_content)
         self._write_turns(self.path, self.turns)
         if self.full_path and self.full_path != self.path:
             self._append_turn_to_path(
@@ -100,11 +225,27 @@ class Conversation:
             self._print_turn(self.turns[-1])
         return True
 
-    def messages(self, *, system_as_user: bool = False) -> list[dict[str, str]]:
+    def messages(
+        self,
+        *,
+        system_as_user: bool = False,
+        reviewer_view: bool = False,
+    ) -> list[dict[str, str]]:
+        """Return chat messages with roles appropriate to the receiving model.
+
+        Feedback responses are stored as user turns so the implementation model
+        receives them as external critique. When the feedback model reads the
+        shared transcript, those same turns are its prior assistant decisions,
+        not new user instructions. Presenting the correct role avoids turning a
+        previous reviewer opinion into a new instruction. Harness-owned effective
+        reviews keep their user role so their provenance remains explicit.
+        """
         messages: list[dict[str, str]] = []
         for turn in self.turns:
             if system_as_user and turn.role == "system":
                 messages.append({"role": "user", "content": "TRANSCRIPT_SYSTEM_NOTE:\n" + turn.content})
+            elif reviewer_view and turn.content.startswith("FEEDBACK_AGENT_RESPONSE:"):
+                messages.append({"role": "assistant", "content": turn.content})
             else:
                 messages.append(asdict(turn))
         return messages
@@ -141,16 +282,22 @@ class Conversation:
 
     def write_markdown(self, path: Path, *, full: bool = False) -> None:
         """Export the JSONL transcript in a form people can read after the run."""
-        turns = self._load_turns(self.full_path) if full and self.full_path else self.turns
-        lines: list[str] = ["# Agent Transcript", ""]
-        for index, turn in enumerate(turns, start=1):
-            lines.append(f"## {index}. {turn.role}")
-            lines.append("")
-            lines.append("```text")
-            lines.append(turn.content)
-            lines.append("```")
-            lines.append("")
-        path.write_text("\n".join(lines), encoding="utf-8")
+        turns: Iterable[Turn]
+        turns = self._iter_turns(self.full_path) if full and self.full_path else self.turns
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as stream:
+            stream.write("# Agent Transcript\n\n")
+            for index, turn in enumerate(turns, start=1):
+                longest_backtick_run = max(
+                    (len(match.group(0)) for match in re.finditer(r"`+", turn.content)),
+                    default=0,
+                )
+                fence = "`" * max(3, longest_backtick_run + 1)
+                stream.write(f"## {index}. {turn.role}\n\n{fence}text\n")
+                stream.write(turn.content)
+                if not turn.content.endswith("\n"):
+                    stream.write("\n")
+                stream.write(f"{fence}\n\n")
 
     def _print_turn(self, turn: Turn) -> None:
         label = self._turn_label(turn)
@@ -177,6 +324,12 @@ class Conversation:
             return "FEEDBACK REQUEST"
         if content.startswith("FEEDBACK_AGENT_RESPONSE"):
             return "FEEDBACK RESPONSE"
+        if content.startswith(HARNESS_EFFECTIVE_REVIEW_MARKER):
+            return "HARNESS EFFECTIVE REVIEW"
+        if content.startswith(VALIDATED_FEEDBACK_DECISION_MARKER):
+            return "VALIDATED FEEDBACK DECISION"
+        if content.startswith(HARNESS_RESPONSE_OMISSION_MARKER):
+            return "HARNESS RESPONSE OMISSION"
         return turn.role.upper()
 
     def _turn_color(self, turn: Turn) -> str:
@@ -187,6 +340,12 @@ class Conversation:
             return "\033[36m"
         if content.startswith("FEEDBACK_AGENT"):
             return "\033[33m"
+        if content.startswith(HARNESS_EFFECTIVE_REVIEW_MARKER):
+            return "\033[2m"
+        if content.startswith(VALIDATED_FEEDBACK_DECISION_MARKER):
+            return "\033[2m"
+        if content.startswith(HARNESS_RESPONSE_OMISSION_MARKER):
+            return "\033[2m"
         if turn.role == "system":
             return "\033[2m"
         return ""

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent import FeedbackLoopAgent
-from .config import load_config
+from .config import load_config, validate_config
 
 
 def _compact_summary(summary: dict[str, Any]) -> dict[str, Any]:
@@ -50,12 +50,13 @@ def main() -> int:
     config = load_config(args.config, repo_root=repo_root)
     if args.workspace:
         workspace = Path(args.workspace)
-        if not workspace.is_absolute():
-            workspace = (repo_root / workspace).resolve()
+        workspace = (workspace if workspace.is_absolute() else repo_root / workspace).resolve(strict=False)
         config = replace(config, runtime=replace(config.runtime, workspace=workspace))
     prompt = args.prompt
     if args.prompt_file:
         prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+    if prompt is not None and not prompt.strip():
+        parser.error("the project prompt must not be empty")
     if prompt is not None or args.title:
         config = replace(
             config,
@@ -71,6 +72,7 @@ def main() -> int:
             mcp_tools=replace(config.mcp_tools, web_scraping=False),
             web_research=replace(config.web_research, enabled=False),
         )
+    validate_config(config)
     summary = FeedbackLoopAgent(config).run()
     mode = config.runtime.final_summary.lower()
     if mode == "full":

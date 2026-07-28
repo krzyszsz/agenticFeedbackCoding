@@ -20,7 +20,7 @@ Default: install Ubuntu host dependencies, Docker Engine, AMD/Mesa Vulkan packag
 Python venv requirements, and build the agent container image.
 
 Options:
-  --download-model       Download the default Qwen3.6-27B Q4_K_M GGUF + mmproj.
+  --download-model       Download the selected MODEL_PROFILE target and MTP files.
   --build-llama-vulkan   Build the optional llama.cpp Vulkan server image.
   --skip-host            Do not install apt/Docker/Vulkan host packages.
   --skip-amd-vulkan      Do not install libvulkan1/mesa-vulkan-drivers/vulkan-tools.

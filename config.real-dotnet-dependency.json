@@ -1,12 +1,14 @@
 {
   "implementation_model": {
-    "name": "qwen3.6-27b-q4km",
-    "base_url": "http://127.0.0.1:8161/v1",
+    "name": "qwen3.6-27b-mtp",
+    "base_url": "http://127.0.0.1:8163/v1",
     "api_key": "not-needed",
     "model": "local-gguf",
-    "context_window": 76800,
+    "context_window": 131072,
     "max_tokens": 32768,
-    "temperature": 0.2,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
     "retry_sleep_seconds": 30,
@@ -23,7 +25,7 @@
     "docker_image": "agentic-feedback-coding:local",
     "docker_user": "root",
     "workspace": "workspaces/real-dotnet-dependency",
-    "command_timeout_seconds": 180,
+    "command_timeout_seconds": 0,
     "print_transcript": true,
     "live_turn_max_chars": 30000,
     "color_transcript": true,
@@ -42,11 +44,11 @@
     "transcript_review_max_chars": 24000
   },
   "loop": {
-    "max_iterations": 3
+    "max_approach_reattempts": 5
   },
   "project_design": {
     "title": "Container-local .NET dependency setup benchmark",
-    "prompt": "Build a small C#/.NET project in this workspace: a tested library plus console app that parses todo items from a text file, identifies overdue open items, and prints a short report. Do not change the harness Dockerfile. The disposable agent container may not have dotnet installed, so the first independently verifiable plan step must check whether dotnet is available and, if missing, install a .NET SDK inside the Docker agent container using bounded terminal commands. Document exactly what was installed and where. If using dotnet-install.sh, use a shell command such as bash -lc so $HOME expands correctly; HOME is /tmp in the agent container and /tmp/.dotnet is already on PATH for later validation commands. Do not install SDK files under the project workspace. Then implement the library, CLI, tests, README, and validation evidence. Prefer dotnet build and dotnet test as the final validation; only use a documented fallback if SDK installation genuinely fails. Maintain PLAN.md during the work. Keep steps clear, verifiable, and technology-specific to C#/.NET rather than rewriting the task as Python."
+    "prompt": "Build a small C#/.NET project in this workspace: a tested library plus console app that parses todo items from a text file, identifies overdue open items, and prints a short report. Do not change the harness Dockerfile. The disposable agent container may not have dotnet installed, so the first independently verifiable plan step must check whether dotnet is available and, if missing, install a .NET SDK inside the Docker agent container using bounded terminal commands. Document exactly what was installed and where. If using dotnet-install.sh, use a shell command such as bash -lc so $HOME expands correctly; HOME is /tmp in the agent container and /tmp/.dotnet is already on PATH for later validation commands. Do not install SDK files under the project workspace. Then implement the library, CLI, tests, README, and validation evidence. Prefer dotnet build and dotnet test as the final validation; only use a documented fallback if SDK installation genuinely fails. Keep steps clear, verifiable, and technology-specific to C#/.NET rather than rewriting the task as Python."
   },
   "phases": {
     "requirements_refinement": {
@@ -61,13 +63,11 @@
   },
   "resolution_policy": {
     "max_same_error_repeats": 2,
-    "allow_requirement_dilution": true,
     "allow_skip_with_note": true,
     "stop_on_cannot_resolve": false
   },
   "quality_policy": {
-    "assume_code_quality_when_unspecified": true,
-    "require_research_and_structure_step": true
+    "assume_code_quality_when_unspecified": true
   },
   "review_policy": {
     "hard_pushback_iterations": 3,

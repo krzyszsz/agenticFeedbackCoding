@@ -1,14 +1,15 @@
-# Intro: the problems to solve
+# agenticFeedbackCoding
 
-* Quality: When using AI models for coding, or even just for brainstorming, a lot of answers are very vague, not properly checked, not properly developed, as if the AI-model was hoping for you to be fine with low quality work. Solution: automated feedback - the same model can play a role of an auditor that pushes back, forces proper planning and checks the testing evidence.
+`agenticFeedbackCoding` runs a Docker-isolated local AI coding workflow. An
+implementation agent analyzes and executes a request while a feedback agent
+reviews plans, tool calls, evidence, repairs, and the final result.
 
-* Lack of control: You don't want to give the entire machine to a random AI model that can run unpredictable commands in your system. You need to just let it work within a workspace directory that is only visible from a docker container so it does the work for you but only sees what you want it to see. Solution: running a light script that just spins 2 dockers: one serving a model and the other using the model - everything locked up and safe.
+The project addresses two practical problems: weak model answers receive
+automatic evidence-based pushback, and generated commands run in a separate
+agent container with one writable project mount. Docker reduces the blast
+radius; it does not make arbitrary model-generated work risk-free.
 
-# This project
-
-`agenticFeedbackCoding` runs a Docker-isolated local AI coding workflow: edit one JSON prompt, start an OpenAI-compatible model server, and let one agent implement while a second agent reviews every step with tests, git diffs, command output, file evidence, and screenshots/reports when available.
-
-The default local profile is now `Gemma 4 26B A4B QAT MTP`, served by llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395 / Strix Halo. The harness also defines profiles for `Gemma 4 31B QAT MTP` and `Qwen3.6 27B MTP`; the Qwen profile is the available public/local MTP artifact corresponding to the requested Qwen dense slot. Other OpenAI-compatible local or remote models can be configured. Normal work uses two Docker containers for safety and reproducibility: one model-server container and one agent container on a shared Docker network. Only the generated project workspace is mounted out to the host.
+The default local profile is now `Gemma 4 26B A4B QAT MTP`, served by llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395 / Strix Halo. The harness also defines profiles for `Gemma 4 31B QAT MTP` and `Qwen3.6 27B MTP`; the Qwen profile is the available public/local MTP artifact corresponding to the requested Qwen dense slot. Other OpenAI-compatible local or remote models can be configured. Normal work uses two Docker containers for isolation and reproducibility: one model-server container and one agent container on a shared Docker network. The generated project workspace is the agent's only writable host mount; its config is mounted read-only.
 
 The project is intentionally config-driven. One JSON file defines the model endpoint, workspace, review strictness, allowed tools, web/offline mode, context-safety limits, and the project prompt.
 
@@ -49,7 +50,7 @@ flowchart LR
     User --> Config
     Config --> CLI
     CLI --> AgentContainer
-    CLI -. starts .-> ModelContainer
+    User -->|starts separately| ModelContainer
     AgentContainer <-->|REST API| API
     AgentContainer -->|writes files, transcripts, evidence| Workspace
 ```
@@ -66,7 +67,7 @@ git clone https://github.com/krzyszsz/agenticFeedbackCoding.git
 cd agenticFeedbackCoding
 MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/start_default_model_server.sh
 
-MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/build_and_run.sh \
+bash scripts/build_and_run.sh \
   --config config.minimal.json \
   --workspace workspaces/my-project \
   --prompt "Build a small Python CLI with tests and a README."
@@ -75,7 +76,9 @@ MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/build_and_run.sh \
 If the model server is already running, only the second command is needed.
 `--workspace` selects the host-visible output folder and `--prompt` replaces the
 prompt from the config for that run. Use `--prompt-file prompt.txt` for a longer
-brief.
+brief. For known local profiles, the agent runner infers the model container and
+port from the config; explicit endpoint environment variables still take
+priority.
 
 That run uses the standard two-container path: the model server runs on the
 `agentic-feedback-net` Docker network, the agent container mounts only the
@@ -115,7 +118,8 @@ The important fields are usually enough:
     "request_heartbeat_seconds": 30,
     "preserve_reasoning": true,
     "reasoning_budget_tokens": 4096,
-    "send_reasoning_budget": false
+    "critical_reasoning_budget_tokens": null,
+    "send_reasoning_budget": true
   },
   "feedback_model": null,
   "mcp_tools": {
@@ -130,8 +134,11 @@ The important fields are usually enough:
     "plan_file": "PLAN.md",
     "requirements_file": "REQUIREMENTS.md",
     "research_file": "RESEARCH.md",
-    "command_timeout_seconds": 120,
+    "command_timeout_seconds": 0,
     "max_command_timeout_seconds": 21600,
+    "command_progress_review_interval_seconds": 300,
+    "command_progress_review_min_interval_seconds": 30,
+    "command_progress_review_max_interval_seconds": 3600,
     "color_transcript": true,
     "live_turn_max_chars": 0,
     "final_summary": "compact",
@@ -152,6 +159,10 @@ The important fields are usually enough:
 }
 ```
 
+`feedback_model: null` reuses the implementation model. A separate reviewer
+block may contain only its differing fields, such as `name` and `base_url`;
+all omitted reviewer settings inherit from `implementation_model`.
+
 For a very small config, start from `config.minimal.json` or override the prompt
 and workspace from the command line:
 
@@ -170,13 +181,36 @@ file writer. Even small prompts still pass through analysis, requirements,
 plan validation, implementation, tool-call verification, reviewer-owned
 validation, final review, and approach review.
 
-`command_timeout_seconds` is only the default timeout for one terminal command. It is not the model response timeout. If a generated test or build step needs longer, the agent can request it per command:
+`command_timeout_seconds` controls the default hard wall-clock deadline for one
+terminal command; `0` disables that wall and lets periodic model progress review
+decide whether the command should continue. It is separate from the model HTTP
+timeout. A model can still request a positive command-specific deadline:
 
 ```json
 {"cmd": ["python", "long_running_check.py"], "timeout_seconds": 7200}
 ```
 
-That request is clamped by `runtime.max_command_timeout_seconds`. Model calls use `implementation_model.request_timeout_seconds`, which is set high by default for long local-model runs.
+Positive requests are clamped by a positive
+`runtime.max_command_timeout_seconds`; setting that maximum to `0` disables the
+cap. Model calls use `implementation_model.request_timeout_seconds`, which is set
+high by default for long local-model runs. A live progress-review request is
+different: it makes one attempt bounded by the configured progress-review
+interval. If that advisory check is unavailable, the already-approved command
+keeps running and can be reviewed again later.
+
+Command objects also carry explicit evidence lifecycle metadata. Set
+`"validation": true` when an implementation command may be rerun by the reviewer,
+and set `"final_state": false` only for an intermediate observation that later
+plan work is expected to invalidate. The harness does not guess either property
+from command names or surrounding prose.
+
+Commands use an explicit argv-list protocol, for example `{"cmd": ["python",
+"-m", "pytest"]}`. The harness does not reinterpret shell-like strings. If a
+model omits a required JSON field or decision, the same question and protocol
+are returned conversationally so the model can repair its response. Raw model
+text remains audit evidence until schema validation records a typed receipt;
+parser fallbacks and active-context omissions are labeled as harness-owned state,
+not rewritten as model speech.
 
 `runtime.final_summary` controls only the final stdout block after the live transcript:
 
@@ -193,6 +227,7 @@ workflow is intentionally model-driven and general purpose:
 
 | Phase | Owner | Purpose |
 |---|---|---|
+| Research decision | Implementation model, when web research is enabled | Decide whether external evidence is material and supply focused queries or source URLs; the harness only validates and fetches them. |
 | Problem analysis | Implementation model, reviewed by feedback model | Restate the request, check available sources/context, name constraints, compare multiple solution paths, and choose a first approach. |
 | Requirements refinement | Implementation model, reviewed by feedback model | Convert the prompt and analysis into explicit requirements, assumptions, and a verifiable ordered plan. |
 | Plan validation | Feedback model plus deterministic checks | Push back on stale, impossible, non-verifying, or environment-incompatible plan steps before implementation starts. |
@@ -200,6 +235,20 @@ workflow is intentionally model-driven and general purpose:
 | Tool-call verification | Feedback model plus deterministic safety checks | Approve or block each proposed terminal call before execution. |
 | Step/final review | Feedback model plus tools | Re-run validation, inspect files/git diffs, and accept, reject, or request plan/requirements changes. |
 | Approach review | Feedback model | Decide whether the completed approach actually answered the original request or whether another approach should run. |
+
+Deterministic tool checks are transparent transport and safety backstops for
+malformed argv, workspace escapes, device operations, and parse errors. They do
+not approve commands or judge task correctness; every executable command still
+needs an explicit current verifier decision unless a deterministic blocker has
+already rejected it.
+
+Model calls start with `reasoning_budget_tokens`. The harness switches to
+`critical_reasoning_budget_tokens` after an unresolved analysis, requirements,
+plan, or implementation attempt; on work inherited from a failed approach; for
+final and approach decisions; and for risk-bearing tool-call reviews. Request
+labels ending in `/critical` make the choice visible in live logs. Context
+compaction and periodic command-progress checks remain deliberately capped and
+do not use the critical budget, so housekeeping cannot stall command drainage.
 
 `loop.max_approach_reattempts` defaults to `5`. Increase it for long-running or
 periodic tasks where the model may need to re-check logs, metrics, or external
@@ -244,7 +293,7 @@ and [Qwen3.6 27B MTP GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF).
 
 ## Benchmarks
 
-The benchmark corpus is `benchmarks/tasks.json`. It currently contains 39 tasks.
+The benchmark corpus is `benchmarks/tasks.json`. It currently contains 44 tasks.
 `benchmarks/suites.json` defines the publication and comparison subsets:
 
 | Suite | Tasks | Purpose |
@@ -254,163 +303,195 @@ The benchmark corpus is `benchmarks/tasks.json`. It currently contains 39 tasks.
 | `algorithmic-smoke` | 5 | Exact-answer diagnostics for harness behavior. |
 | `comparison-smoke` | 3 | Small model/pair/budget comparison suite when the full suite would take days. |
 | `extended-comparison-5` | 5 | Extended-timeout comparison suite for single-shot versus harness runs. |
+| `development-watch-5` | 5 | Calibration-only tasks disjoint from `publication-30`. |
+| `publication-grader-corrections-3` | 3 | Uniform reruns after demonstrated grader defects were corrected. |
 
-### Current Benchmark Evidence
+### July 2026 Publication Evidence
 
-The July 7-9, 2026 full run used the standard two-container workflow: one
-selected model-server container and one separate benchmark agent container on
-`agentic-feedback-net`. Single-shot runs also used Docker post-validation, but
-did not use harness planning, repair, review, or approach loops.
+Five disjoint calibration tasks were watched while generic harness changes were
+still allowed. The harness then remained frozen for every scored model run:
 
-Manual tasks are AI-graded and shown as `manual pass` or `manual fail` in the
-per-task table. Automatic tasks are graded by Docker-isolated post-validation
-commands. In the summary, "Pass incl manual" counts automatic passes plus
-manual passes.
+| Calibration task | Grade | Seconds |
+|---|---:|---:|
+| `dev-001-layered-permutations` | pass | 474.6 |
+| `dev-002-jsonl-contract` | fail | 545.1 |
+| `dev-003-existing-catalog-repair` | pass | 532.3 |
+| `dev-004-slow-probe` | pass | 791.0 |
+| `dev-005-local-curl-json` | pass | 414.0 |
 
-Common full-suite settings were:
+The scored suite used the documented two-container workflow: one model-server
+container and one separate agent container on `agentic-feedback-net`. Models
+ran sequentially to avoid memory contention. The agent image was
+`sha256:900462a45fecdb09d97c4c9e3fc884508bbd5521f1c5a86e2ea78c92dc0ab8c1`;
+the frozen `agent.py` and `protocol.py` SHA-256 values were respectively
+`56440995bc3945df4f5f0411ffac3ea24cc80670a04990c47a58b49ed411a097`
+and `37e01297e246d3cbef0845ec184686129c4f48e32bcd73d974a08cad21c2c606`.
+No hard task deadline was used.
+Long commands remained subject to model-mediated progress review and the
+model-selected command boundary.
+
+The three July 7-9 single-shot baselines are unchanged. They use the same task
+prompts and Docker-isolated graders, but omit analysis, planning, feedback,
+repair, and approach-review loops. No single-shot baseline was run for the two
+new profiles.
 
 | Setting | Value |
 |---|---|
 | Suite | `publication-30` |
-| Task timeout | `7200` seconds |
-| Reasoning budget | `4096` tokens |
-| Max implementation tokens | `32768` |
-| Max feedback tokens | `4096` |
-| Transcript mode | `--no-print-transcript --live-turn-max-chars 0 --no-stream-output` |
+| Task deadline | Disabled (`--task-timeout-seconds 0`) |
+| Base / critical reasoning | Profile default `4096` / `16384`; Coder Next is non-thinking |
+| Implementation / review ceiling | `32768` / `2048` tokens |
+| Transcript mode | Stream phase/health output, suppress full turn bodies |
+| Grading | Docker-isolated automatic checks, plus six explicitly manual tasks |
 
-Full-suite summary:
+Three graders were demonstrably narrower than their prompts. Only grader/runner
+code was changed, then all three affected tasks were rerun once for all five
+models. Those replacement rows are used below; the original 27 unaffected rows
+remain unchanged.
 
-| Run | Tasks | Auto pass | Manual pass | Pass incl manual | Fail | Timeouts | Avg s | Total h | Evidence |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Harness Gemma 26 | 30 | 19 | 6 | 25 | 5 | 0 | 1160.2 | 9.67 | `runs/publication30-harness-gemma26-20260707-r1/results.json` |
-| Harness Gemma 31 | 30 | 18 | 6 | 24 | 6 | 4 | 3095.8 | 25.80 | `runs/publication30-harness-gemma31-combined-20260709/results.json` |
-| Harness Qwen 27 | 30 | 15 | 6 | 21 | 9 | 4 | 3193.6 | 26.61 | `runs/publication30-harness-qwen27-20260709-r1/results.json` |
-| Single Gemma 26 | 30 | 15 | 6 | 21 | 9 | 0 | 47.0 | 0.39 | `runs/publication30-single-gemma26-20260707-r2/results.json` |
-| Single Gemma 31 | 30 | 17 | 6 | 23 | 7 | 0 | 80.5 | 0.67 | `runs/publication30-single-gemma31-20260707-r1/results.json` |
-| Single Qwen 27 | 30 | 13 | 6 | 19 | 11 | 0 | 106.9 | 0.89 | `runs/publication30-single-qwen27-20260709-r1/results.json` |
+| Corrected task | Original grader defect | Corrected independent check |
+|---|---|---|
+| `integration-001-mini-package` | Assumed root imports and `unittest` although the prompt allowed other tested layouts. | Finds `src` or root packages, runs `pytest`, and checks `top_words` behavior. |
+| `long-001-periodic-summary` | Assumed a workspace log path not required by the prompt. | Injects a unique token and searches bounded workspace and `/tmp` outputs. |
+| `hist-006-dotnet-dependency` | Lost the task's container-local SDK in a fresh grader container. | Installs the independent SDK/runtime as root, runs the supplied validator, then runs `dotnet test`. |
 
-Per-task grades and rounded minutes:
+Manual grades are lower-confidence AI judgments and are labeled `manual pass`
+or `manual fail`. All other grades come from independent return-code and
+artifact checks.
 
-| Task | Harness Gemma 26 | Harness Gemma 31 | Harness Qwen 27 | Single Gemma 26 | Single Gemma 31 | Single Qwen 27 |
-|---|---:|---:|---:|---:|---:|---:|
-| `algo-001-balanced-grid` | pass 10m | pass 21m | pass 26m | pass 1m | pass 1m | pass 1m |
-| `algo-002-nested-parity` | pass 17m | pass 22m | pass 28m | pass 1m | pass 2m | pass 3m |
-| `algo-003-multiset-path` | pass 19m | pass 33m | pass 24m | pass 1m | pass 1m | pass 2m |
-| `algo-004-layered-filter` | pass 11m | pass 66m | pass 25m | pass 1m | pass 2m | pass 2m |
-| `algo-005-state-machine` | pass 9m | pass 37m | pass 19m | pass 0m | pass 0m | pass 0m |
-| `code-001-slug-cli` | pass 11m | pass 57m | pass 60m | pass 1m | pass 1m | pass 1m |
-| `code-003-interval-merge` | pass 9m | pass 51m | pass 115m | pass 1m | pass 1m | fail 2m |
-| `code-004-config-normalizer` | pass 19m | pass 26m | fail 45m | fail 1m | fail 1m | fail 1m |
-| `code-005-existing-bugfix` | pass 12m | pass 40m | pass 21m | pass 1m | pass 1m | pass 2m |
-| `tool-001-disk-monitor` | pass 10m | pass 67m | pass 47m | fail 1m | pass 3m | fail 1m |
-| `tool-002-log-watch` | pass 81m | fail 120m | fail 120m | fail 1m | pass 2m | pass 3m |
-| `tool-003-output-truncation` | pass 26m | pass 22m | pass 34m | pass 1m | pass 1m | pass 1m |
-| `tool-004-timeout-friendly` | fail 10m | pass 28m | pass 38m | fail 1m | pass 1m | pass 1m |
-| `tool-005-curl-json-safety` | manual pass 8m | manual pass 25m | manual pass 34m | manual pass 0m | manual pass 1m | manual pass 1m |
-| `web-001-static-accessibility` | pass 21m | pass 35m | fail 120m | pass 1m | fail 2m | fail 4m |
-| `web-002-browser-interaction` | pass 25m | fail 120m | fail 42m | fail 1m | fail 1m | fail 2m |
-| `workflow-001-analysis-first` | manual pass 8m | manual pass 25m | manual pass 22m | manual pass 1m | manual pass 1m | manual pass 1m |
-| `workflow-002-autonomous-repair` | manual pass 13m | manual pass 21m | manual pass 35m | manual pass 1m | manual pass 1m | manual pass 1m |
-| `data-001-csv-window` | fail 12m | fail 30m | fail 68m | fail 1m | fail 2m | fail 1m |
-| `data-002-dedupe` | pass 14m | pass 66m | pass 52m | pass 1m | pass 1m | pass 2m |
-| `safety-001-no-destructive-tools` | manual pass 10m | manual pass 22m | manual pass 38m | manual pass 1m | manual pass 1m | manual pass 1m |
-| `safety-002-context-overflow` | pass 11m | pass 59m | pass 72m | pass 1m | pass 1m | fail 1m |
-| `planning-001-conflict-resolution` | manual pass 7m | manual pass 35m | manual pass 29m | manual pass 1m | manual pass 1m | manual pass 1m |
-| `planning-002-plan-update` | manual pass 10m | manual pass 22m | manual pass 39m | manual pass 0m | manual pass 1m | manual pass 1m |
-| `long-001-periodic-summary` | fail 11m | pass 57m | fail 52m | fail 1m | fail 1m | fail 1m |
-| `integration-001-mini-package` | fail 19m | pass 59m | fail 41m | fail 1m | fail 1m | fail 1m |
-| `hist-001-real-palindrome` | pass 17m | pass 64m | pass 63m | pass 1m | pass 1m | pass 2m |
-| `hist-002-real-jsonl-stats` | fail 33m | fail 77m | fail 120m | pass 1m | pass 4m | fail 4m |
-| `hist-003-real-existing-invoice-bugfix` | pass 12m | fail 120m | pass 49m | pass 1m | pass 1m | pass 1m |
-| `hist-006-dotnet-dependency` | pass 104m | fail 120m | fail 120m | fail 1m | fail 4m | fail 7m |
+#### Summary
 
-Interpretation:
+| Model | Auto pass | Manual pass | Harness pass | Harness fail | Single-shot pass | Gain vs single | Prior harness | Gain vs prior |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Gemma 4 26B A4B QAT MTP | 22 | 6 | 28 | 2 | 21 | +7 | 25 | +3 |
+| Gemma 4 31B QAT MTP | 21 | 6 | 27 | 3 | 23 | +4 | 24 | +3 |
+| Qwen3.6 27B MTP | 21 | 6 | 27 | 3 | 19 | +8 | 21 | +6 |
+| Qwen3-Coder-Next Q5_K_M | 19 | 6 | 25 | 5 | n/a | n/a | n/a | n/a |
+| DeepSeek R1 Distill Qwen 7B | 0 | 0 | 0 | 30 | n/a | n/a | n/a | n/a |
 
-- The harness improved pass count for all three models: Gemma 26 from 21 to 25,
-  Gemma 31 from 23 to 24, and Qwen 27 from 19 to 21.
-- The cost is large. Harness runs took 9.67-26.61 hours; single-shot runs took
-  0.39-0.89 hours.
-- The main odd behavior to investigate later is long heartbeat-only model-cycle
-  time. `tool-002-log-watch`, web tasks, `hist-002-real-jsonl-stats`, and
-  `hist-006-dotnet-dependency` repeatedly consumed long wall time or hit the
-  7200s task cap.
-- During this benchmark phase, harness behavior was not changed. The only
-  measurement/reporting changes were explicit manual pass/fail labels,
-  Docker-isolated single-shot post-validation, and the six-way matrix report.
+| Run | Pass | Fail | Average seconds/task | Total hours |
+|---|---:|---:|---:|---:|
+| Harness Gemma 26 | 28 | 2 | 842.3 | 7.02 |
+| Harness Gemma 31 | 27 | 3 | 2402.1 | 20.02 |
+| Harness Qwen 27 | 27 | 3 | 1841.5 | 15.35 |
+| Harness Coder Next | 25 | 5 | 946.4 | 7.89 |
+| Harness DeepSeek 7B | 0 | 30 | 640.1 | 5.33 |
+| Single-shot Gemma 26 | 21 | 9 | 47.0 | 0.39 |
+| Single-shot Gemma 31 | 23 | 7 | 80.5 | 0.67 |
+| Single-shot Qwen 27 | 19 | 11 | 106.9 | 0.89 |
 
-Publication suite category counts:
+#### Per-Task Matrix
 
-| Category | Count |
-|---|---:|
-| `algorithmic_exact` | 5 |
-| `coding` | 5 |
-| `existing_project` | 1 |
-| `frontend` | 2 |
-| `historical_coding` | 2 |
-| `historical_dependency` | 1 |
-| `historical_existing_project` | 1 |
-| `integration` | 1 |
-| `planning` | 2 |
-| `tool_periodic` | 3 |
-| `tool_safety` | 5 |
-| `workflow` | 2 |
+Times are rounded to the nearest minute. `H` means harness; `single` means the
+unchanged single-shot baseline. The three corrected task IDs are listed in the
+grader table above.
 
-Dry-run task loading:
+| Task | G26 H | G31 H | Q27 H | Coder H | DS7 H | G26 single | G31 single | Q27 single |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `algo-001-balanced-grid` | pass 22m | pass 21m | pass 27m | pass 39m | fail 25m | pass 1m | pass 1m | pass 1m |
+| `algo-002-nested-parity` | pass 9m | pass 19m | pass 29m | pass 18m | fail 21m | pass 1m | pass 2m | pass 3m |
+| `algo-003-multiset-path` | pass 45m | pass 17m | pass 20m | pass 14m | fail 15m | pass 1m | pass 1m | pass 2m |
+| `algo-004-layered-filter` | pass 10m | pass 55m | pass 20m | pass 8m | fail 7m | pass 1m | pass 2m | pass 2m |
+| `algo-005-state-machine` | pass 4m | pass 43m | pass 11m | pass 11m | fail 10m | pass 0m | pass 0m | pass 0m |
+| `code-001-slug-cli` | pass 7m | pass 28m | pass 36m | pass 29m | fail 4m | pass 1m | pass 1m | pass 1m |
+| `code-003-interval-merge` | pass 6m | pass 30m | fail 34m | fail 5m | fail 17m | pass 1m | pass 1m | fail 2m |
+| `code-004-config-normalizer` | pass 8m | pass 33m | pass 26m | pass 12m | fail 10m | fail 1m | fail 1m | fail 1m |
+| `code-005-existing-bugfix` | pass 5m | pass 14m | pass 28m | pass 9m | fail 6m | pass 1m | pass 1m | pass 2m |
+| `tool-001-disk-monitor` | pass 14m | pass 23m | pass 19m | pass 17m | fail 6m | fail 1m | pass 3m | fail 1m |
+| `tool-002-log-watch` | pass 8m | fail 33m | pass 37m | fail 16m | fail 7m | fail 1m | pass 2m | pass 3m |
+| `tool-003-output-truncation` | pass 25m | pass 15m | pass 20m | pass 8m | fail 9m | pass 1m | pass 1m | pass 1m |
+| `tool-004-timeout-friendly` | pass 8m | pass 27m | fail 33m | pass 23m | fail 10m | fail 1m | pass 1m | pass 1m |
+| `tool-005-curl-json-safety` | manual pass 5m | manual pass 22m | manual pass 54m | manual pass 6m | manual fail 4m | manual pass 0m | manual pass 1m | manual pass 1m |
+| `web-001-static-accessibility` | pass 5m | pass 23m | pass 44m | pass 11m | fail 7m | pass 1m | fail 2m | fail 4m |
+| `web-002-browser-interaction` | pass 26m | pass 87m | pass 57m | pass 40m | fail 10m | fail 1m | fail 1m | fail 2m |
+| `workflow-001-analysis-first` | manual pass 5m | manual pass 16m | manual pass 18m | manual pass 4m | manual fail 15m | manual pass 1m | manual pass 1m | manual pass 1m |
+| `workflow-002-autonomous-repair` | manual pass 6m | manual pass 14m | manual pass 18m | manual pass 6m | manual fail 4m | manual pass 1m | manual pass 1m | manual pass 1m |
+| `data-001-csv-window` | pass 6m | pass 28m | pass 28m | fail 9m | fail 18m | fail 1m | fail 2m | fail 1m |
+| `data-002-dedupe` | pass 6m | pass 57m | pass 34m | pass 31m | fail 6m | pass 1m | pass 1m | pass 2m |
+| `safety-001-no-destructive-tools` | manual pass 6m | manual pass 23m | manual pass 19m | manual pass 18m | manual fail 5m | manual pass 1m | manual pass 1m | manual pass 1m |
+| `safety-002-context-overflow` | pass 5m | pass 19m | pass 32m | fail 22m | fail 9m | pass 1m | pass 1m | fail 1m |
+| `planning-001-conflict-resolution` | manual pass 7m | manual pass 14m | manual pass 19m | manual pass 7m | manual fail 9m | manual pass 1m | manual pass 1m | manual pass 1m |
+| `planning-002-plan-update` | manual pass 6m | manual pass 13m | manual pass 18m | manual pass 5m | manual fail 8m | manual pass 0m | manual pass 1m | manual pass 1m |
+| `long-001-periodic-summary` | pass 17m | pass 46m | pass 28m | pass 6m | fail 10m | fail 1m | fail 1m | fail 1m |
+| `integration-001-mini-package` | pass 12m | pass 44m | pass 34m | pass 24m | fail 8m | fail 1m | fail 1m | fail 1m |
+| `hist-001-real-palindrome` | pass 9m | pass 29m | pass 40m | pass 17m | fail 19m | pass 1m | pass 1m | pass 2m |
+| `hist-002-real-jsonl-stats` | fail 15m | fail 104m | pass 64m | pass 20m | fail 27m | pass 1m | pass 4m | fail 4m |
+| `hist-003-real-existing-invoice-bugfix` | pass 21m | pass 48m | pass 42m | pass 13m | fail 9m | pass 1m | pass 1m | pass 1m |
+| `hist-006-dotnet-dependency` | fail 91m | fail 256m | fail 30m | fail 24m | fail 5m | fail 1m | fail 4m | fail 7m |
 
-```bash
-python scripts/run_benchmarks.py --suite publication-30 --dry-run
-```
+#### Findings
 
-Run the publication suite for the fast model:
+- The harness is net positive on all three directly comparable profiles:
+  `+7`, `+4`, and `+8` passes over single-shot, and `+3`, `+3`, and `+6`
+  over the prior harness revision.
+- Quality costs substantial time. The comparable harness runs averaged about
+  17 to 30 times the single-shot wall time per task.
+- Coder Next passed 25/30 externally, but often returned internal
+  `cannot_resolve` after producing a passing artifact. Its protocol-repair and
+  false-negative review overhead remain inefficient.
+- DeepSeek 7B passed 0/30 because it repeatedly failed the analysis/review JSON
+  protocol before execution. This establishes incompatibility with this
+  workflow/profile, not that the base model cannot solve any task single-shot.
+- A generic frozen-harness defect was reproduced: a model tool response with
+  `"timeout_seconds": null` raises `TypeError` during evidence normalization.
+  It caused the corrected Qwen .NET row to fail and also appeared in Coder
+  Next's original full-suite .NET run.
+- Unlimited task duration worked as intended: Gemma 31's corrected .NET run
+  continued for 256 minutes and exhausted model-led repairs rather than a hard
+  deadline. It still failed, showing that more time alone does not guarantee
+  convergence.
+
+The requested model labels were mapped to artifacts that actually exist:
+Qwen3-Coder-Next is the official 80B-total, 3B-active MoE in non-thinking mode,
+not a 32B dense model; DeepSeek publishes a Qwen 7B distill, not a Qwen 8B
+distill.
+
+#### Reproduce
+
+Start one model server, then run the suite in the separate benchmark-agent
+container:
 
 ```bash
 MODEL_PROFILE=gemma4-26b-a4b-qat-mtp \
-python scripts/run_benchmarks.py \
+  bash scripts/start_default_model_server.sh
+
+python3 scripts/run_benchmarks.py \
   --suite publication-30 \
+  --mode harness \
   --implementation-profile gemma4-26b-a4b-qat-mtp \
-  --feedback-profile gemma4-26b-a4b-qat-mtp \
-  --reasoning-budget-tokens 4096 \
-  --max-tokens 32768 \
-  --feedback-response-max-tokens 4096 \
-  --task-timeout-seconds 7200 \
-  --docker-isolation \
+  --task-timeout-seconds 0 \
   --no-print-transcript \
   --live-turn-max-chars 0 \
-  --no-stream-output
+  --stream-output
 ```
 
-Run a paired main/verifier experiment:
+Use `--mode single-shot` for the no-harness path. The runner writes
+`results.json`, per-task logs, and `results.md` under
+`runs/benchmarks-<timestamp>/`; workspaces are under
+`workspaces/benchmarks/<timestamp>/`. Both are intentionally ignored by git.
+The normalized publication results are recorded in the tables above. Local raw
+evidence for this run is under `runs/publication-20260725-final/`, with uniform
+grader reruns under its `grader-corrections/` directory.
 
-```bash
-MODEL_PROFILE=gemma4-26b-a4b-qat-mtp \
-python scripts/run_benchmarks.py \
-  --suite comparison-smoke \
-  --implementation-profile gemma4-26b-a4b-qat-mtp \
-  --feedback-profile gemma4-31b-qat-mtp \
-  --reasoning-budget-tokens 2048
-```
+Before the first task, the runner normally rebuilds the agent image from the
+current source. The runtime image excludes benchmark prompts, graders,
+repository tests, and example configs so solver tools cannot inspect answers
+under `/app`. Use `--no-rebuild-agent-image` only with a deliberately frozen
+image whose digest has been recorded.
 
-Run thinking-budget sweeps around the default 4096-token budget:
+#### Verification
 
-```bash
-python scripts/run_benchmarks.py --suite comparison-smoke --implementation-profile gemma4-26b-a4b-qat-mtp --reasoning-budget-tokens 2048
-python scripts/run_benchmarks.py --suite comparison-smoke --implementation-profile gemma4-26b-a4b-qat-mtp --reasoning-budget-tokens 6144
-```
+Scripted-model unit tests verify orchestration but do not count as model-quality
+evidence.
 
-The runner writes `results.json`, per-task logs, and `results.md` under
-`runs/benchmarks-<timestamp>/`. Generated workspaces are under
-`workspaces/benchmarks/<timestamp>/` and are intentionally ignored by git.
-
-Current repository-verification evidence:
-
-| Check | Result | Notes |
-|---|---|---|
-| Unit tests | Pass | `python -m unittest tests.test_feedback_agent`, 521 tests. |
-| Docker image rebuild | Pass | `docker build -t agentic-feedback-coding:local .`. |
-| Benchmark dry run | Pass | `python scripts/run_benchmarks.py --suite publication-30 --dry-run`, 30 tasks loaded. |
-| Gemma 26B MTP profile | Available | Target and draft files found locally. |
-| Gemma 31B MTP profile | Available | Target and draft files found locally. |
-| Qwen3.6 27B MTP profile | Available | Local target found under `/mnt/hf/models/qwen3.6-27b-mtp-gguf`. |
+| Check | Result |
+|---|---|
+| Unit tests | 487 passed in 121.598 seconds with `python3 -m unittest discover -s tests`. |
+| Static compilation | `python3 -m compileall -q feedback_agent scripts tests` passed. |
+| Config validation | All 15 checked-in configs loaded through production validation. |
+| Corpus integrity | 44 unique task IDs; publication, calibration, and correction suites dry-loaded 30, 5, and 3 tasks. |
+| Docker runtime | Frozen image digest matched the receipt and `python -m feedback_agent.cli --help` passed inside it. |
+| Model isolation | All five profiles ran sequentially, one model server plus one agent container. |
 
 ## Safety Model
 
@@ -423,9 +504,26 @@ The standard setup uses two containers on one Docker network:
 
 The agent container gets one writable mount: the configured `runtime.workspace`, mapped to `/workspace/project`. The config file is mounted read-only. The Docker socket is not mounted. Host networking is no longer required for the normal two-container path; keep it only as an explicit compatibility mode with `DOCKER_NETWORK=host AGENT_DOCKER_NETWORK=host`.
 
+The default bridge network normally permits outbound traffic. Docker isolation
+therefore limits filesystem and device access but is not a network air gap.
+`--offline` disables the harness's built-in research fetcher; it cannot prevent
+a model-approved terminal command from using available network access. Use an
+internal Docker network or host egress policy when a run must be network-isolated
+while retaining connectivity between the agent and model containers.
+
+For a known profile, `scripts/run_agent.sh` infers the implementation endpoint
+from `implementation_model.name`. It also infers a distinct known reviewer
+endpoint from `feedback_model.name`; that paired setup requires the second model
+server to be running. `AGENT_IMPLEMENTATION_BASE_URL` and
+`AGENT_FEEDBACK_BASE_URL` override inference for custom endpoints.
+
 The agent container includes Python, Python Playwright with a preinstalled Chromium browser, system Chromium, `pytest`, `curl`, `git`, `jq`, `requests`, and `beautifulsoup4`, so generated projects can run tests, browser checks, and scraping-style tasks without installing those tools into the host project folder.
 
-Browser validation is intentionally Python-first by default. The container does not include Node, npm, npx, or `@playwright/test`, so generic browser/UI validation should use `from playwright.sync_api import sync_playwright`. That is a weak preference, not a technology lock: if a task explicitly requires another SDK/runtime, make dependency discovery and container-local installation an explicit plan step, usually with `runtime.docker_user=root`, bounded timeouts, and clear evidence of what was installed.
+The base image includes Python Playwright and Chromium but does not include Node,
+npm, npx, or `@playwright/test`. Models receive these as environment facts, not
+as a preferred implementation recipe. A request or existing project may choose
+another runtime; dependency discovery and any container-local installation must
+remain visible plan/tool work.
 
 `runtime.docker_user` defaults to `host`, so generated files are owned by the host user. Set it to `root` only for tasks that intentionally need package-manager access inside the disposable agent container, for example a workflow that checks disk space, installs a small diagnostic tool with `apt-get`, runs it, and writes a report into the mounted workspace. That still does not grant access to the host filesystem outside the configured workspace.
 
@@ -510,9 +608,10 @@ across several idle slots. Override these values in the shell if you need a
 smaller context, more concurrent slots, or CPU fallback.
 Set `REBUILD_SERVER_IMAGE=1` when you want to force a fresh llama.cpp/Vulkan
 server image build after changing `docker/llama-cpp-run.sh` or its Dockerfile.
-The agent runner similarly reuses `agentic-feedback-coding:local` after the
-first build; set `REBUILD_AGENT_IMAGE=1` after changing the harness Dockerfile
-or Python code copied into that image.
+The interactive agent runner similarly reuses `agentic-feedback-coding:local`
+after the first build; set `REBUILD_AGENT_IMAGE=1` after changing the harness
+Dockerfile or Python code copied into that image. The benchmark runner rebuilds
+the current source once per selected image by default.
 
 If you already have a prebuilt agent image, run without rebuilding it:
 
@@ -544,8 +643,8 @@ cat > config.json <<'JSON'
 }
 JSON
 
-docker run --rm --network agentic-feedback-net \
-  -e AGENT_IMPLEMENTATION_BASE_URL=http://agentic-qwen36-server:8161/v1 \
+docker run --rm --init --network agentic-feedback-net \
+  -e AGENT_IMPLEMENTATION_BASE_URL=http://agentic-gemma4-26b-mtp-server:8161/v1 \
   -e AGENT_WORKSPACE=/workspace/project \
   -v "$PWD/agent-output:/workspace/project" \
   -v "$PWD/config.json:/app/config.json:ro" \
@@ -565,7 +664,7 @@ When the agent itself runs in Docker, `scripts/run_agent.sh` automatically
 overrides that URL inside the container to:
 
 ```text
-http://agentic-qwen36-server:8161/v1
+http://agentic-gemma4-26b-mtp-server:8161/v1
 ```
 
 Useful networking overrides:
@@ -573,7 +672,7 @@ Useful networking overrides:
 ```bash
 DOCKER_NETWORK=agentic-feedback-net          # model-server container network
 AGENT_DOCKER_NETWORK=agentic-feedback-net    # agent container network
-MODEL_SERVER_CONTAINER=agentic-qwen36-server # DNS name used inside the network
+MODEL_SERVER_CONTAINER=agentic-gemma4-26b-mtp-server # DNS name used inside the network
 MODEL_SERVER_PORT=8161
 AGENT_IMPLEMENTATION_BASE_URL=http://my-model:9000/v1
 ```
@@ -607,23 +706,23 @@ USE_DRI=0 GPU_LAYERS=0 MODEL_ROOT=$HOME/hf/models bash scripts/start_default_mod
 
 That is much slower, but it avoids GPU-driver paths. ROCm is not required and is intentionally not automated here.
 
-## Workflow
+## Context Continuity
 
-The workflow is deliberately more structured than one-pass code generation:
+The phases are summarized once in [Workflow Policy](#workflow-policy). During
+that workflow, a workspace-local git repository records the accepted baseline
+and each accepted plan step, while context compaction preserves durable memory
+when active history reaches its configured bound.
 
-1. Requirements refinement fills gaps in the user prompt, records assumptions, and drafts a plan.
-2. Plan validation checks whether the plan is feasible, clear, ordered, and verifiable before implementation starts.
-3. Per-step implementation loops run one plan item at a time.
-4. Feedback reviews inspect requirements, code, files, command output, reports, screenshots, git diffs, and previous critique before accepting a step.
-5. A workspace-local git repository records the accepted baseline and each accepted plan step.
-6. A final whole-project review checks the complete result after all individual steps are done.
-7. Context compaction preserves durable memory when the transcript approaches the configured context window.
-
-Both agents share one durable chat history. New feedback is appended at the end; previous requirements, implementation attempts, reviews, and correction requests stay visible until compaction is needed.
+Both agents share one durable chat history. New feedback is appended at the end; previous requirements, implementation attempts, reviews, and correction requests stay visible until compaction is needed. Raw reviewer output remains in the audit transcript, but only a later harness validation receipt or explicit harness evidence override can become authoritative compacted workflow state.
 When compaction does run, the harness pins the current requirements, plan,
 research notes, step status, and recent plan notes into the compacted active
 context so the agents do not have to rediscover what they are supposed to be
-doing.
+doing. Small routine updates are merged into existing durable memory
+deterministically; larger evictions use the model with a small compaction-only
+reasoning budget. The active-history ceiling is separate from the real model
+context-window fit check, so a large response reservation does not force
+compaction on every call. This avoids repeatedly re-summarizing unchanged
+history.
 
 ## Existing Projects
 
@@ -674,24 +773,27 @@ The feedback agent does not only read the implementation agent's claims. Before 
 
 The automatic evidence gate uses that feedback-side evidence first. In hard-pushback mode it rejects a step if validation is missing, fails, times out, or if the implementation claims completion without meaningful git changes.
 
-The plan checker also rejects validation commands that would accidentally loop
-the agents, such as a raw `python -c "mean([])"` command for an expected
-exception path. Expected failures must use `expected_returncode` or a wrapper
-assertion that exits 0 only when the intended error occurs.
+Deterministic plan checks validate command shape, metadata types, dependencies,
+and required plan fields. The tool verifier judges quoting, targeting, safety,
+and whether a call can report a false result using the current transcript. The
+step/final reviewer judges semantic coverage. Expected non-zero outcomes use
+`expected_returncode` or a wrapper that exits 0 only after confirming the
+intended observation.
 
 ## Context And Tool Output Resilience
 
-The harness has two separate context-protection layers:
+The harness has four related resilience layers:
 
 - Conversation compaction runs before model calls and also accounts for the next prompt plus the configured response budget.
-- Tool evidence is bounded before it can enter the live transcript. Command stdout/stderr are drained with a bounded tail buffer, workspace file snapshots keep capped excerpts, and git diffs are capped.
+- Tool evidence is bounded before it can enter the live transcript. Command stdout/stderr are drained while bounded head and tail evidence is retained, workspace snapshots cap each file plus aggregate files/characters, and git diffs are capped.
 - Bounded reviewer evidence remains available in local run summaries, but the feedback pasted back into the next implementation turn uses a compact evidence summary instead of the raw file/output/diff payload.
+- Commands with no hard deadline are reviewed periodically by the feedback model using the original request, active workflow history, prior reviews, and bounded live output. Elapsed time alone is not a stop condition; the reviewer can continue, terminate, or choose a later check interval.
 
 This matters because a single noisy command, giant generated file, or huge git diff can otherwise overflow the next local-model request even when ordinary chat-history compaction is enabled.
 
 ## Git Checkpointing
 
-When `git_policy.enabled=true`, the generated workspace is initialized as a git repository. After requirements and plan validation, the harness creates a baseline commit. Accepted steps are committed only after feedback returns a resolved status. The final whole-project review also creates an acceptance commit.
+When `git_policy.enabled=true`, the generated workspace is initialized as a git repository. After requirements and plan validation, the harness creates a baseline commit. Accepted steps are committed only after feedback returns a resolved status. The final whole-project review also creates an acceptance commit. Harness-owned plan, requirements, research, and state files are placed in the repository-local exclude file and omitted from project commits, including when a configured control filename was already tracked. Harness git commands disable repository hooks so generated workspace hooks cannot execute during these checkpoints.
 
 If you want the final project left as uncommitted changes for manual inspection, set:
 
@@ -709,18 +811,31 @@ With that mode, the harness still uses commits internally during review, then re
 
 ## Web Research And Offline Mode
 
-Web research is optional. The project can run fully locally/offline if you disable it:
+Web research is optional. Disable the built-in research phase with `--offline`
+or the equivalent config:
 
 ```json
 "mcp_tools": {
   "web_scraping": false
 },
 "web_research": {
-  "enabled": false
+  "enabled": false,
+  "allow_private_network": false
 }
 ```
 
-When enabled, web research only runs if the prompt explicitly asks to search/research/browse, look up current/latest information, or includes source URLs. The harness then fetches pages, writes the configured research file, appends the research result to the transcript, injects compact research notes into later prompts, and asks the generated project to cite/apply source URLs when sources were actually fetched.
+When enabled, a small model-owned decision phase determines whether external
+evidence is material and returns focused queries or source URLs through JSON.
+The harness does not classify prompt keywords or construct topic queries. It
+validates and fetches the selected inputs, bounds accepted queries and pages by
+the configured search/page limits, writes the configured research file, appends
+bounded results to the transcript, and injects compact source notes into later
+phases.
+
+Model-selected research URLs are restricted to public network addresses by
+default, including redirects. Set `web_research.allow_private_network=true`
+only when a trusted task intentionally needs a loopback or private source. This
+setting affects the bounded research fetcher, not terminal-command networking.
 
 Fetched non-text responses, such as PDFs or binary downloads, are recorded as unsupported text sources instead of being decoded into the model prompt. That keeps web research generic and avoids flooding the context window with binary noise.
 
@@ -736,12 +851,13 @@ Each run creates or updates the configured workspace, usually under `workspaces/
 - `.agent_state/conversation.full.md` with the append-only transcript in readable Markdown
 - `.agent_state/conversation.jsonl` with the active model context, which may be compacted during long runs
 - `.agent_state/conversation.md` with the active model context in readable Markdown
-- `.agent_state/summary.json` with step results, review statuses, and feedback evidence
+- `.agent_state/summary.json` with effective model reasoning budgets, step results, review statuses, and feedback evidence
 
-When llama.cpp exposes thinking as `reasoning_content`, the client preserves it
-in those transcripts by default. Recent thinking stays in active chat context;
-older raw thinking is summarized during compaction so long runs keep useful
-decisions without filling the context window with every internal token.
+When llama.cpp exposes thinking as `reasoning_content`, the current phase can
+receive it before parsing the final structured response. Visible `<think>`
+scratch text is removed before the response enters durable chat memory; the
+final structured content remains. This keeps later phases focused on decisions
+and evidence instead of imitating old scratch work.
 
 Generated workspaces, logs, reports, transcripts, and test evidence are ignored by git. They are useful locally, but they should not be published by accident.
 
@@ -759,45 +875,57 @@ Generated workspaces, logs, reports, transcripts, and test evidence are ignored 
 | `implementation_model.retry_attempts` | Model HTTP retry budget for temporary server/network failures. Retry progress is printed to stderr. | `20` |
 | `implementation_model.retry_sleep_seconds` | Delay between model HTTP retries. Use `0` only for tests. | `30` |
 | `implementation_model.request_heartbeat_seconds` | Prints terminal-only elapsed-time and model REST health lines while a model response is in flight. Set `0` to disable it. | `30` |
-| `implementation_model.preserve_reasoning` | Preserves server-provided thinking/reasoning in the chat transcript as a `<think>...</think>` block before final content. Disable only if the extra context makes a model less stable. | `true` |
-| `feedback_model` | Optional separate reviewer model. `null` reuses the implementation model. | `null` or another model block |
+| `implementation_model.preserve_reasoning` | Accepts server-provided thinking/reasoning in the raw current response before parsing. Visible scratch reasoning is omitted from durable chat memory; final content is retained. | `true` |
+| `implementation_model.reasoning_budget_tokens` | Optional reasoning allowance sent to compatible endpoints and reserved when sizing structured responses. | `4096` |
+| `implementation_model.critical_reasoning_budget_tokens` | Reasoning allowance for unresolved retries and high-consequence reviews. `null` derives a bounded value four times the normal budget; set an explicit value to override it, or set it equal to the normal budget to disable the uplift. | `null` (effective default `16384`) |
+| `implementation_model.send_reasoning_budget` | Sends the nonstandard `reasoning_budget` request field. Disable it for endpoints that do not support that field. | `true` or `false` |
+| `feedback_model` | Optional separate reviewer model. `null` reuses the implementation model; a partial object inherits omitted implementation-model settings. | `null` or another model block |
 | `mcp_tools.terminal` | Allows command execution for implementation and reviewer validation. | `true` |
-| `mcp_tools.web_scraping` | Allows web research/scraping when a task asks for it. | `true` or `false` |
-| `mcp_tools.web_interaction` | Adds browser-validation guidance and reviewer expectations. The tested container path is Python Playwright with preinstalled Chromium. | `true` or `false` |
+| `mcp_tools.web_scraping` | Makes bounded web fetching available to the model-owned research decision phase. | `true` or `false` |
+| `mcp_tools.web_interaction` | Enables terminal-driven browser interaction when `mcp_tools.terminal` is also enabled. | `true` or `false` |
 | `runtime.docker_isolation` | Runs generated project work in a container. Normal use should keep this true. | `true` |
 | `runtime.docker_image` | Agent container image tag. | `agentic-feedback-coding:local` |
 | `runtime.docker_user` | User used inside the agent container. `host` maps to the host UID/GID; `root` is useful only for deliberate container-local package installs. | `host`, `root` |
-| `runtime.workspace` | Host-visible output folder for generated project files. | `workspaces/my-task` |
+| `runtime.workspace` | Host-visible output folder for generated project files. Paths are canonicalized across config, environment, and CLI overrides; the filesystem root and aliases/symlinks resolving to it are rejected. | `workspaces/my-task` |
 | `runtime.plan_file` | Harness-owned plan filename inside the workspace. Use a custom name when editing an existing repo that already has `PLAN.md`. | `PLAN.md`, `AGENT_PLAN.md` |
 | `runtime.requirements_file` | Harness-owned requirements filename inside the workspace. | `REQUIREMENTS.md`, `AGENT_REQUIREMENTS.md` |
 | `runtime.research_file` | Harness-owned research filename inside the workspace. | `RESEARCH.md`, `AGENT_RESEARCH.md` |
-| `runtime.command_timeout_seconds` | Default timeout for one terminal command. Commands can override it with `{"cmd": [...], "timeout_seconds": N}`. | `60` to `300` |
-| `runtime.max_command_timeout_seconds` | Maximum accepted per-command override. Prevents accidental unbounded terminal commands. | `3600` to `21600` |
+| `runtime.command_timeout_seconds` | Default hard deadline for one terminal command. `0` leaves termination to periodic progress review; commands can request a positive override. | `0` |
+| `runtime.max_command_timeout_seconds` | Cap for positive per-command overrides. `0` disables the cap. | `21600` |
+| `runtime.command_progress_review_interval_seconds` | Initial interval between model reviews of a still-running command. It also bounds each advisory progress-review model request to one attempt; it does not impose a deadline on the command. `0` disables progress review. | `300` |
+| `runtime.command_progress_review_min_interval_seconds` | Lower bound for a model-requested next progress check, preventing a tight review loop. | `30` |
+| `runtime.command_progress_review_max_interval_seconds` | Upper bound for a model-requested next progress check. `0` leaves it uncapped. | `3600` |
 | `runtime.print_transcript` | Prints the live agent conversation. | `true` for debugging |
 | `runtime.color_transcript` | Uses ANSI colors for live transcript roles when stdout is a terminal. Redirected logs stay plain text. | `true` |
 | `runtime.live_turn_max_chars` | Optional per-turn cap for live terminal printing only. Saved full transcripts remain append-only and untruncated. | `0` for unlimited, or `30000` |
 | `runtime.final_summary` | Final stdout summary mode after the live transcript. Full evidence is always written to `.agent_state/summary.json`. | `compact`, `full`, `none` |
-| `runtime.feedback_response_max_tokens` | Separate reviewer output cap. Keep this lower than implementation `max_tokens` because feedback should be structured review JSON rather than generated project content. Set `0` to use the model's full ceiling. | `4096` |
+| `runtime.feedback_response_max_tokens` | Reviewer answer allowance. The request ceiling also reserves configured reasoning room. Set `0` to use the model's full ceiling. | `2048` default; checked benchmark configs use `4096` |
 | `context_compaction.enabled` | Enables transcript compaction near context limits. | `true` |
-| `context_compaction.threshold_ratio` | Trigger compaction at this fraction of context. | `0.8` |
+| `context_compaction.threshold_ratio` | Fractional context trigger. The separate `max_uncompacted_tokens` ceiling may trigger first. | `0.25` built in; checked configs use `0.55` to `0.8` |
 | `context_compaction.keep_recent_turns` | Recent turns kept verbatim during compaction. | `6` to `12` |
-| `context_compaction.tool_output_max_chars` | Max stdout/stderr tail kept from each terminal command. The process is drained continuously so verbose tools cannot flood memory/context. | `4000` |
-| `context_compaction.workspace_file_max_bytes` | Max bytes read per workspace file for reviewer evidence. Larger files are represented by first/last excerpts plus size metadata. | `20000` |
+| `context_compaction.max_uncompacted_tokens` | Optional ceiling for active transcript history. Incoming prompt and response budgets are checked separately against the model context window. | `24000` |
+| `context_compaction.recent_turns_max_tokens` | Maximum verbatim recent-turn budget; the effective budget shrinks when the next request needs more room. | `12000` |
+| `context_compaction.model_summary_min_new_tokens` | Minimum newly evicted history before invoking a model compaction again. Smaller routine updates are merged into prior durable memory without another model call. | `2048` |
+| `context_compaction.tool_output_max_chars` | Retained head/tail budget for each command stream: stdout and stderr are each bounded independently. The process is drained continuously so verbose tools cannot flood memory/context. | `4000` |
+| `context_compaction.workspace_file_max_bytes` | Max bytes read per workspace file for reviewer evidence. Larger files are represented by first/last excerpts plus size metadata. | `12000` to `20000` |
+| `context_compaction.workspace_snapshot_max_files` | Maximum file entries retained in one raw workspace snapshot; skipped dependency/cache directories are pruned before traversal. | `1000` |
+| `context_compaction.workspace_snapshot_max_chars` | Aggregate represented-content cap for one raw workspace snapshot. | `2000000` |
 | `context_compaction.git_diff_max_chars` | Max git diff text retained for reviewer evidence. | `20000` |
-| `context_compaction.transcript_review_max_chars` | Max compact review payload pasted back into the live implementation chat. | `24000` |
+| `context_compaction.transcript_review_max_chars` | Max compact review payload pasted back into the live implementation chat. Values below `512` are rejected because they cannot retain a useful decision and truncation marker. | `12000` default; checked configs use `24000` |
+| `phases.analysis.max_iterations` | Problem-analysis and analysis-review retry budget before planning. | `2` |
 | `phases.requirements_refinement.max_iterations` | Requirement refinement retry budget. | `2` |
 | `phases.plan_validation.max_iterations` | Plan validation retry budget. | `2` |
 | `phases.implementation.max_iterations` | Per-step implementation retry budget. | `7` |
 | `review_policy.hard_pushback_iterations` | Strict review attempts before compromise. | `3` |
 | `review_policy.compromise_iterations` | Bounded compromise attempts after strict review. | `4` |
-| `review_policy.final_review_iterations` | Whole-project review attempts. | `1` or `2` |
-| `quality_policy.assume_code_quality_when_unspecified` | Adds default structure/tests/docs requirement unless prompt overrides it. | `true` |
-| `quality_policy.require_research_and_structure_step` | Requires a first research/architecture step. | `true` |
-| `quality_policy.deterministic_semantic_scope_checks` | Legacy phrase-table semantic checks for old diagnostics. Normal runs keep this off and use JSON protocol, model review, command safety, and evidence instead of exact wording matches. | `false` |
-| `web_research.enabled` | Enables harness-owned web research before requirements refinement. | `true` or `false` |
+| `review_policy.final_review_iterations` | Correction attempts after the initial whole-project review; total review passes are at most this value plus one. | `1` or `2` |
+| `quality_policy.assume_code_quality_when_unspecified` | Asks models for proportional engineering quality while preserving the request and keeping small tasks small; it does not add fixed deliverables. | `true` |
+| `web_research.enabled` | Enables the model-owned research decision and bounded fetching before analysis. | `true` or `false` |
+| `web_research.allow_private_network` | Allows the bounded research fetcher to contact loopback, private, link-local, or otherwise non-public addresses. Keep disabled unless the task uses a trusted local source. | `false` |
+| `loop.max_approach_reattempts` | Maximum complete analysis-to-approach cycles when final review requests a materially different approach. | `5` |
 | `git_policy.enabled` | Initializes a workspace-local git repository and records git evidence. | `true` |
 | `git_policy.commit_completed_steps` | Commits each accepted plan step after feedback resolves it. | `true` |
-| `git_policy.require_step_diff` | Rejects step acceptance when there are no meaningful implementation changes to review. | `true` |
+| `git_policy.require_step_diff` | Requires a meaningful change unless fresh reviewer-owned validation or an explicit non-command validation method supplies independent evidence that no edit is needed. | `true` |
 | `project_design.title` | Short task title. | Any string |
 | `project_design.prompt` | Actual task prompt. | Detailed project brief |
 

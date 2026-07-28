@@ -6,47 +6,21 @@ from typing import Any
 from .bounds import run_bounded_process
 
 
-DEFAULT_GITIGNORE = """# Harness/runtime state
+LOCAL_GIT_EXCLUDES = """# agenticFeedbackCoding local runtime state
 .agent_state/
 __pycache__/
 *.pyc
 .pytest_cache/
-out/
-
-# Tool/dependency installs that may be created inside the disposable container
 $HOME/
 .dotnet/
 node_modules/
 .venv/
 venv/
-bin/
-obj/
-dist/
-build/
 """
 
 
 HARNESS_ONLY_PATHS = {
     ".agent_state",
-    ".gitignore",
-    "PLAN.md",
-    "REQUIREMENTS.md",
-    "RESEARCH.md",
-    "AGENT_PLAN.md",
-    "AGENT_REQUIREMENTS.md",
-}
-
-
-GENERATED_TOOL_PATHS = {
-    "$HOME",
-    ".dotnet",
-    "node_modules",
-    ".venv",
-    "venv",
-    "bin",
-    "obj",
-    "dist",
-    "build",
 }
 
 
@@ -57,7 +31,14 @@ def run_git(
     output_limit_chars: int = 20000,
 ) -> dict[str, Any]:
     """Run a bounded git command and return JSON-friendly evidence."""
-    command = ["git", *args]
+    command = [
+        "git",
+        "-c",
+        f"safe.directory={workspace.resolve()}",
+        "-c",
+        "core.hooksPath=/dev/null",
+        *args,
+    ]
     return run_bounded_process(
         command,
         cwd=workspace,
@@ -66,22 +47,47 @@ def run_git(
     )
 
 
-def ensure_git_repo(workspace: Path, *, user_name: str, user_email: str) -> dict[str, Any]:
+def _normalized_ignored_paths(paths: set[str] | None) -> list[str]:
+    normalized: list[str] = []
+    for value in sorted(paths or set()):
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            continue
+        text = path.as_posix()
+        while text.startswith("./"):
+            text = text[2:]
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def ensure_git_repo(
+    workspace: Path,
+    *,
+    user_name: str,
+    user_email: str,
+    ignored_paths: set[str] | None = None,
+) -> dict[str, Any]:
     """Initialize a workspace-local repository and configure deterministic identity."""
     workspace.mkdir(parents=True, exist_ok=True)
-    gitignore = workspace / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text(DEFAULT_GITIGNORE, encoding="utf-8")
+    init = run_git(workspace, ["init"])
+    if init.get("returncode") == 0:
+        exclude_path = workspace / ".git" / "info" / "exclude"
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+        desired = [
+            *[line for line in LOCAL_GIT_EXCLUDES.splitlines() if line],
+            *_normalized_ignored_paths(ignored_paths),
+        ]
+        missing = [line for line in desired if line not in existing.splitlines()]
+        if missing:
+            prefix = "" if not existing or existing.endswith("\n") else "\n"
+            exclude_path.write_text(existing + prefix + "\n".join(missing) + "\n", encoding="utf-8")
     results = [
-        run_git(workspace, ["init"]),
-        # `safe.directory` is only honored from protected config scopes. The
-        # root-in-container path can have a host-owned mount point with a
-        # root-owned `.git` directory, so local repo config is not enough.
-        run_git(workspace, ["config", "--global", "--add", "safe.directory", str(workspace)]),
+        init,
         run_git(workspace, ["config", "user.name", user_name]),
         run_git(workspace, ["config", "user.email", user_email]),
         run_git(workspace, ["config", "core.autocrlf", "false"]),
-        run_git(workspace, ["config", "safe.directory", str(workspace)]),
     ]
     return {"enabled": True, "results": results}
 
@@ -106,30 +112,58 @@ def _status_path(line: str) -> str:
     return path.strip()
 
 
-def meaningful_changed_paths(status_short: str) -> list[str]:
+def meaningful_changed_paths(status_short: str, *, ignored_paths: set[str] | None = None) -> list[str]:
     """Return changed paths that are not just harness bookkeeping files."""
+    ignored = HARNESS_ONLY_PATHS | {str(Path(path)) for path in (ignored_paths or set())}
     changed: list[str] = []
     for line in status_short.splitlines():
+        if line.lstrip().startswith("[stdout truncated"):
+            continue
         path = _status_path(line)
         if not path:
             continue
         root = path.split("/", 1)[0]
-        if path in HARNESS_ONLY_PATHS or root in HARNESS_ONLY_PATHS or root in GENERATED_TOOL_PATHS:
+        if path in ignored or root in ignored:
             continue
         changed.append(path)
     return changed
 
 
-def git_evidence(workspace: Path, *, max_diff_chars: int = 20000) -> dict[str, Any]:
+def git_evidence(
+    workspace: Path,
+    *,
+    max_diff_chars: int = 20000,
+    ignored_paths: set[str] | None = None,
+) -> dict[str, Any]:
     """Capture the current diff/status for the feedback agent."""
-    status = git_status_short(workspace)
+    status_result = run_git(
+        workspace,
+        ["status", "--short"],
+        output_limit_chars=max_diff_chars,
+    )
+    # Preserve leading porcelain status columns, e.g. " M file.py".
+    status = str(status_result.get("stdout") or "").rstrip()
+    ignored = HARNESS_ONLY_PATHS | {str(Path(path)) for path in (ignored_paths or set())}
+    diff_pathspec = [".", *[f":(exclude){path}" for path in sorted(ignored)]]
+    head = git_head(workspace)
+    diff_prefix = ["diff", "HEAD"] if head else ["diff"]
     return {
         "enabled": True,
-        "head": git_head(workspace),
+        "head": head,
         "status_short": status,
-        "meaningful_changed_paths": meaningful_changed_paths(status),
-        "diff_stat": run_git(workspace, ["diff", "--stat"], output_limit_chars=max_diff_chars)["stdout"].strip(),
-        "diff": run_git(workspace, ["diff", "--", "."], output_limit_chars=max_diff_chars)["stdout"],
+        "status_truncated": bool(status_result.get("stdout_truncated")),
+        "status_bytes": status_result.get("stdout_bytes"),
+        "meaningful_changed_paths": meaningful_changed_paths(status, ignored_paths=ignored),
+        "diff_stat": run_git(
+            workspace,
+            [*diff_prefix, "--stat", "--", *diff_pathspec],
+            output_limit_chars=max_diff_chars,
+        )["stdout"].strip(),
+        "diff": run_git(
+            workspace,
+            [*diff_prefix, "--", *diff_pathspec],
+            output_limit_chars=max_diff_chars,
+        )["stdout"],
     }
 
 
@@ -139,19 +173,54 @@ def commit_all(
     *,
     allow_empty: bool = False,
     timeout_seconds: int = 30,
+    ignored_paths: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Commit all workspace changes if present, optionally creating an empty anchor commit."""
+    """Commit project changes while leaving harness control files untracked."""
     before = git_head(workspace)
     status_before = git_status_short(workspace)
+    excluded = _normalized_ignored_paths(HARNESS_ONLY_PATHS | (ignored_paths or set()))
     add = run_git(workspace, ["add", "-A"], timeout_seconds)
-    if not allow_empty and not git_status_short(workspace):
+    if add.get("returncode") != 0:
         return {
             "committed": False,
-            "reason": "no changes",
+            "reason": "git add failed",
+            "head_before": before,
+            "head_after": git_head(workspace),
+            "status_before": status_before,
+            "status_after": git_status_short(workspace),
+            "add": add,
+        }
+    unstage_control_paths: dict[str, Any] | None = None
+    if before and excluded:
+        unstage_control_paths = run_git(
+            workspace,
+            ["reset", "-q", before, "--", *excluded],
+            timeout_seconds,
+        )
+        if unstage_control_paths.get("returncode") != 0:
+            return {
+                "committed": False,
+                "reason": "could not exclude tracked harness control files from the commit",
+                "head_before": before,
+                "head_after": git_head(workspace),
+                "status_before": status_before,
+                "status_after": git_status_short(workspace),
+                "add": add,
+                "unstage_control_paths": unstage_control_paths,
+                "ignored_paths": excluded,
+            }
+    staged = run_git(workspace, ["diff", "--cached", "--quiet", "--exit-code"], timeout_seconds)
+    if not allow_empty and staged.get("returncode") == 0:
+        return {
+            "committed": False,
+            "reason": "no project changes",
             "head_before": before,
             "head_after": before,
             "status_before": status_before,
             "add": add,
+            "staged_check": staged,
+            "unstage_control_paths": unstage_control_paths,
+            "ignored_paths": excluded,
         }
     args = ["commit", "-m", message]
     if allow_empty:
@@ -165,6 +234,9 @@ def commit_all(
         "status_before": status_before,
         "status_after": git_status_short(workspace),
         "add": add,
+        "staged_check": staged,
+        "unstage_control_paths": unstage_control_paths,
+        "ignored_paths": excluded,
         "commit": commit,
     }
 

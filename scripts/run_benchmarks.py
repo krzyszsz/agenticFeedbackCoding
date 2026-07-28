@@ -11,14 +11,19 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, TextIO
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from feedback_agent.config import DEFAULT_CONFIG, ModelConfig, _deep_merge
-from feedback_agent.bounds import run_bounded_process
+from feedback_agent.config import (
+    DEFAULT_CONFIG,
+    ModelConfig,
+    _deep_merge,
+    derive_critical_reasoning_budget,
+)
+from feedback_agent.bounds import clamp_text, run_bounded_process
 from feedback_agent.llm import OpenAICompatClient
 from feedback_agent.model_profiles import ModelProfile, resolve_profile
 from feedback_agent.workspace import (
@@ -93,9 +98,26 @@ def benchmark_config(
     feedback_response_max_tokens: int,
     print_transcript: bool,
     live_turn_max_chars: int,
+    critical_reasoning_budget_tokens: int | None = None,
 ) -> dict[str, Any]:
     impl = resolve_profile(implementation_profile)
     feedback = resolve_profile(feedback_profile) if feedback_profile else None
+    implementation_reasoning_budget = (
+        reasoning_budget_tokens
+        if reasoning_budget_tokens is not None
+        else impl.reasoning_budget_tokens
+    )
+    implementation_critical_reasoning_budget = derive_critical_reasoning_budget(
+        implementation_reasoning_budget,
+        max_tokens,
+        critical_reasoning_budget_tokens,
+    )
+    _validate_direct_model_budget(
+        implementation_profile,
+        max_tokens=max_tokens,
+        reasoning_budget_tokens=implementation_reasoning_budget,
+        critical_reasoning_budget_tokens=implementation_critical_reasoning_budget,
+    )
     model_cfg = {
         "name": impl.name,
         "base_url": f"http://127.0.0.1:{impl.port}/v1",
@@ -103,13 +125,16 @@ def benchmark_config(
         "model": "local-gguf",
         "context_window": impl.context_window,
         "max_tokens": max_tokens,
-        "temperature": 0.2,
+        "temperature": impl.temperature,
+        "top_p": impl.top_p,
+        "top_k": impl.top_k,
         "request_timeout_seconds": 21600,
         "retry_attempts": 20,
         "retry_sleep_seconds": 30,
         "request_heartbeat_seconds": 30,
         "preserve_reasoning": True,
-        "reasoning_budget_tokens": reasoning_budget_tokens or impl.reasoning_budget_tokens,
+        "reasoning_budget_tokens": implementation_reasoning_budget,
+        "critical_reasoning_budget_tokens": critical_reasoning_budget_tokens,
         "send_reasoning_budget": True,
     }
     data: dict[str, Any] = {
@@ -118,10 +143,12 @@ def benchmark_config(
         "runtime": {
             "docker_isolation": docker_isolation,
             "workspace": str(workspace.relative_to(repo_root) if workspace.is_relative_to(repo_root) else workspace),
-            "command_timeout_seconds": 120,
+            "command_timeout_seconds": 0,
             "max_command_timeout_seconds": 21600,
             "command_progress_review_interval_seconds": 300,
             "command_progress_review_min_interval_seconds": 30,
+            "command_progress_review_max_interval_seconds": 3600,
+            "command_progress_review_request_timeout_seconds": 120,
             "print_transcript": print_transcript,
             "live_turn_max_chars": live_turn_max_chars,
             "final_summary": "compact",
@@ -149,12 +176,32 @@ def benchmark_config(
     if task.get("web_research", False):
         data["web_research"] = {"enabled": True}
     if feedback:
+        feedback_reasoning_budget = (
+            reasoning_budget_tokens
+            if reasoning_budget_tokens is not None
+            else feedback.reasoning_budget_tokens
+        )
+        feedback_critical_reasoning_budget = derive_critical_reasoning_budget(
+            feedback_reasoning_budget,
+            max_tokens,
+            critical_reasoning_budget_tokens,
+        )
+        _validate_direct_model_budget(
+            feedback.name,
+            max_tokens=max_tokens,
+            reasoning_budget_tokens=feedback_reasoning_budget,
+            critical_reasoning_budget_tokens=feedback_critical_reasoning_budget,
+        )
         data["feedback_model"] = {
             **model_cfg,
             "name": feedback.name,
             "base_url": f"http://127.0.0.1:{feedback.port}/v1",
             "context_window": feedback.context_window,
-            "reasoning_budget_tokens": reasoning_budget_tokens or feedback.reasoning_budget_tokens,
+            "temperature": feedback.temperature,
+            "top_p": feedback.top_p,
+            "top_k": feedback.top_k,
+            "reasoning_budget_tokens": feedback_reasoning_budget,
+            "critical_reasoning_budget_tokens": critical_reasoning_budget_tokens,
         }
     if task.get("config_overrides"):
         data = _deep_merge(data, task["config_overrides"])
@@ -162,8 +209,15 @@ def benchmark_config(
 
 
 def write_config(path: Path, data: dict[str, Any]) -> None:
+    write_text_atomic(path, json.dumps(data, indent=2) + "\n")
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    """Replace benchmark metadata atomically so interruption cannot corrupt resume state."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
 
 
 def seed_workspace(workspace: Path, task: dict[str, Any]) -> None:
@@ -178,8 +232,25 @@ def direct_model_config(
     *,
     reasoning_budget_tokens: int | None,
     max_tokens: int,
+    critical_reasoning_budget_tokens: int | None = None,
 ) -> ModelConfig:
     profile = resolve_profile(profile_name)
+    effective_reasoning_budget = (
+        reasoning_budget_tokens
+        if reasoning_budget_tokens is not None
+        else profile.reasoning_budget_tokens
+    )
+    effective_critical_reasoning_budget = derive_critical_reasoning_budget(
+        effective_reasoning_budget,
+        max_tokens,
+        critical_reasoning_budget_tokens,
+    )
+    _validate_direct_model_budget(
+        profile_name,
+        max_tokens=max_tokens,
+        reasoning_budget_tokens=effective_reasoning_budget,
+        critical_reasoning_budget_tokens=effective_critical_reasoning_budget,
+    )
     return ModelConfig(
         name=profile.name,
         base_url=f"http://127.0.0.1:{profile.port}/v1",
@@ -187,19 +258,64 @@ def direct_model_config(
         model="local-gguf",
         context_window=profile.context_window,
         max_tokens=max_tokens,
-        temperature=0.2,
+        temperature=profile.temperature,
+        top_p=profile.top_p,
+        top_k=profile.top_k,
         request_timeout_seconds=21600,
         retry_attempts=20,
         retry_sleep_seconds=30,
         request_heartbeat_seconds=30,
         preserve_reasoning=True,
-        reasoning_budget_tokens=reasoning_budget_tokens or profile.reasoning_budget_tokens,
+        reasoning_budget_tokens=effective_reasoning_budget,
+        critical_reasoning_budget_tokens=effective_critical_reasoning_budget,
         send_reasoning_budget=True,
+        request_json_object=True,
     )
 
 
+def _validate_direct_model_budget(
+    profile_name: str,
+    *,
+    max_tokens: int,
+    reasoning_budget_tokens: int | None,
+    critical_reasoning_budget_tokens: int | None = None,
+) -> None:
+    if max_tokens <= 0:
+        raise ValueError(f"{profile_name}: max_tokens must be greater than zero")
+    if reasoning_budget_tokens is not None:
+        if reasoning_budget_tokens < 0:
+            raise ValueError(f"{profile_name}: reasoning budget must be zero or greater")
+        if reasoning_budget_tokens >= max_tokens:
+            raise ValueError(
+                f"{profile_name}: reasoning budget ({reasoning_budget_tokens}) must be smaller than "
+                f"max_tokens ({max_tokens}) so the model can return an answer"
+            )
+    if critical_reasoning_budget_tokens is None:
+        return
+    if critical_reasoning_budget_tokens < 0:
+        raise ValueError(f"{profile_name}: critical reasoning budget must be zero or greater")
+    if critical_reasoning_budget_tokens >= max_tokens:
+        raise ValueError(
+            f"{profile_name}: critical reasoning budget ({critical_reasoning_budget_tokens}) must be smaller than "
+            f"max_tokens ({max_tokens}) so the model can return an answer"
+        )
+    if (
+        reasoning_budget_tokens is not None
+        and critical_reasoning_budget_tokens < reasoning_budget_tokens
+    ):
+        raise ValueError(
+            f"{profile_name}: critical reasoning budget ({critical_reasoning_budget_tokens}) must be at least "
+            f"the normal reasoning budget ({reasoning_budget_tokens})"
+        )
+
+
 def single_shot_prompt(task: dict[str, Any], workspace: Path) -> str:
-    workspace_files = collect_workspace_files(workspace, max_file_bytes=12000)
+    workspace_files = collect_workspace_files(
+        workspace,
+        max_file_bytes=12000,
+        max_files=100,
+        max_total_chars=80_000,
+    )
     return (
         "You are running without the agentic feedback harness. This is a single-shot benchmark.\n"
         "Complete the requested project in one response. You cannot ask follow-up questions, run tools, "
@@ -211,8 +327,8 @@ def single_shot_prompt(task: dict[str, Any], workspace: Path) -> str:
         '  "self_check": ["short check you performed mentally"]\n'
         "}\n"
         "Use only relative paths inside the workspace. Do not include markdown fences or extra prose. "
-        "Do not create harness state files such as PLAN.md, REQUIREMENTS.md, RESEARCH.md, or .agent_state files "
-        "unless the user explicitly asks for those as project deliverables.\n\n"
+        "Do not write .agent_state or .git control state. Do not create harness document names such as PLAN.md, "
+        "REQUIREMENTS.md, or RESEARCH.md unless the user explicitly asks for those as project deliverables.\n\n"
         f"Task title: {task['title']}\n"
         f"Task prompt:\n{task['prompt']}\n\n"
         "Existing workspace files, if any, are provided as bounded context. Preserve user files unless the task requires changing them:\n"
@@ -279,12 +395,8 @@ def run_single_shot(
 
 
 def _normalize_manual_grade(value: Any) -> str | None:
-    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if text in {"pass", "manual_pass"}:
-        return "manual_pass"
-    if text in {"fail", "manual_fail"}:
-        return "manual_fail"
-    return None
+    grade = str(value or "").strip()
+    return grade if grade in {"manual_pass", "manual_fail"} else None
 
 
 def manual_grade_task(
@@ -303,7 +415,17 @@ def manual_grade_task(
     README tables can distinguish automatic checks from model-judged checks.
     """
     criteria = task.get("manual_pass_criteria") or []
-    workspace_files = collect_workspace_files(workspace, max_file_bytes=10000)
+    workspace_files = collect_workspace_files(
+        workspace,
+        max_file_bytes=10000,
+        max_files=100,
+        max_total_chars=100_000,
+    )
+    validation_evidence = clamp_text(
+        json.dumps(validation_results, indent=2),
+        40_000,
+        marker="validation evidence truncated",
+    )
     prompt = (
         "You are grading one completed benchmark task. Decide whether the produced workspace satisfies the task.\n"
         "Return strict JSON only with this shape:\n"
@@ -313,7 +435,7 @@ def manual_grade_task(
         f"Task title: {task['title']}\n"
         f"Task prompt:\n{task['prompt']}\n\n"
         f"Manual pass criteria:\n{json.dumps(criteria, indent=2)}\n\n"
-        f"Validation results, if any:\n{json.dumps(validation_results, indent=2)}\n\n"
+        f"Validation results, if any:\n{validation_evidence}\n\n"
         "Workspace files:\n"
         f"{json.dumps(workspace_files, indent=2)}"
     )
@@ -332,7 +454,8 @@ def manual_grade_task(
         {"role": "user", "content": prompt},
     ]
     raw = ""
-    for _attempt in range(2):
+    last_error = ""
+    for attempt in range(2):
         try:
             raw = client.chat(messages, max_tokens=max_tokens, temperature=0.0)
             payload = extract_json_object(raw)
@@ -356,17 +479,27 @@ def manual_grade_task(
                 },
             ])
         except Exception as exc:
-            return {
-                "grade": "manual_fail",
-                "evidence": [],
-                "concerns": [f"manual grader failed: {exc!r}"],
-                "raw_tail": raw[-4000:],
-                "grader_profile": grader_profile,
-            }
+            last_error = repr(exc)
+            if attempt == 0:
+                if raw:
+                    messages.append({"role": "assistant", "content": raw[-4000:]})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your response did not match the requested grading JSON protocol. "
+                        f"The parser reported: {exc}. Re-answer the same grading question as exactly one JSON "
+                        "object with grade equal to manual_pass or manual_fail, plus evidence and concerns lists."
+                    ),
+                })
+                continue
+            break
     return {
         "grade": "manual_fail",
         "evidence": [],
-        "concerns": ["manual grader did not return manual_pass or manual_fail"],
+        "concerns": [
+            "manual grader did not return a valid manual_pass or manual_fail decision"
+            + (f": {last_error}" if last_error else "")
+        ],
         "raw_tail": raw[-4000:],
         "grader_profile": grader_profile,
     }
@@ -389,6 +522,8 @@ def _stream_process_output(
     timeout_seconds: int | None,
     start: float,
     stream_output: bool,
+    log_stream: TextIO | None = None,
+    capture_limit_chars: int = 200_000,
 ) -> str:
     """Stream real benchmark subprocess output instead of hiding long runs.
 
@@ -397,14 +532,45 @@ def _stream_process_output(
     transcript output, so a long model call or tool command is visible while the
     result log still captures the same text.
     """
+    capture_limit_chars = max(1000, capture_limit_chars)
+    head_limit = capture_limit_chars // 2
+    tail_limit = capture_limit_chars - head_limit
+    captured_head = ""
+    captured_tail = ""
+    captured_total = 0
+
+    def record(text: str) -> None:
+        nonlocal captured_head, captured_tail, captured_total
+        if not text:
+            return
+        if log_stream is not None:
+            log_stream.write(text)
+            log_stream.flush()
+        captured_total += len(text)
+        if len(captured_head) < head_limit:
+            take = min(head_limit - len(captured_head), len(text))
+            captured_head += text[:take]
+        captured_tail = (captured_tail + text)[-tail_limit:]
+
+    def captured_output() -> str:
+        if captured_total <= capture_limit_chars:
+            overlap = max(0, len(captured_head) + len(captured_tail) - captured_total)
+            return captured_head + captured_tail[overlap:]
+        return (
+            captured_head
+            + f"\n[BENCHMARK_LOG_CAPTURE_TRUNCATED: kept first {len(captured_head)} and last "
+            f"{len(captured_tail)} of {captured_total} chars; full output is in the task log]\n"
+            + captured_tail
+        )
+
     pipe = getattr(proc, "stdout", None)
     if pipe is None or not hasattr(pipe, "fileno"):
         stdout, _stderr = proc.communicate(timeout=timeout_seconds)
-        return stdout or ""
+        record(stdout or "")
+        return captured_output()
 
     selector = selectors.DefaultSelector()
     selector.register(pipe, selectors.EVENT_READ)
-    chunks: list[str] = []
     deadline = start + timeout_seconds if timeout_seconds else None
     last_heartbeat = start
     pipe_closed = False
@@ -414,7 +580,7 @@ def _stream_process_output(
             raise subprocess.TimeoutExpired(
                 cmd=getattr(proc, "args", "scripts/run_agent.sh"),
                 timeout=timeout_seconds,
-                output="".join(chunks),
+                output=captured_output(),
             )
         events = selector.select(timeout=1.0)
         if not events and proc.poll() is not None:
@@ -423,7 +589,7 @@ def _stream_process_output(
             data = os.read(key.fileobj.fileno(), 8192)
             if data:
                 text = data.decode("utf-8", errors="replace")
-                chunks.append(text)
+                record(text)
                 if stream_output:
                     print(text, end="", flush=True)
             else:
@@ -435,7 +601,7 @@ def _stream_process_output(
             print(f"[benchmark-runner] harness subprocess still running: {elapsed}s elapsed.", flush=True)
             last_heartbeat = now
     proc.wait(timeout=5)
-    return "".join(chunks)
+    return captured_output()
 
 
 def run_harness(
@@ -446,6 +612,7 @@ def run_harness(
     feedback_profile: str | None,
     timeout_seconds: int | None,
     stream_output: bool,
+    log_path: Path | None = None,
 ) -> tuple[int, float, str]:
     safe_stem = re.sub(r"[^a-zA-Z0-9_.-]+", "-", config_path.stem).strip("-")[:40] or "task"
     container_name = f"agentic-bench-{safe_stem}-{os.getpid()}-{int(time.time() * 1000) % 1000000}"
@@ -461,6 +628,10 @@ def run_harness(
         env.setdefault("AGENT_FEEDBACK_BASE_URL", _docker_model_url(feedback))
     start = time.monotonic()
     proc: subprocess.Popen[str] | None = None
+    log_stream: TextIO | None = None
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_stream = log_path.open("w", encoding="utf-8")
     try:
         proc = subprocess.Popen(
             ["bash", "scripts/run_agent.sh", "--config", str(config_path)],
@@ -476,6 +647,7 @@ def run_harness(
             timeout_seconds=timeout_seconds,
             start=start,
             stream_output=stream_output,
+            log_stream=log_stream,
         )
         return proc.returncode, time.monotonic() - start, stdout or ""
     except subprocess.TimeoutExpired as exc:
@@ -499,7 +671,10 @@ def run_harness(
                 more, _stderr = proc.communicate(timeout=5)
                 if isinstance(more, bytes):
                     more = more.decode("utf-8", errors="replace")
-                output += more or ""
+                if more and log_stream is not None:
+                    log_stream.write(more)
+                    log_stream.flush()
+                output = clamp_text(output + (more or ""), 200_000, marker="benchmark capture truncated")
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -510,9 +685,29 @@ def run_harness(
                 more, _stderr = proc.communicate(timeout=5)
                 if isinstance(more, bytes):
                     more = more.decode("utf-8", errors="replace")
-                output += more or ""
-        output += f"\n[BENCHMARK_TIMEOUT] harness task exceeded {timeout_seconds} seconds and was stopped.\n"
+                if more and log_stream is not None:
+                    log_stream.write(more)
+                    log_stream.flush()
+                output = clamp_text(output + (more or ""), 200_000, marker="benchmark capture truncated")
+        timeout_marker = f"\n[BENCHMARK_TIMEOUT] harness task exceeded {timeout_seconds} seconds and was stopped.\n"
+        output += timeout_marker
+        if log_stream is not None:
+            log_stream.write(timeout_marker)
+            log_stream.flush()
         return 124, time.monotonic() - start, output
+    finally:
+        if log_stream is not None:
+            log_stream.close()
+
+
+def build_benchmark_agent_image(repo_root: Path, image: str) -> None:
+    """Build the current harness source once before using it in a benchmark."""
+    print(f"[benchmark-runner] building current agent image: {image}", flush=True)
+    subprocess.run(
+        ["docker", "build", "-t", image, "."],
+        cwd=repo_root,
+        check=True,
+    )
 
 
 def run_docker_post_validation_commands(
@@ -541,11 +736,16 @@ def run_docker_post_validation_commands(
         )
         if not parts:
             continue
+        docker_user = command.get("docker_user", "host") if isinstance(command, dict) else "host"
+        if docker_user not in {"host", "root"}:
+            raise ValueError("post-validation docker_user must be 'host' or 'root'")
+        container_user = "0:0" if docker_user == "root" else uid_gid
         container_name = f"agentic-bench-post-{os.getpid()}-{index}-{int(time.time() * 1000) % 1000000}"
         docker_command = [
             "docker",
             "run",
             "--rm",
+            "--init",
             "--name",
             container_name,
             "--label",
@@ -553,7 +753,7 @@ def run_docker_post_validation_commands(
             "--security-opt",
             "label=disable",
             "--user",
-            uid_gid,
+            container_user,
             "-e",
             "AGENT_IN_CONTAINER=1",
             "-e",
@@ -606,7 +806,7 @@ def grade_task(
     docker_image: str = "agentic-feedback-coding:local",
     manual_grader_profile: str | None = None,
     manual_grader_reasoning_budget_tokens: int | None = None,
-    manual_grader_max_tokens: int = 4096,
+    manual_grader_max_tokens: int = 8192,
 ) -> dict[str, Any]:
     grading = task.get("grading", "manual")
     commands = task.get("post_validation_commands") or []
@@ -679,6 +879,7 @@ def result_matches_run(
     implementation_profile: str,
     feedback_profile: str | None,
     reasoning_budget_tokens: int | None,
+    critical_reasoning_budget_tokens: int | None = None,
     max_tokens: int | None = None,
     feedback_response_max_tokens: int | None = None,
 ) -> bool:
@@ -688,6 +889,7 @@ def result_matches_run(
         and result.get("implementation_profile") == implementation_profile
         and result.get("feedback_profile") == feedback_profile
         and result.get("reasoning_budget_tokens") == reasoning_budget_tokens
+        and result.get("critical_reasoning_budget_tokens") == critical_reasoning_budget_tokens
     )
     if max_tokens is not None:
         matches = matches and result.get("max_tokens") == max_tokens
@@ -706,7 +908,9 @@ def load_resume_results(
     reasoning_budget_tokens: int | None,
     max_tokens: int,
     feedback_response_max_tokens: int,
+    critical_reasoning_budget_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
+    """Load the shared result set; per-run matching happens at task selection."""
     results_path = output_dir / "results.json"
     if not results_path.exists():
         return []
@@ -730,6 +934,16 @@ def display_grade(grade: str) -> str:
     }.get(grade, grade)
 
 
+def display_reasoning_budget(value: Any) -> str:
+    return "profile" if value is None else str(value)
+
+
+def display_critical_reasoning_budget(value: Any, *, run_mode: str) -> str:
+    if run_mode == "single-shot":
+        return "n/a"
+    return "auto" if value is None else str(value)
+
+
 def final_benchmark_grade(task: dict[str, Any], returncode: int, measured_grade: str) -> str:
     if returncode == 0:
         return measured_grade
@@ -740,19 +954,23 @@ def final_benchmark_grade(task: dict[str, Any], returncode: int, measured_grade:
 
 def markdown_table(results: list[dict[str, Any]]) -> str:
     lines = [
-        "| Task | Category | Mode | Model | Verifier | Budget | Grade | Final | Seconds | Approach Attempts |",
-        "|---|---|---|---|---|---:|---|---:|---:|---:|",
+        "| Task | Category | Mode | Model | Verifier | Base Budget | Critical Budget | Grade | Final | Seconds | Approach Attempts |",
+        "|---|---|---|---|---|---:|---:|---|---:|---:|---:|",
     ]
     for result in results:
         summary = result.get("summary") or {}
         lines.append(
-            "| {task} | {category} | {mode} | {model} | {verifier} | {budget} | {grade} | {final} | {seconds:.1f} | {attempts} |".format(
+            "| {task} | {category} | {mode} | {model} | {verifier} | {budget} | {critical_budget} | {grade} | {final} | {seconds:.1f} | {attempts} |".format(
                 task=result["task_id"],
                 category=result["category"],
                 mode=result.get("run_mode", "harness"),
                 model=result["implementation_profile"],
                 verifier=result.get("feedback_profile") or "same",
-                budget=result.get("reasoning_budget_tokens") or "profile",
+                budget=display_reasoning_budget(result.get("reasoning_budget_tokens")),
+                critical_budget=display_critical_reasoning_budget(
+                    result.get("critical_reasoning_budget_tokens"),
+                    run_mode=result.get("run_mode", "harness"),
+                ),
                 grade=display_grade(result["grade"]),
                 final=summary.get("final_status", "n/a"),
                 seconds=float(result.get("elapsed_seconds") or 0),
@@ -763,21 +981,35 @@ def markdown_table(results: list[dict[str, Any]]) -> str:
 
 
 def summary_table(results: list[dict[str, Any]]) -> str:
-    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, str, Any, Any, Any, Any], list[dict[str, Any]]] = {}
     for result in results:
-        key = (result.get("run_mode", "harness"), result["implementation_profile"], result.get("feedback_profile") or "same")
+        key = (
+            result.get("run_mode", "harness"),
+            result["implementation_profile"],
+            result.get("feedback_profile") or "same",
+            result.get("reasoning_budget_tokens"),
+            result.get("critical_reasoning_budget_tokens"),
+            result.get("max_tokens"),
+            result.get("feedback_response_max_tokens"),
+        )
         groups.setdefault(key, []).append(result)
     lines = [
-        "| Mode | Model | Verifier | Budget | Tasks | Pass | Fail | Manual | Avg Seconds |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|",
+        "| Mode | Model | Verifier | Base Budget | Critical Budget | Max Out | Review Out | Tasks | Pass | Fail | Manual | Avg Seconds |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for (mode, model, verifier), items in sorted(groups.items()):
+    for (mode, model, verifier, budget, critical_budget, max_tokens, feedback_tokens), items in sorted(
+        groups.items(),
+        key=lambda item: tuple(str(value) for value in item[0]),
+    ):
         passed = sum(1 for item in items if item["grade"] in {"pass", "manual_pass"})
         failed = sum(1 for item in items if item["grade"] in {"fail", "manual_fail"})
         manual = sum(1 for item in items if str(item["grade"]).startswith("manual_"))
         avg = sum(float(item.get("elapsed_seconds") or 0) for item in items) / max(1, len(items))
-        budgets = sorted({str(item.get("reasoning_budget_tokens") or "profile") for item in items})
-        lines.append(f"| {mode} | {model} | {verifier} | {', '.join(budgets)} | {len(items)} | {passed} | {failed} | {manual} | {avg:.1f} |")
+        lines.append(
+            f"| {mode} | {model} | {verifier} | {display_reasoning_budget(budget)} | "
+            f"{display_critical_reasoning_budget(critical_budget, run_mode=mode)} | "
+            f"{max_tokens} | {feedback_tokens} | {len(items)} | {passed} | {failed} | {manual} | {avg:.1f} |"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -789,12 +1021,21 @@ def main() -> int:
     parser.add_argument("--mode", choices=["harness", "single-shot"], default="harness")
     parser.add_argument("--implementation-profile", default="gemma4-26b-a4b-qat-mtp")
     parser.add_argument("--feedback-profile")
-    parser.add_argument("--reasoning-budget-tokens", type=int)
-    parser.add_argument("--max-tokens", type=int, default=8192)
-    parser.add_argument("--feedback-response-max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--reasoning-budget-tokens",
+        type=int,
+        help="Normal model reasoning allowance; omit to use the selected profile.",
+    )
+    parser.add_argument(
+        "--critical-reasoning-budget-tokens",
+        type=int,
+        help="Escalated harness reasoning allowance; omit for bounded 4x automatic sizing.",
+    )
+    parser.add_argument("--max-tokens", type=int, default=32768)
+    parser.add_argument("--feedback-response-max-tokens", type=int, default=2048)
     parser.add_argument("--manual-grader-profile", default="")
     parser.add_argument("--manual-grader-reasoning-budget-tokens", type=int)
-    parser.add_argument("--manual-grader-max-tokens", type=int, default=4096)
+    parser.add_argument("--manual-grader-max-tokens", type=int, default=8192)
     parser.add_argument("--task-id", action="append", default=[])
     parser.add_argument("--limit", type=int)
     parser.add_argument("--output-dir", default="")
@@ -804,8 +1045,12 @@ def main() -> int:
     parser.add_argument("--print-transcript", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--live-turn-max-chars", type=int, default=20000)
     parser.add_argument("--stream-output", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--rebuild-agent-image", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    run_critical_reasoning_budget = (
+        args.critical_reasoning_budget_tokens if args.mode == "harness" else None
+    )
 
     repo_root = REPO_ROOT
     suite_ids = load_suite_ids(repo_root / args.suites, args.suite)
@@ -821,6 +1066,7 @@ def main() -> int:
         implementation_profile=args.implementation_profile,
         feedback_profile=args.feedback_profile,
         reasoning_budget_tokens=args.reasoning_budget_tokens,
+        critical_reasoning_budget_tokens=run_critical_reasoning_budget,
         max_tokens=args.max_tokens,
         feedback_response_max_tokens=args.feedback_response_max_tokens,
     ) if args.resume else []
@@ -829,6 +1075,7 @@ def main() -> int:
             print(f"{task['id']}\t{task['category']}\t{task.get('grading', 'manual')}\t{task['title']}")
         return 0
 
+    prepared_images: set[str] = set()
     for task in tasks:
         existing_result = next(
             (
@@ -841,6 +1088,7 @@ def main() -> int:
                     implementation_profile=args.implementation_profile,
                     feedback_profile=args.feedback_profile,
                     reasoning_budget_tokens=args.reasoning_budget_tokens,
+                    critical_reasoning_budget_tokens=run_critical_reasoning_budget,
                     max_tokens=args.max_tokens,
                     feedback_response_max_tokens=args.feedback_response_max_tokens,
                 )
@@ -865,6 +1113,7 @@ def main() -> int:
                     implementation_profile=args.implementation_profile,
                     feedback_profile=args.feedback_profile,
                     reasoning_budget_tokens=args.reasoning_budget_tokens,
+                    critical_reasoning_budget_tokens=run_critical_reasoning_budget,
                     max_tokens=args.max_tokens,
                     feedback_response_max_tokens=args.feedback_response_max_tokens,
                 )
@@ -873,6 +1122,7 @@ def main() -> int:
         seed_workspace(workspace, task)
         config_path = output_dir / f"{task['id']}.json"
         single_shot_metadata: dict[str, Any] = {}
+        docker_image = "agentic-feedback-coding:local"
         if args.mode == "harness":
             cfg = benchmark_config(
                 task,
@@ -882,12 +1132,19 @@ def main() -> int:
                 feedback_profile=args.feedback_profile,
                 docker_isolation=args.docker_isolation,
                 reasoning_budget_tokens=args.reasoning_budget_tokens,
+                critical_reasoning_budget_tokens=run_critical_reasoning_budget,
                 max_tokens=args.max_tokens,
                 feedback_response_max_tokens=args.feedback_response_max_tokens,
                 print_transcript=args.print_transcript,
                 live_turn_max_chars=args.live_turn_max_chars,
             )
             write_config(config_path, cfg)
+            docker_image = str(cfg["runtime"]["docker_image"])
+        if args.docker_isolation and args.rebuild_agent_image and docker_image not in prepared_images:
+            build_benchmark_agent_image(repo_root, docker_image)
+            prepared_images.add(docker_image)
+        if args.mode == "harness":
+            task_log_path = output_dir / f"{task['id']}.log"
             returncode, elapsed, output = run_harness(
                 repo_root,
                 config_path,
@@ -895,6 +1152,7 @@ def main() -> int:
                 feedback_profile=args.feedback_profile,
                 timeout_seconds=args.task_timeout_seconds or None,
                 stream_output=args.stream_output,
+                log_path=task_log_path,
             )
         else:
             returncode, elapsed, output, single_shot_metadata = run_single_shot(
@@ -904,14 +1162,18 @@ def main() -> int:
                 reasoning_budget_tokens=args.reasoning_budget_tokens,
                 max_tokens=args.max_tokens,
             )
-        (output_dir / f"{task['id']}.log").write_text(output, encoding="utf-8")
+            (output_dir / f"{task['id']}.log").write_text(output, encoding="utf-8")
         grade = grade_task(
             workspace,
             task,
             repo_root=repo_root,
             docker_post_validation=args.docker_isolation,
-            docker_image=cfg["runtime"]["docker_image"] if args.mode == "harness" else "agentic-feedback-coding:local",
-            manual_grader_profile=args.manual_grader_profile or args.implementation_profile,
+            docker_image=docker_image,
+            manual_grader_profile=(
+                (args.manual_grader_profile or args.implementation_profile)
+                if returncode == 0
+                else None
+            ),
             manual_grader_reasoning_budget_tokens=args.manual_grader_reasoning_budget_tokens,
             manual_grader_max_tokens=args.manual_grader_max_tokens,
         )
@@ -924,6 +1186,7 @@ def main() -> int:
             "implementation_profile": args.implementation_profile,
             "feedback_profile": args.feedback_profile,
             "reasoning_budget_tokens": args.reasoning_budget_tokens,
+            "critical_reasoning_budget_tokens": run_critical_reasoning_budget,
             "max_tokens": args.max_tokens,
             "feedback_response_max_tokens": args.feedback_response_max_tokens,
             "workspace": str(workspace),
@@ -943,13 +1206,16 @@ def main() -> int:
             }
             result["single_shot"] = single_shot_metadata
         results.append(result)
-        (output_dir / "results.json").write_text(json.dumps({"results": results}, indent=2), encoding="utf-8")
-        (output_dir / "results.md").write_text(
+        write_text_atomic(
+            output_dir / "results.json",
+            json.dumps({"results": results}, indent=2) + "\n",
+        )
+        write_text_atomic(
+            output_dir / "results.md",
             "# Benchmark Results\n\n## Summary\n\n"
             + summary_table(results)
             + "\n## Details\n\n"
             + markdown_table(results),
-            encoding="utf-8",
         )
         print(f"{task['id']}: {result['grade']} in {elapsed:.1f}s")
 

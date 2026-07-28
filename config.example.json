@@ -6,14 +6,17 @@
     "model": "local-gguf",
     "context_window": 131072,
     "max_tokens": 32768,
-    "temperature": 0.25,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 64,
     "request_timeout_seconds": 21600,
     "retry_attempts": 20,
     "retry_sleep_seconds": 30,
     "request_heartbeat_seconds": 30,
     "preserve_reasoning": true,
     "reasoning_budget_tokens": 4096,
-    "send_reasoning_budget": false
+    "critical_reasoning_budget_tokens": null,
+    "send_reasoning_budget": true
   },
   "feedback_model": null,
   "mcp_tools": {
@@ -29,7 +32,11 @@
     "plan_file": "PLAN.md",
     "requirements_file": "REQUIREMENTS.md",
     "research_file": "RESEARCH.md",
-    "command_timeout_seconds": 120,
+    "command_timeout_seconds": 0,
+    "command_progress_review_interval_seconds": 300,
+    "command_progress_review_min_interval_seconds": 30,
+    "command_progress_review_max_interval_seconds": 3600,
+    "command_progress_review_request_timeout_seconds": 120,
     "print_transcript": true,
     "live_turn_max_chars": 0,
     "color_transcript": true,
@@ -44,16 +51,20 @@
     "summary_max_tokens": 1024,
     "tool_output_max_chars": 4000,
     "workspace_file_max_bytes": 20000,
+    "workspace_snapshot_max_files": 1000,
+    "workspace_snapshot_max_chars": 2000000,
     "git_diff_max_chars": 20000,
-    "transcript_review_max_chars": 24000
+    "transcript_review_max_chars": 24000,
+    "max_uncompacted_tokens": 24000,
+    "recent_turns_max_tokens": 12000,
+    "model_summary_min_new_tokens": 2048
   },
   "loop": {
-    "max_iterations": 3,
     "max_approach_reattempts": 5
   },
   "project_design": {
     "title": "Starter task tracker project",
-    "prompt": "Build a Python command-line task tracker. It should support adding tasks, marking tasks done, listing tasks, and saving state as JSON. Keep the implementation well structured, testable, and documented. Maintain PLAN.md during the work."
+    "prompt": "Build a Python command-line task tracker. It should support adding tasks, marking tasks done, listing tasks, and saving state as JSON. Keep the implementation well structured, testable, and documented."
   },
   "phases": {
     "analysis": {
@@ -71,13 +82,11 @@
   },
   "resolution_policy": {
     "max_same_error_repeats": 2,
-    "allow_requirement_dilution": true,
     "allow_skip_with_note": true,
     "stop_on_cannot_resolve": false
   },
   "quality_policy": {
-    "assume_code_quality_when_unspecified": true,
-    "require_research_and_structure_step": true
+    "assume_code_quality_when_unspecified": true
   },
   "review_policy": {
     "hard_pushback_iterations": 3,
@@ -86,6 +95,7 @@
   },
   "web_research": {
     "enabled": true,
+    "allow_private_network": false,
     "max_search_results": 3,
     "max_pages": 3,
     "timeout_seconds": 15,

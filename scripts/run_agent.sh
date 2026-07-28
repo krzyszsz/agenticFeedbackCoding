@@ -4,22 +4,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$PROJECT_DIR"
+MODEL_PROFILE_OVERRIDE="${MODEL_PROFILE-}"
+FEEDBACK_MODEL_PROFILE_OVERRIDE="${FEEDBACK_MODEL_PROFILE-}"
 source "$REPO_ROOT/scripts/env.sh"
-
-if [ -n "${MODEL_PROFILE:-}" ]; then
-  eval "$(PYTHONPATH="$REPO_ROOT" python3 -m feedback_agent.model_profiles env "$MODEL_PROFILE")"
-fi
 
 CONFIG_PATH="$PROJECT_DIR/config.example.json"
 WORKSPACE_OVERRIDE=""
-CONTAINER_CLI_ARGS=()
+CONTAINER_CLI_ARGS=(--config /app/config.json)
 HOST_CLI_ARGS=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --config)
       CONFIG_PATH="$2"
-      CONTAINER_CLI_ARGS+=(--config /app/config.json)
       shift 2
       ;;
     --workspace)
@@ -67,8 +64,61 @@ while [ "$#" -gt 0 ]; do
 done
 
 CONFIG_ABS="$(realpath "$CONFIG_PATH")"
-if [ "${#CONTAINER_CLI_ARGS[@]}" -eq 0 ]; then
-  CONTAINER_CLI_ARGS=(--config /app/config.json)
+
+if [ -n "$MODEL_PROFILE_OVERRIDE" ]; then
+  MODEL_PROFILE="$MODEL_PROFILE_OVERRIDE"
+else
+  configured_model_name="$(PYTHONPATH="$PROJECT_DIR" python3 - "$CONFIG_ABS" "$REPO_ROOT" <<'PY'
+import sys
+from pathlib import Path
+from feedback_agent.config import load_config
+
+print(load_config(sys.argv[1], repo_root=Path(sys.argv[2])).implementation_model.name)
+PY
+)"
+  if PYTHONPATH="$REPO_ROOT" python3 -m feedback_agent.model_profiles json "$configured_model_name" >/dev/null 2>&1; then
+    MODEL_PROFILE="$configured_model_name"
+  else
+    MODEL_PROFILE=""
+  fi
+fi
+
+if [ -n "$MODEL_PROFILE" ]; then
+  eval "$(PYTHONPATH="$REPO_ROOT" python3 -m feedback_agent.model_profiles env "$MODEL_PROFILE")"
+fi
+
+if [ -n "$FEEDBACK_MODEL_PROFILE_OVERRIDE" ]; then
+  FEEDBACK_MODEL_PROFILE="$FEEDBACK_MODEL_PROFILE_OVERRIDE"
+else
+  configured_feedback_model_name="$(PYTHONPATH="$PROJECT_DIR" python3 - "$CONFIG_ABS" "$REPO_ROOT" <<'PY'
+import sys
+from pathlib import Path
+from feedback_agent.config import load_config
+
+feedback = load_config(sys.argv[1], repo_root=Path(sys.argv[2])).feedback_model
+print(feedback.name if feedback else "")
+PY
+)"
+  if [ -n "$configured_feedback_model_name" ] && \
+    PYTHONPATH="$REPO_ROOT" python3 -m feedback_agent.model_profiles json "$configured_feedback_model_name" >/dev/null 2>&1; then
+    FEEDBACK_MODEL_PROFILE="$configured_feedback_model_name"
+  else
+    FEEDBACK_MODEL_PROFILE=""
+  fi
+fi
+
+feedback_profile_container=""
+feedback_profile_port=""
+if [ -n "$FEEDBACK_MODEL_PROFILE" ]; then
+  feedback_profile_endpoint="$(PYTHONPATH="$REPO_ROOT" python3 - "$FEEDBACK_MODEL_PROFILE" <<'PY'
+import sys
+from feedback_agent.model_profiles import resolve_profile
+
+profile = resolve_profile(sys.argv[1])
+print(f"{profile.container_name}\t{profile.port}")
+PY
+)"
+  IFS=$'\t' read -r feedback_profile_container feedback_profile_port <<< "$feedback_profile_endpoint"
 fi
 
 config_field() {
@@ -77,15 +127,15 @@ config_field() {
 import sys
 from pathlib import Path
 from dataclasses import replace
-from feedback_agent.config import load_config
+from feedback_agent.config import load_config, validate_config
 
 cfg = load_config(sys.argv[1], repo_root=Path(sys.argv[2]))
 workspace_override = sys.argv[3]
 if workspace_override:
     workspace = Path(workspace_override)
-    if not workspace.is_absolute():
-        workspace = (Path(sys.argv[2]) / workspace).resolve()
+    workspace = (workspace if workspace.is_absolute() else Path(sys.argv[2]) / workspace).resolve(strict=False)
     cfg = replace(cfg, runtime=replace(cfg.runtime, workspace=workspace))
+validate_config(cfg)
 field = sys.argv[4]
 if field == "docker_enabled":
     print("1" if cfg.runtime.docker_isolation else "0")
@@ -145,8 +195,13 @@ if [ "$docker_enabled" = "1" ] && [ "${AGENT_IN_CONTAINER:-0}" != "1" ]; then
       "${docker_cmd[@]}" network inspect "$agent_network" >/dev/null 2>&1 || \
         "${docker_cmd[@]}" network create "$agent_network" >/dev/null
       network_args=(--network "$agent_network")
-      if [ -z "${AGENT_IMPLEMENTATION_BASE_URL:-}" ]; then
+      if [ -n "$MODEL_PROFILE" ] && [ -z "${AGENT_IMPLEMENTATION_BASE_URL:-}" ]; then
         AGENT_IMPLEMENTATION_BASE_URL="http://$model_server_container:$model_server_port/v1"
+      fi
+      if [ -n "$FEEDBACK_MODEL_PROFILE" ] && [ -z "${AGENT_FEEDBACK_BASE_URL:-}" ]; then
+        feedback_server_container="${FEEDBACK_MODEL_SERVER_CONTAINER:-$feedback_profile_container}"
+        feedback_server_port="${FEEDBACK_MODEL_SERVER_PORT:-$feedback_profile_port}"
+        AGENT_FEEDBACK_BASE_URL="http://$feedback_server_container:$feedback_server_port/v1"
       fi
       ;;
   esac
@@ -180,7 +235,7 @@ if [ "$docker_enabled" = "1" ] && [ "${AGENT_IN_CONTAINER:-0}" != "1" ]; then
   if [ -n "${AGENT_CONTAINER_LABEL:-}" ]; then
     container_identity_args+=(--label "$AGENT_CONTAINER_LABEL")
   fi
-  "${docker_cmd[@]}" run --rm "${container_identity_args[@]}" "${network_args[@]}" --security-opt label=disable \
+  "${docker_cmd[@]}" run --rm --init "${container_identity_args[@]}" "${network_args[@]}" --security-opt label=disable \
     "${user_args[@]}" \
     "${env_args[@]}" \
     -v "$workspace:/workspace/project" \

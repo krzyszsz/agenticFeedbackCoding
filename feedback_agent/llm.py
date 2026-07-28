@@ -12,6 +12,10 @@ from typing import TextIO
 from .config import ModelConfig
 
 
+MIN_MODEL_RESPONSE_BYTES = 1_000_000
+MAX_MODEL_RESPONSE_BYTES = 64 * 1024 * 1024
+
+
 class ModelRequestRetrier:
     """Retry transient model-server failures around one HTTP request.
 
@@ -50,6 +54,8 @@ class ModelRequestRetrier:
                 RuntimeError,
             ) as exc:
                 last_error = exc
+                if not self._is_retryable(exc):
+                    raise
                 remaining = self.attempts - attempt
                 if remaining <= 0:
                     break
@@ -57,6 +63,13 @@ class ModelRequestRetrier:
                 if self.sleep_seconds:
                     self.sleep(self.sleep_seconds)
         raise RuntimeError(f"model request failed after {self.attempts} attempts: {last_error}") from last_error
+
+    @staticmethod
+    def _is_retryable(exc: BaseException) -> bool:
+        """Return whether repeating the same request can plausibly succeed."""
+        if not isinstance(exc, urllib.error.HTTPError):
+            return True
+        return exc.code in {408, 409, 425, 429} or 500 <= exc.code < 600
 
     def _log_retry(self, attempt: int, remaining: int, exc: BaseException) -> None:
         print(
@@ -127,14 +140,133 @@ class OpenAICompatClient:
         self.cfg = cfg
 
     def chat(self, messages: list[dict[str, str]], *, max_tokens: int | None = None, temperature: float | None = None) -> str:
+        return self._chat(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            request_label=self.cfg.name,
+            reasoning_budget_tokens=self.cfg.reasoning_budget_tokens,
+            request_json_object=self.cfg.request_json_object,
+        )
+
+    def chat_labeled(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_label: str,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> str:
+        """Run a normal request with a phase label in terminal-only progress."""
+        return self._chat(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            request_label=f"{self.cfg.name}/{request_label}",
+            reasoning_budget_tokens=self.cfg.reasoning_budget_tokens,
+            request_json_object=self.cfg.request_json_object,
+        )
+
+    def chat_labeled_with_reasoning_budget(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_label: str,
+        reasoning_budget_tokens: int | None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> str:
+        """Run a labeled request with a phase-selected reasoning allowance."""
+        return self._chat(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            request_label=f"{self.cfg.name}/{request_label}",
+            reasoning_budget_tokens=reasoning_budget_tokens,
+            request_json_object=self.cfg.request_json_object,
+        )
+
+    def chat_for_compaction(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> str:
+        """Summarize context without spending the full task reasoning budget."""
+        reasoning_budget = self.cfg.reasoning_budget_tokens
+        if reasoning_budget is not None:
+            reasoning_budget = min(reasoning_budget, 512)
+        return self._chat(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            request_label=f"{self.cfg.name}/context-compaction",
+            reasoning_budget_tokens=reasoning_budget,
+            request_json_object=False,
+        )
+
+    def chat_for_progress_review(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        request_label: str,
+        request_timeout_seconds: int,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> str:
+        """Run one bounded review without delaying a completed tool call for hours.
+
+        A progress review is advisory monitoring around a still-running process,
+        not the task itself. If it cannot answer within the configured review
+        cadence, the process runner conservatively keeps the approved command
+        running and can ask again later.
+        """
+        reasoning_budget = self.cfg.reasoning_budget_tokens
+        if reasoning_budget is not None:
+            reasoning_budget = min(reasoning_budget, 512)
+        configured_timeout = self.cfg.request_timeout_seconds
+        review_timeout = max(1, request_timeout_seconds)
+        if configured_timeout > 0:
+            review_timeout = min(review_timeout, configured_timeout)
+        return self._chat(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            request_label=f"{self.cfg.name}/{request_label}",
+            reasoning_budget_tokens=reasoning_budget,
+            request_timeout_seconds=review_timeout,
+            retry_attempts=1,
+            request_json_object=self.cfg.request_json_object,
+        )
+
+    def _chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None,
+        temperature: float | None,
+        request_label: str,
+        reasoning_budget_tokens: int | None,
+        request_timeout_seconds: int | None = None,
+        retry_attempts: int | None = None,
+        request_json_object: bool,
+    ) -> str:
+        response_tokens = self.cfg.max_tokens if max_tokens is None else max_tokens
         payload = {
             "model": self.cfg.model,
             "messages": messages,
             "temperature": self.cfg.temperature if temperature is None else temperature,
-            "max_tokens": self.cfg.max_tokens if max_tokens is None else max_tokens,
+            "max_tokens": response_tokens,
         }
-        if self.cfg.send_reasoning_budget and self.cfg.reasoning_budget_tokens is not None:
-            payload["reasoning_budget"] = self.cfg.reasoning_budget_tokens
+        if self.cfg.top_p is not None:
+            payload["top_p"] = self.cfg.top_p
+        if self.cfg.top_k is not None:
+            payload["top_k"] = self.cfg.top_k
+        if self.cfg.send_reasoning_budget and reasoning_budget_tokens is not None:
+            payload["reasoning_budget"] = reasoning_budget_tokens
+        if request_json_object:
+            payload["response_format"] = {"type": "json_object"}
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             f"{self.cfg.base_url}/chat/completions",
@@ -145,24 +277,46 @@ class OpenAICompatClient:
             },
             method="POST",
         )
-        request_timeout = None if self.cfg.request_timeout_seconds <= 0 else self.cfg.request_timeout_seconds
+        effective_timeout = (
+            self.cfg.request_timeout_seconds
+            if request_timeout_seconds is None
+            else request_timeout_seconds
+        )
+        request_timeout = None if effective_timeout <= 0 else effective_timeout
+        response_byte_limit = min(
+            MAX_MODEL_RESPONSE_BYTES,
+            max(MIN_MODEL_RESPONSE_BYTES, response_tokens * 32),
+        )
 
         def send_once() -> str:
             with urllib.request.urlopen(req, timeout=request_timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+                raw_body = resp.read(response_byte_limit + 1)
+            if len(raw_body) > response_byte_limit:
+                raise ValueError(
+                    "model response exceeded the bounded HTTP response limit "
+                    f"of {response_byte_limit} bytes"
+                )
+            body = json.loads(raw_body.decode("utf-8"))
             if body.get("error"):
                 raise RuntimeError(f"model returned error: {body['error']}")
             msg = body["choices"][0]["message"]
             return format_assistant_message(msg, preserve_reasoning=self.cfg.preserve_reasoning)
 
         def send_with_heartbeat() -> str:
+            input_tokens = sum(max(1, len(str(message.get("content") or "")) // 4) for message in messages)
+            print(
+                f"[model-call] starting {request_label}: input~{input_tokens} tokens; "
+                f"max_output={response_tokens}; reasoning_budget={reasoning_budget_tokens}.",
+                file=sys.stderr,
+                flush=True,
+            )
             return ModelRequestHeartbeat(
                 interval_seconds=self.cfg.request_heartbeat_seconds,
                 health_check=self.health_status,
-            ).run(self.cfg.name, send_once)
+            ).run(request_label, send_once)
 
         return ModelRequestRetrier(
-            attempts=self.cfg.retry_attempts,
+            attempts=self.cfg.retry_attempts if retry_attempts is None else retry_attempts,
             sleep_seconds=self.cfg.retry_sleep_seconds,
         ).run(send_with_heartbeat)
 
@@ -200,9 +354,9 @@ def format_assistant_message(msg: dict, *, preserve_reasoning: bool) -> str:
     llama.cpp can expose reasoning as `message.reasoning_content` when started
     with `--reasoning-format deepseek`. The orchestration code still expects a
     single text transcript, so thinking is represented as a normal `<think>`
-    block before the final content. This keeps later local-model turns aware of
-    the reasoning while leaving JSON extraction able to recover the final JSON
-    object from the same text.
+    block before the final content. This lets the current phase parse the final
+    JSON object from the same text; the agent removes visible scratch reasoning
+    before storing the response in durable chat memory.
     """
     content = str(msg.get("content") or "")
     reasoning = _message_reasoning_content(msg)
@@ -210,7 +364,7 @@ def format_assistant_message(msg: dict, *, preserve_reasoning: bool) -> str:
         return content or reasoning
     if not reasoning:
         return content
-    if content and "<think" in content.lower():
+    if content.lstrip().lower().startswith("<think"):
         return content
     reasoning_block = f"<think>\n{reasoning.strip()}\n</think>"
     if content:

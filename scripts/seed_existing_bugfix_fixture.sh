@@ -3,9 +3,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-WORKSPACE="${1:-$PROJECT_DIR/workspaces/existing-bugfix-demo}"
+WORKSPACE="$(realpath -m "${1:-$PROJECT_DIR/workspaces/existing-bugfix-demo}")"
+case "$WORKSPACE" in
+  "$PROJECT_DIR"/workspaces/*) ;;
+  *)
+    echo "Refusing to replace a fixture outside $PROJECT_DIR/workspaces: $WORKSPACE" >&2
+    exit 2
+    ;;
+esac
 
-rm -rf "$WORKSPACE"
+rm -rf -- "$WORKSPACE"
 mkdir -p "$WORKSPACE/invoice_calc" "$WORKSPACE/tests"
 
 cat > "$WORKSPACE/invoice_calc/__init__.py" <<'PY'
