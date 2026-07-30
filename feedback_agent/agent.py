@@ -20,6 +20,7 @@ from .protocol import (
     COMMAND_RESPONSE_PHASES,
     FILE_RESPONSE_PHASES,
     HARNESS_EFFECTIVE_REVIEW_MARKER,
+    HARNESS_PROTOCOL_ERROR_STATUS,
     HARNESS_RESPONSE_OMISSION_MARKER,
     PHASE_DECISION_VALUES,
     PHASE_STATUS_VALUES,
@@ -41,6 +42,9 @@ from .workspace import (
     write_plan_doc,
     write_requirements_doc,
 )
+
+
+PROTOCOL_REPAIR_REASONING_BUDGET_CAP = 512
 
 
 def _strip_visible_reasoning_for_transcript(text: str) -> str:
@@ -368,6 +372,20 @@ plausible material failure supported by the request or current evidence. If
 direct evidence or one inspected common mechanism rules them out, accept;
 otherwise request the smallest decisive check or correction. Do not invent
 doubt, repeat a passing check without cause, or demand exhaustive proof.
+"""
+
+
+REVIEWER_VALIDATION_REQUEST_GUIDANCE = """
+Reviewer-requested validation:
+The optional `validation_commands` list is for the smallest observational check
+needed to decide this review independently. Leave it empty when current evidence
+is sufficient or terminal execution is unavailable. Do not use it for setup,
+implementation, destructive work, broad exploration, or repetition of an
+equivalent passing check. When requesting commands, return a non-accepting
+status and name the unresolved evidence gap in `required_changes`. The harness
+will verify and run at most one requested-validation round, then ask for a final
+decision from those results. Each command is an argv list, or an object with a
+list-valued `cmd` plus needed timeout or expected-returncode metadata.
 """
 
 
@@ -894,6 +912,7 @@ class FeedbackLoopAgent:
         *,
         max_tokens: int | None = None,
         critical_reasoning: bool = False,
+        reasoning_budget_cap_tokens: int | None = None,
     ) -> str:
         """Append a request, call the implementation model, then persist its reply.
 
@@ -917,9 +936,10 @@ class FeedbackLoopAgent:
             self.conversation.messages(),
             request_label=self._reasoning_request_label(prompt, critical_reasoning),
             max_tokens=max_tokens,
-            reasoning_budget_tokens=self._reasoning_budget_for(
+            reasoning_budget_tokens=self._capped_reasoning_budget(
                 self.config.implementation_model,
                 critical_reasoning=critical_reasoning,
+                cap_tokens=reasoning_budget_cap_tokens,
             ),
         )
         self.conversation.append(
@@ -936,6 +956,7 @@ class FeedbackLoopAgent:
         temperature: float = 0.1,
         progress_review_timeout_seconds: int | None = None,
         critical_reasoning: bool = False,
+        reasoning_budget_cap_tokens: int | None = None,
     ) -> str:
         """Run the feedback model against the same durable transcript.
 
@@ -952,6 +973,7 @@ class FeedbackLoopAgent:
             response_tokens = self._feedback_response_tokens(
                 feedback_cfg,
                 critical_reasoning=critical_reasoning,
+                reasoning_budget_cap_tokens=reasoning_budget_cap_tokens,
             )
         content = "FEEDBACK_AGENT_REQUEST:\n" + prompt
         maybe_compact(
@@ -987,9 +1009,10 @@ class FeedbackLoopAgent:
                 request_label=self._reasoning_request_label(prompt, critical_reasoning),
                 max_tokens=response_tokens,
                 temperature=temperature,
-                reasoning_budget_tokens=self._reasoning_budget_for(
+                reasoning_budget_tokens=self._capped_reasoning_budget(
                     feedback_cfg,
                     critical_reasoning=critical_reasoning,
+                    cap_tokens=reasoning_budget_cap_tokens,
                 ),
             )
         self.conversation.append(
@@ -1036,6 +1059,19 @@ class FeedbackLoopAgent:
         if critical_reasoning and model_cfg.critical_reasoning_budget_tokens is not None:
             return model_cfg.critical_reasoning_budget_tokens
         return model_cfg.reasoning_budget_tokens
+
+    @classmethod
+    def _capped_reasoning_budget(
+        cls,
+        model_cfg: Any,
+        *,
+        critical_reasoning: bool,
+        cap_tokens: int | None,
+    ) -> int | None:
+        budget = cls._reasoning_budget_for(model_cfg, critical_reasoning=critical_reasoning)
+        if budget is None or cap_tokens is None:
+            return budget
+        return min(max(0, int(budget)), max(0, int(cap_tokens)))
 
     @staticmethod
     def _critical_reasoning_for_iteration(iteration: int, *, inherited_rework: bool = False) -> bool:
@@ -1104,11 +1140,18 @@ class FeedbackLoopAgent:
                 string_limit=800,
                 list_limit=3,
             )
+        if review.get("review_protocol_error") is True:
+            payload["review_protocol_error"] = True
+        if review.get("status_provenance"):
+            payload["status_provenance"] = review.get("status_provenance")
         self.conversation.append("user", HARNESS_EFFECTIVE_REVIEW_MARKER + "\n" + json.dumps(payload, indent=2))
 
     def _record_validated_feedback_decision(self, phase: str, payload: dict[str, Any]) -> None:
         """Record schema validation without treating raw model text as trusted state."""
-        if phase not in WORKFLOW_REVIEW_PHASES:
+        if (
+            phase not in WORKFLOW_REVIEW_PHASES
+            or self._status(payload) == HARNESS_PROTOCOL_ERROR_STATUS
+        ):
             return
         receipt = {
             "phase": phase,
@@ -1132,7 +1175,13 @@ class FeedbackLoopAgent:
             VALIDATED_FEEDBACK_DECISION_MARKER + "\n" + json.dumps(receipt, indent=2),
         )
 
-    def _feedback_response_tokens(self, feedback_cfg, *, critical_reasoning: bool = False) -> int:
+    def _feedback_response_tokens(
+        self,
+        feedback_cfg,
+        *,
+        critical_reasoning: bool = False,
+        reasoning_budget_cap_tokens: int | None = None,
+    ) -> int:
         """Keep reviewer JSON bounded even when implementation output can be large.
 
         The implementation model may need a high ceiling for generated files,
@@ -1148,6 +1197,7 @@ class FeedbackLoopAgent:
             configured,
             minimum=512,
             critical_reasoning=critical_reasoning,
+            reasoning_budget_cap_tokens=reasoning_budget_cap_tokens,
         )
 
     def _structured_control_tokens(self, ceiling: int = 4096, *, critical_reasoning: bool = False) -> int:
@@ -1182,6 +1232,7 @@ class FeedbackLoopAgent:
         *,
         minimum: int,
         critical_reasoning: bool = False,
+        reasoning_budget_cap_tokens: int | None = None,
     ) -> int:
         """Reserve output room for a reasoning budget plus final structured JSON.
 
@@ -1192,9 +1243,10 @@ class FeedbackLoopAgent:
         emit parseable JSON. The cap still honors the model's configured maximum.
         """
         answer_budget = max(minimum, int(answer_tokens))
-        selected_budget = self._reasoning_budget_for(
+        selected_budget = self._capped_reasoning_budget(
             model_cfg,
             critical_reasoning=critical_reasoning,
+            cap_tokens=reasoning_budget_cap_tokens,
         )
         reasoning_budget = max(0, int(selected_budget or 0))
         target = answer_budget + reasoning_budget if reasoning_budget else answer_budget
@@ -1313,6 +1365,7 @@ class FeedbackLoopAgent:
                     temperature=0.0,
                     critical_reasoning=False,
                     progress_review_timeout_seconds=progress_review_timeout_seconds,
+                    reasoning_budget_cap_tokens=PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
                 )
             else:
                 repaired = self._implementation_chat(
@@ -1321,9 +1374,11 @@ class FeedbackLoopAgent:
                         self.config.implementation_model,
                         6144,
                         minimum=2048,
-                        critical_reasoning=critical_reasoning,
+                        critical_reasoning=False,
+                        reasoning_budget_cap_tokens=PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
                     ),
-                    critical_reasoning=critical_reasoning,
+                    critical_reasoning=False,
+                    reasoning_budget_cap_tokens=PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
                 )
             try:
                 return accept(self._extract_phase_json(repaired, phase=phase))
@@ -1360,9 +1415,11 @@ class FeedbackLoopAgent:
                         self.config.implementation_model,
                         4096,
                         minimum=2048,
-                        critical_reasoning=critical_reasoning,
+                        critical_reasoning=False,
+                        reasoning_budget_cap_tokens=PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
                     ),
-                    critical_reasoning=critical_reasoning,
+                    critical_reasoning=False,
+                    reasoning_budget_cap_tokens=PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
                 )
                 return self._extract_phase_json(repaired_minimal, phase=phase)
 
@@ -1376,16 +1433,27 @@ class FeedbackLoopAgent:
 
     @staticmethod
     def _normalize_phase_protocol(payload: dict[str, Any], *, phase: str) -> dict[str, Any]:
-        """Fill redundant protocol fields without interpreting task semantics.
+        """Normalize model protocol fields without interpreting task semantics.
 
         Local models sometimes provide every per-command safety decision but
         omit the aggregate tool-verification status. That status is a mechanical
         projection of the command decisions, so deriving it avoids an expensive
         repair turn without inventing evidence or changing the review outcome.
+        Harness-only state and provenance fields are removed here so model text
+        cannot manufacture trusted control state.
         """
         if not isinstance(payload, dict):
             return payload
-        normalized = dict(payload)
+        normalized = {
+            key: value
+            for key, value in payload.items()
+            if not str(key).startswith("_harness_")
+            and key not in {"protocol_error", "review_protocol_error", "status_provenance"}
+        }
+        if phase == "PLAN_VALIDATION_LIFECYCLE_PHASE":
+            # This phase is decision-based and has no model-owned status field.
+            normalized.pop("status", None)
+            return normalized
         if phase == "APPROACH_REVIEW_PHASE":
             decision = str(normalized.get("decision") or "").strip()
             status_by_decision = {
@@ -1592,6 +1660,15 @@ class FeedbackLoopAgent:
                 return "summary is empty"
             status = str(payload.get("status") or "").strip()
             accepting = {"resolved", "skipped_with_note", "resolved_with_compromise"}
+            if phase in {"STEP_REVIEW_PHASE", "FINAL_PROJECT_REVIEW_PHASE"}:
+                validation_commands = payload.get("validation_commands", [])
+                if not isinstance(validation_commands, list):
+                    return "validation_commands is not list"
+                command_issue = FeedbackLoopAgent._command_list_contract_issue(validation_commands)
+                if command_issue:
+                    return f"validation_commands {command_issue}"
+                if validation_commands and status in accepting:
+                    return "validation_commands must be empty for an accepting review"
             if status in accepting and payload["required_changes"]:
                 return "required_changes must be empty for an accepting review"
             if status not in accepting and not payload["required_changes"]:
@@ -1661,6 +1738,15 @@ class FeedbackLoopAgent:
             record_feedback_decision=False,
             critical_reasoning=True,
         )
+        if self._status(decision) == HARNESS_PROTOCOL_ERROR_STATUS:
+            effective = dict(decision)
+            effective["_harness_effective_review"] = True
+            self._record_effective_review_if_needed(
+                "PLAN_VALIDATION_PHASE",
+                effective,
+                reason="plan_validation_lifecycle_protocol_failure",
+            )
+            return effective
         if decision.get("decision") == "valid":
             return review
 
@@ -2035,6 +2121,7 @@ class FeedbackLoopAgent:
             temperature=0.0,
             critical_reasoning=False,
             progress_review_timeout_seconds=progress_review_timeout_seconds,
+            reasoning_budget_cap_tokens=PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
         )
         return self._extract_phase_json(repaired, phase=phase)
 
@@ -2076,21 +2163,28 @@ class FeedbackLoopAgent:
                 "repair_error": str(repair_error),
                 "final_repair_error": str(final_repair_error or ""),
             }
-        return {
-            "status": "cannot_resolve",
-            "needs_rework": True,
+        fallback = {
+            "status": HARNESS_PROTOCOL_ERROR_STATUS,
+            "needs_rework": False,
             "summary": summary,
             "required_changes": [
-                "Reviewer protocol repair failed; repeat the review decision in the requested JSON contract before using it as workflow guidance.",
+                "No reviewer decision was accepted because every response missed the requested JSON contract.",
             ],
             "verification_evidence": [
                 "Harness parser could not extract valid reviewer JSON from the original or repair response."
             ],
             "review_protocol_error": True,
+            "status_provenance": "harness_protocol_validation",
             "parse_error": str(parse_error),
             "repair_error": str(repair_error),
             "final_repair_error": str(final_repair_error or ""),
         }
+        self._record_effective_review_if_needed(
+            phase,
+            fallback,
+            reason="review_protocol_failure",
+        )
+        return fallback
 
     def _malformed_implementation_fallback(
         self,
@@ -2147,10 +2241,12 @@ class FeedbackLoopAgent:
             step_results = []
             if phase_blocker is not None:
                 step_results = [phase_blocker]
+                blocker_status = str(phase_blocker.get("status") or "cannot_resolve")
                 final_review = {
-                    "status": "cannot_resolve",
+                    "status": blocker_status,
                     "summary": phase_blocker.get("last_review_summary", "A critical pre-implementation phase failed."),
                     "iterations": [],
+                    "resolution": phase_blocker.get("resolution", {}),
                 }
             else:
                 while True:
@@ -2166,10 +2262,87 @@ class FeedbackLoopAgent:
                             inherited_rework=approach_attempt > 1,
                         ))
                     self._write_plan_doc()
-                    if step_results[-1]["status"] == "cannot_resolve" and self.config.resolution_policy.stop_on_cannot_resolve:
+                    latest_step_status = str(step_results[-1].get("status") or "")
+                    if latest_step_status == HARNESS_PROTOCOL_ERROR_STATUS or (
+                        latest_step_status == "cannot_resolve"
+                        and self.config.resolution_policy.stop_on_cannot_resolve
+                    ):
                         break
-                final_review = self._final_review_phase(step_results)
-            approach_review = self._approach_review_phase(approach_attempt, step_results, final_review)
+                protocol_step = next(
+                    (
+                        item
+                        for item in step_results
+                        if item.get("status") == HARNESS_PROTOCOL_ERROR_STATUS
+                    ),
+                    None,
+                )
+                if protocol_step is not None:
+                    protocol_resolution = protocol_step.get("resolution") or {}
+                    final_review = {
+                        "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                        "summary": protocol_resolution.get(
+                            "note",
+                            "A step review produced no validated protocol decision.",
+                        ),
+                        "iterations": [],
+                        "resolution": protocol_resolution,
+                    }
+                else:
+                    final_review = self._final_review_phase(step_results)
+            protocol_blocker = None
+            if phase_blocker is not None and phase_blocker.get("status") == HARNESS_PROTOCOL_ERROR_STATUS:
+                protocol_blocker = phase_blocker
+            if protocol_blocker is None:
+                protocol_blocker = next(
+                    (
+                        item
+                        for item in step_results
+                        if item.get("status") == HARNESS_PROTOCOL_ERROR_STATUS
+                    ),
+                    None,
+                )
+            if protocol_blocker is None and self._status(final_review) == HARNESS_PROTOCOL_ERROR_STATUS:
+                protocol_blocker = final_review
+            if protocol_blocker is not None:
+                protocol_resolution = (
+                    protocol_blocker.get("resolution")
+                    if isinstance(protocol_blocker.get("resolution"), dict)
+                    else {}
+                )
+                protocol_summary = str(
+                    protocol_resolution.get("note")
+                    or protocol_blocker.get("last_review_summary")
+                    or protocol_blocker.get("summary")
+                    or "Protocol validation failed."
+                )
+                approach_review = {
+                    "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                    "needs_rework": False,
+                    "decision": "stop_unresolved",
+                    "summary": (
+                        "A workflow review produced no validated protocol decision. "
+                        "The harness stopped without treating that transport failure as a task verdict."
+                    ),
+                    "evidence_reviewed": [],
+                    "runbook_updates": [protocol_summary],
+                    "required_changes": [],
+                    "status_provenance": "harness_protocol_validation",
+                }
+                self._record_effective_review_if_needed(
+                    "APPROACH_REVIEW_PHASE",
+                    approach_review,
+                    reason="upstream_review_protocol_failure",
+                )
+                self.conversation.append(
+                    "user",
+                    "APPROACH_REVIEW_RESULT:\n"
+                    + json.dumps(self._compact_approach_review_for_transcript(approach_review), indent=2),
+                )
+                self._append_plan_note(
+                    f"[approach {approach_attempt}] stopped because validated workflow control state was unavailable."
+                )
+            else:
+                approach_review = self._approach_review_phase(approach_attempt, step_results, final_review)
             self.approach_history.append({
                 "approach_attempt": approach_attempt,
                 "analysis": analysis_result,
@@ -2261,12 +2434,26 @@ class FeedbackLoopAgent:
             or str((result.get("iterations") or [{}])[-1].get("review", {}).get("summary") or "")
             or f"{phase} phase did not resolve."
         )
+        blocker_status = (
+            HARNESS_PROTOCOL_ERROR_STATUS
+            if status == HARNESS_PROTOCOL_ERROR_STATUS
+            else "cannot_resolve"
+        )
         return {
             "step_id": f"{phase}_phase",
-            "status": "cannot_resolve",
+            "status": blocker_status,
             "attempts": [],
             "phase_result": result,
             "last_review_summary": summary,
+            "resolution": {
+                "status": blocker_status,
+                "note": summary,
+                "provenance": (
+                    str(resolution.get("provenance") or "harness_protocol_validation")
+                    if blocker_status == HARNESS_PROTOCOL_ERROR_STATUS
+                    else str(resolution.get("provenance") or "bounded_workflow_resolution")
+                ),
+            },
         }
 
     def _requirements_validation_only_skip_can_continue(self, result: dict[str, Any]) -> bool:
@@ -2534,7 +2721,16 @@ class FeedbackLoopAgent:
                 critical_reasoning=critical_reasoning,
             )
             iterations.append({"iteration": index, "analysis": latest, "review": review})
-            if self._status(review) == "resolved":
+            review_status = self._status(review)
+            if review_status == HARNESS_PROTOCOL_ERROR_STATUS:
+                resolution = self._protocol_error_resolution("analysis review", review)
+                self._append_plan_note(f"[analysis] {resolution['note']}")
+                return {
+                    "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                    "iterations": iterations,
+                    "resolution": resolution,
+                }
+            if review_status == "resolved":
                 self._append_plan_note(f"[analysis] resolved after iteration {index}: {review.get('summary', '')}")
                 return {"status": "resolved", "iterations": iterations}
             self.conversation.append(
@@ -2716,6 +2912,16 @@ class FeedbackLoopAgent:
             )
             iterations.append({"iteration": index, "requirements": latest, "review": review})
             review_status = self._status(review)
+            if review_status == HARNESS_PROTOCOL_ERROR_STATUS:
+                resolution = self._protocol_error_resolution("requirements review", review)
+                self.last_requirements_review = self._compact_review_for_transcript(review)
+                self._append_plan_note(f"[requirements] {resolution['note']}")
+                self._write_requirements_doc(review)
+                return {
+                    "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                    "iterations": iterations,
+                    "resolution": resolution,
+                }
             if review_status == "resolved" or (
                 review_status == "skipped_with_note"
                 and review.get("_harness_finding_scope") == "validation_commands"
@@ -2800,9 +3006,11 @@ class FeedbackLoopAgent:
             "REQUIREMENTS_REVIEW_PHASE\n"
             "Decide whether the requirements preserve the original request, resolve necessary gaps, and support "
             "a feasible verifiable plan. Reject concrete ambiguity, contradiction, scope expansion, or missing "
-            "verification strategy. Apply the supplied environment, quality, research, and deterministic findings "
-            "only under their stated conditions. Request a specific assumption when it can safely resolve a gap; "
-            "otherwise use an available non-resolved status. Do not invent a replacement interface.\n"
+            "verification strategy. Detailed step boundaries and semantic command adequacy belong to the separate "
+            "plan-validation phase; do not reject otherwise sound requirements merely to prescribe a preferred "
+            "validator. Apply the supplied environment, quality, research, and deterministic findings only under "
+            "their stated conditions. Request a specific assumption when it can safely resolve a gap; otherwise "
+            "use an available non-resolved status. Do not invent a replacement interface.\n"
             f"{_review_prompt_guidance(ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE)}\n"
             + json.dumps(prompt),
             temperature=0.1,
@@ -2862,6 +3070,15 @@ class FeedbackLoopAgent:
             )
             iterations.append({"iteration": index, "review": review, "plan": self.plan_steps})
             status = self._status(review)
+            if status == HARNESS_PROTOCOL_ERROR_STATUS:
+                resolution = self._protocol_error_resolution("plan validation", review)
+                self._append_plan_note(f"[plan] {resolution['note']}")
+                self._write_plan_doc()
+                return {
+                    "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                    "iterations": iterations,
+                    "resolution": resolution,
+                }
             if status in {"resolved", "resolved_with_compromise"}:
                 if status == "resolved_with_compromise":
                     self._apply_validation_command_compromise_to_plan(review)
@@ -2876,13 +3093,14 @@ class FeedbackLoopAgent:
                 iterations[-1]["requirements_refinement"] = requirements_result
                 blocker = self._blocking_phase_step("requirements", requirements_result)
                 if blocker is not None:
+                    blocker_status = str(blocker.get("status") or "cannot_resolve")
                     return {
-                        "status": "cannot_resolve",
+                        "status": blocker_status,
                         "iterations": iterations,
-                        "resolution": {
-                            "status": "cannot_resolve",
+                        "resolution": blocker.get("resolution", {
+                            "status": blocker_status,
                             "note": blocker.get("last_review_summary", "Requirements change did not resolve."),
-                        },
+                        }),
                     }
                 if index >= self.config.phases.plan_validation.max_iterations:
                     note = (
@@ -3126,6 +3344,7 @@ class FeedbackLoopAgent:
             if str(step.get("status", "pending")).strip() not in {
                 "resolved",
                 "cannot_resolve",
+                HARNESS_PROTOCOL_ERROR_STATUS,
                 "skipped",
                 "skipped_with_note",
             }:
@@ -3188,6 +3407,7 @@ class FeedbackLoopAgent:
         unchanged_artifact_count = 0
         last_progress_signature = ""
         last_artifact_signature = ""
+        reassessment_signature = ""
         implementation_budget = max(1, self.config.phases.implementation.max_iterations)
         allocated_review_attempts = max(1, (
             max(0, self.config.review_policy.hard_pushback_iterations)
@@ -3220,6 +3440,12 @@ class FeedbackLoopAgent:
             summary = str(review.get("summary", ""))
             progress_signature = self._repair_progress_signature(review)
             artifact_signature = self._repair_artifact_signature(review)
+            guard_kind = "evidence" if progress_signature else "artifact"
+            guard_signature = (
+                f"{guard_kind}:{progress_signature or artifact_signature}"
+                if progress_signature or artifact_signature
+                else ""
+            )
             unchanged_evidence_count = (
                 unchanged_evidence_count + 1
                 if progress_signature and progress_signature == last_progress_signature
@@ -3232,6 +3458,22 @@ class FeedbackLoopAgent:
             )
             last_progress_signature = progress_signature
             last_artifact_signature = artifact_signature
+            if reassessment_signature and guard_signature != reassessment_signature:
+                reassessment_signature = ""
+            if status == HARNESS_PROTOCOL_ERROR_STATUS:
+                resolution = self._protocol_error_resolution(
+                    f"step {step['id']} review",
+                    review,
+                )
+                step["status"] = HARNESS_PROTOCOL_ERROR_STATUS
+                self._append_plan_note(f"[{step['id']}] {resolution['note']}")
+                self._write_plan_doc()
+                return {
+                    "step_id": step["id"],
+                    "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                    "attempts": attempts,
+                    "resolution": resolution,
+                }
             if status in {"resolved", "resolved_with_compromise"}:
                 step["status"] = "resolved"
                 self._adopt_accepted_validation_commands_for_step(step, attempts[-1])
@@ -3259,12 +3501,14 @@ class FeedbackLoopAgent:
                 attempts[-1]["requirements_refinement"] = requirements_result
                 requirements_blocker = self._blocking_phase_step("requirements", requirements_result)
                 if requirements_blocker is not None:
-                    step["status"] = "cannot_resolve"
+                    blocker_status = str(requirements_blocker.get("status") or "cannot_resolve")
+                    step["status"] = blocker_status
                     return {
                         "step_id": step["id"],
-                        "status": "cannot_resolve",
+                        "status": blocker_status,
                         "attempts": attempts,
                         "control_state_blocker": requirements_blocker,
+                        "resolution": requirements_blocker.get("resolution", {}),
                     }
                 control_result = self._plan_validation_phase(inherited_rework=True)
             else:
@@ -3273,14 +3517,16 @@ class FeedbackLoopAgent:
                 attempts[-1]["plan_revalidation"] = control_result
                 control_blocker = self._blocking_phase_step("plan", control_result)
                 if control_blocker is not None:
+                    blocker_status = str(control_blocker.get("status") or "cannot_resolve")
                     current = self._current_step_by_id(step["id"])
                     if current is not None:
-                        current["status"] = "cannot_resolve"
+                        current["status"] = blocker_status
                     return {
                         "step_id": step["id"],
-                        "status": "cannot_resolve",
+                        "status": blocker_status,
                         "attempts": attempts,
                         "control_state_blocker": control_blocker,
+                        "resolution": control_blocker.get("resolution", {}),
                     }
                 current = self._current_step_by_id(step["id"])
                 if current is None:
@@ -3298,24 +3544,91 @@ class FeedbackLoopAgent:
                 step["status"] = "cannot_resolve"
                 self._append_plan_note(f"[{step['id']}] cannot resolve: {summary}")
                 return {"step_id": step["id"], "status": "cannot_resolve", "attempts": attempts}
-            if unchanged_evidence_count >= max(1, self.config.resolution_policy.max_same_error_repeats):
-                self._append_plan_note(
-                    f"[{step['id']}] unchanged workspace and validation evidence repeated "
-                    f"{unchanged_evidence_count} times; the next model turn must reassess the blocker before editing.",
+            if (
+                status == "needs_rework"
+                and reassessment_signature
+                and guard_signature == reassessment_signature
+            ):
+                resolution = {
+                    "status": "cannot_resolve",
+                    "note": (
+                        f"Observable {guard_kind} state remained unchanged after one dedicated reassessment. "
+                        "The harness stopped this step instead of repeating repairs without evidence of progress."
+                    ),
+                    "provenance": "harness_no_progress_guard",
+                }
+                attempts[-1]["no_progress_guard"] = {
+                    "decision": "stop_after_reassessment",
+                    "state_kind": guard_kind,
+                    "state_signature": guard_signature,
+                }
+                step["status"] = "cannot_resolve"
+                self._append_plan_note(f"[{step['id']}] {resolution['note']}")
+                self._record_effective_review_if_needed(
+                    "STEP_REVIEW_PHASE",
+                    {
+                        "status": "cannot_resolve",
+                        "needs_rework": False,
+                        "summary": resolution["note"],
+                        "required_changes": [],
+                        "resolution": resolution,
+                    },
+                    reason="no_progress_guard",
                 )
-            elif unchanged_artifact_count >= max(1, self.config.resolution_policy.max_same_error_repeats):
+                self._write_plan_doc()
+                return {
+                    "step_id": step["id"],
+                    "status": "cannot_resolve",
+                    "attempts": attempts,
+                    "resolution": resolution,
+                }
+            no_progress_threshold = max(1, self.config.resolution_policy.max_same_error_repeats)
+            guard_repeat_count = (
+                unchanged_evidence_count
+                if progress_signature
+                else unchanged_artifact_count
+            )
+            if (
+                status == "needs_rework"
+                and not reassessment_signature
+                and guard_signature
+                and guard_repeat_count >= no_progress_threshold
+                and attempt < max_attempts
+            ):
+                reassessment_signature = guard_signature
+                attempts[-1]["no_progress_guard"] = {
+                    "decision": "reassess_once",
+                    "state_kind": guard_kind,
+                    "state_signature": guard_signature,
+                }
+                repeated_state = (
+                    "validation evidence and deterministic findings"
+                    if guard_kind == "evidence"
+                    else "project artifact state"
+                )
+                self._append_plan_note(
+                    f"[{step['id']}] unchanged {repeated_state} repeated {guard_repeat_count} times; "
+                    "the next model turn must reassess the blocker before editing.",
+                )
+            elif (
+                attempt < max_attempts
+                and bool(progress_signature)
+                and unchanged_evidence_count < no_progress_threshold
+                and unchanged_artifact_count >= no_progress_threshold
+            ):
                 self._append_plan_note(
                     f"[{step['id']}] artifact state repeated {unchanged_artifact_count} times while repair evidence "
                     "changed; the next model turn must distinguish an implementation defect from validator churn.",
                 )
-            self.conversation.append(
-                "user",
-                self._next_implementation_directive(
-                    review,
-                    repeated_evidence_count=unchanged_evidence_count,
-                    repeated_artifact_count=unchanged_artifact_count,
-                ),
-            )
+            if attempt < max_attempts:
+                self.conversation.append(
+                    "user",
+                    self._next_implementation_directive(
+                        review,
+                        repeated_evidence_count=unchanged_evidence_count,
+                        repeated_artifact_count=unchanged_artifact_count,
+                    ),
+                )
         resolution = self._fallback_resolution(f"step {step['id']}", attempts[-1]["review"] if attempts else {})
         step["status"] = resolution["status"]
         return {"step_id": step["id"], "status": resolution["status"], "attempts": attempts, "resolution": resolution}
@@ -3329,6 +3642,8 @@ class FeedbackLoopAgent:
         def command_state(result: Any) -> dict[str, Any]:
             if not isinstance(result, dict):
                 return {"invalid_result": str(result)}
+            stdout = str(result.get("stdout") or "")
+            stderr = str(result.get("stderr") or "")
             return {
                 "command": result.get("command"),
                 "returncode": result.get("returncode"),
@@ -3336,12 +3651,16 @@ class FeedbackLoopAgent:
                 "timed_out": bool(result.get("timed_out")),
                 "stopped_by_progress_review": bool(result.get("stopped_by_progress_review")),
                 "blocked_by_tool_verifier": bool(result.get("blocked_by_tool_verifier")),
-                "stdout": str(result.get("stdout") or "")[-1000:],
-                "stderr": str(result.get("stderr") or "")[-1000:],
+                "blocked_git_mutation": bool(result.get("blocked_git_mutation")),
+                "invalid_command": bool(result.get("invalid_command")),
+                "spawn_error": bool(result.get("spawn_error")),
+                "stdout_sha256": hashlib.sha256(stdout.encode("utf-8", errors="replace")).hexdigest(),
+                "stderr_sha256": hashlib.sha256(stderr.encode("utf-8", errors="replace")).hexdigest(),
+                "stdout_truncated": bool(result.get("stdout_truncated")),
+                "stderr_truncated": bool(result.get("stderr_truncated")),
             }
 
         state = {
-            "workspace_state": self._repair_artifact_signature(review),
             "deterministic_findings": sorted({
                 str(item)
                 for item in review.get("deterministic_evidence_findings", []) or []
@@ -3354,7 +3673,13 @@ class FeedbackLoopAgent:
                 command_state(result)
                 for result in evidence.get("accepted_validation_results", []) or []
             ],
+            "reviewer_validation_results": [
+                command_state(result)
+                for result in evidence.get("reviewer_validation_results", []) or []
+            ],
         }
+        if not any(state.values()):
+            return ""
         encoded = json.dumps(state, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
@@ -3410,8 +3735,8 @@ class FeedbackLoopAgent:
         if repeated_evidence_count >= max(1, self.config.resolution_policy.max_same_error_repeats):
             progress_checkpoint = (
                 "REPAIR_PROGRESS_CHECKPOINT:\n"
-                f"The last {repeated_evidence_count} unresolved reviews had the same observable workspace and "
-                "validation outcome. Before editing, reassess the blocker from the original request and current "
+                f"The last {repeated_evidence_count} unresolved reviews had the same validation outcome and "
+                "deterministic findings. Before editing, reassess the blocker from the original request and current "
                 "evidence. Decide whether the remaining issue is an implementation defect, missing evidence, a "
                 "stale validator or plan, a requirements conflict, or an environment limit. Rewrite a file only "
                 "when a concrete defect remains. Otherwise use resolution_request to ask for a plan/requirements "
@@ -3588,6 +3913,54 @@ class FeedbackLoopAgent:
         normalized.setdefault("test_evidence", [])
         return normalized
 
+    def _run_reviewer_validation_round(
+        self,
+        review: dict[str, Any],
+        *,
+        source: str,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Verify and execute one reviewer-selected evidence request."""
+        commands = list(review.get("validation_commands") or [])
+        if not commands:
+            return {"commands": [], "results": [], "terminal_unavailable": False}
+        if not self.config.mcp_tools.terminal:
+            return {"commands": commands, "results": [], "terminal_unavailable": True}
+        results = self._run_verified_commands(
+            commands,
+            source=source,
+            context={
+                **context,
+                "purpose": (
+                    "One bounded reviewer-requested evidence round. Commands must be observational, "
+                    "proportional, and directed at a concrete unresolved acceptance criterion."
+                ),
+            },
+        )
+        return {"commands": commands, "results": results, "terminal_unavailable": False}
+
+    def _evidence_with_reviewer_validation(
+        self,
+        evidence: dict[str, Any],
+        validation_round: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attach requested results and refresh mutable workspace evidence."""
+        updated = dict(evidence)
+        updated["reviewer_validation_commands"] = validation_round.get("commands", [])
+        updated["reviewer_validation_results"] = validation_round.get("results", [])
+        updated["reviewer_validation_terminal_unavailable"] = bool(
+            validation_round.get("terminal_unavailable")
+        )
+        updated["workspace_files"] = collect_workspace_files(
+            self.workspace,
+            self.config.context_compaction.workspace_file_max_bytes,
+            max_files=self.config.context_compaction.workspace_snapshot_max_files,
+            max_total_chars=self.config.context_compaction.workspace_snapshot_max_chars,
+        )
+        if self.config.git_policy.enabled:
+            updated["git"] = self._git_evidence()
+        return updated
+
     def _step_review_pass(
         self,
         step: dict[str, Any],
@@ -3596,9 +3969,16 @@ class FeedbackLoopAgent:
         review_mode: str,
         *,
         critical_reasoning: bool = False,
+        _feedback_tool_evidence: dict[str, Any] | None = None,
+        _reviewer_validation_round_used: bool = False,
+        _prior_review: dict[str, Any] | None = None,
     ) -> dict:
         """Critique one step using reviewer-owned file and command evidence."""
-        feedback_tool_evidence = self._step_feedback_tool_evidence(step, implementation=implementation)
+        feedback_tool_evidence = (
+            _feedback_tool_evidence
+            if _feedback_tool_evidence is not None
+            else self._step_feedback_tool_evidence(step, implementation=implementation)
+        )
         evidence_findings = self._evidence_findings(step, implementation, feedback_tool_evidence)
         workspace_artifact_paths = self._workspace_artifact_paths(feedback_tool_evidence)
         prompt = {
@@ -3625,6 +4005,22 @@ class FeedbackLoopAgent:
             "feedback_tool_evidence": self._compact_step_evidence_for_prompt(feedback_tool_evidence),
             "workspace_artifact_paths": workspace_artifact_paths,
             "deterministic_evidence_findings": evidence_findings,
+            "reviewer_validation_round": {
+                "used": _reviewer_validation_round_used,
+                "terminal_available": bool(self.config.mcp_tools.terminal),
+                "additional_round_available": (
+                    not _reviewer_validation_round_used and bool(self.config.mcp_tools.terminal)
+                ),
+                "prior_review": (
+                    self._clip_nested_for_transcript(
+                        _prior_review,
+                        string_limit=800,
+                        list_limit=6,
+                    )
+                    if _prior_review
+                    else None
+                ),
+            },
             "review_policy": {
                 "hard_pushback_iterations": self.config.review_policy.hard_pushback_iterations,
                 "compromise_iterations": self.config.review_policy.compromise_iterations,
@@ -3634,16 +4030,25 @@ class FeedbackLoopAgent:
                 "summary": "review summary",
                 "required_changes": ["specific change, or empty when accepting"],
                 "verification_evidence": ["specific command, file, or runtime evidence checked"],
+                "validation_commands": [],
             },
         }
+        validation_round_instruction = (
+            "A reviewer-requested validation round has already been used. Decide from the supplied results; "
+            "leave validation_commands empty and name any remaining implementation, plan, requirements, or "
+            "environment gap directly.\n"
+            if _reviewer_validation_round_used
+            else ""
+        )
         raw = self._feedback_chat_with_compact_context(
             "STEP_REVIEW_PHASE\n"
             f"Review exactly one step against the original request and acceptance criteria using the supplied "
             "current artifacts, reviewer-run validation, and git evidence. Apply review mode "
                 f"`{review_mode}` only after that evidence check: hard pushback rejects material gaps; compromise "
                 "accepts only an explicit unavoidable limitation.\n"
+                f"{validation_round_instruction}"
                 f"{REPAIR_REVIEW_CAUSAL_RECHECK_GUIDANCE if attempt > 1 else ''}\n"
-                f"{_review_prompt_guidance(ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE, deliverable_evidence=True, completion_countercheck=True)}\n"
+                f"{_review_prompt_guidance(ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE, REVIEWER_VALIDATION_REQUEST_GUIDANCE, deliverable_evidence=True, completion_countercheck=True)}\n"
                 + json.dumps(prompt),
             context_note=(
                 "Use the active recent turns, compacted durable memory, this step-review payload, and "
@@ -3662,6 +4067,56 @@ class FeedbackLoopAgent:
             record_feedback_decision=False,
             critical_reasoning=critical_reasoning,
         ))
+        requested_validation = list(review.get("validation_commands") or [])
+        if requested_validation and not _reviewer_validation_round_used:
+            validation_round = self._run_reviewer_validation_round(
+                review,
+                source="step_reviewer_requested_validation",
+                context={
+                    "step": self._compact_step_for_review_prompt(step),
+                    "attempt": attempt,
+                    "review_gap": review.get("required_changes", []),
+                },
+            )
+            augmented_evidence = self._evidence_with_reviewer_validation(
+                feedback_tool_evidence,
+                validation_round,
+            )
+            final_review = self._step_review_pass(
+                step,
+                attempt,
+                implementation,
+                review_mode,
+                critical_reasoning=critical_reasoning,
+                _feedback_tool_evidence=augmented_evidence,
+                _reviewer_validation_round_used=True,
+                _prior_review={
+                    "status": review.get("status"),
+                    "summary": review.get("summary"),
+                    "required_changes": review.get("required_changes", []),
+                    "validation_commands": requested_validation,
+                },
+            )
+            final_review["reviewer_validation_request"] = {
+                "review": {
+                    "status": review.get("status"),
+                    "summary": review.get("summary"),
+                    "required_changes": review.get("required_changes", []),
+                },
+                "commands": validation_round.get("commands", []),
+                "result_count": len(validation_round.get("results", [])),
+                "terminal_unavailable": validation_round.get("terminal_unavailable", False),
+            }
+            return final_review
+        if requested_validation and _reviewer_validation_round_used:
+            evidence_findings = [
+                *evidence_findings,
+                (
+                    "Reviewer requested another validation round after the one-round evidence limit. "
+                    "Use the supplied results or name a concrete remaining work, plan, requirements, or "
+                    "environment gap."
+                ),
+            ]
         review = self._enforce_evidence_policy(review, evidence_findings, review_mode)
         review["deterministic_evidence_findings"] = evidence_findings
         self._update_active_repair_findings(step, attempt, review, evidence_findings)
@@ -3697,7 +4152,12 @@ class FeedbackLoopAgent:
                 item["git_commit"] = self._git_commit_final_review()
                 iterations.append(item)
                 return {"status": review_status, "iterations": iterations}
-            if review_status in {"needs_plan_change", "needs_requirements_change", "cannot_resolve"}:
+            if review_status in {
+                "needs_plan_change",
+                "needs_requirements_change",
+                "cannot_resolve",
+                HARNESS_PROTOCOL_ERROR_STATUS,
+            }:
                 iterations.append(item)
                 self._append_plan_note(
                     f"[final review] {review_status}: correction cannot safely bypass this workflow boundary; "
@@ -3738,6 +4198,14 @@ class FeedbackLoopAgent:
                 "status": "resolved_with_compromise",
                 "iterations": iterations,
                 "resolution": protocol_compromise["resolution"],
+            }
+        if self._status(last_review) == HARNESS_PROTOCOL_ERROR_STATUS:
+            resolution = self._protocol_error_resolution("final review", last_review)
+            self._append_plan_note(f"[final review] {resolution['note']}")
+            return {
+                "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                "iterations": iterations,
+                "resolution": resolution,
             }
         fallback = self._fallback_resolution("final review", last_review)
         self._append_plan_note(f"[final review] {fallback['status']}: {fallback['note']}")
@@ -3780,6 +4248,7 @@ class FeedbackLoopAgent:
         resolution = {
             "status": "resolved_with_compromise",
             "note": summary,
+            "provenance": "harness_verified_evidence_protocol_compromise",
         }
         return {
             "status": "resolved_with_compromise",
@@ -3793,6 +4262,7 @@ class FeedbackLoopAgent:
             ],
             "resolution": resolution,
             "review_protocol_error": True,
+            "status_provenance": "harness_verified_evidence_protocol_compromise",
         }
 
     @staticmethod
@@ -3812,6 +4282,12 @@ class FeedbackLoopAgent:
                         return False
                     if not self._command_returncode_matches_expected(result):
                         return False
+        for result in evidence.get("reviewer_validation_results", []) or []:
+            seen_result = True
+            if result.get("timed_out") or result.get("stopped_by_progress_review"):
+                return False
+            if not self._command_returncode_matches_expected(result):
+                return False
         return seen_result
 
     def _approach_review_phase(
@@ -3870,6 +4346,20 @@ class FeedbackLoopAgent:
             record_feedback_decision=False,
             critical_reasoning=True,
         ))
+        if self._status(review) == HARNESS_PROTOCOL_ERROR_STATUS:
+            review.setdefault("decision", "stop_unresolved")
+            review.setdefault("evidence_reviewed", [])
+            review.setdefault("runbook_updates", [])
+            review["status_provenance"] = "harness_protocol_validation"
+            self.conversation.append(
+                "user",
+                "APPROACH_REVIEW_RESULT:\n"
+                + json.dumps(self._compact_approach_review_for_transcript(review), indent=2),
+            )
+            self._append_plan_note(
+                f"[approach review {approach_attempt}] protocol error: {review.get('summary', 'no summary')}"
+            )
+            return review
         final_status = self._final_status(step_results, final_review)
         evidence_issue = self._approach_review_context_issue(review, available_evidence)
         decision_conflict = final_status != "resolved" and review.get("decision") == "keep_result"
@@ -3904,21 +4394,30 @@ class FeedbackLoopAgent:
                 record_feedback_decision=False,
                 critical_reasoning=True,
             ))
-            evidence_issue = self._approach_review_context_issue(review, available_evidence)
-            decision_conflict = final_status != "resolved" and review.get("decision") == "keep_result"
+            if self._status(review) == HARNESS_PROTOCOL_ERROR_STATUS:
+                review.setdefault("decision", "stop_unresolved")
+                review.setdefault("evidence_reviewed", [])
+                review.setdefault("runbook_updates", [])
+                review["status_provenance"] = "harness_protocol_validation"
+                evidence_issue = "Approach-review protocol repair did not produce accepted control state."
+                decision_conflict = False
+            else:
+                evidence_issue = self._approach_review_context_issue(review, available_evidence)
+                decision_conflict = final_status != "resolved" and review.get("decision") == "keep_result"
             if evidence_issue or decision_conflict:
                 unresolved_context = evidence_issue or (
                     f"Workflow final status {final_status!r} remained incompatible with keep_result after repair."
                 )
                 review = {
-                    "status": "cannot_resolve",
-                    "needs_rework": True,
+                    "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                    "needs_rework": False,
                     "summary": "Approach review remained inconsistent with supplied workflow evidence after repair.",
                     "decision": "stop_unresolved",
                     "evidence_reviewed": [],
                     "runbook_updates": [unresolved_context],
                     "required_changes": [],
                     "review_protocol_error": True,
+                    "status_provenance": "harness_protocol_validation",
                     "_harness_effective_review": True,
                 }
                 self._record_effective_review_if_needed(
@@ -3947,6 +4446,8 @@ class FeedbackLoopAgent:
             "runbook_updates",
             "required_changes",
             "reviewer_rationale",
+            "review_protocol_error",
+            "status_provenance",
         )
         payload = {
             key: review.get(key)
@@ -4010,10 +4511,13 @@ class FeedbackLoopAgent:
                     "text": self._prompt_excerpt(str(value), 1200),
                 })
         for index, result in enumerate(step_results[:8]):
+            resolution = result.get("resolution") if isinstance(result.get("resolution"), dict) else {}
             summary = {
                 "status": result.get("status"),
                 "step_id": result.get("step_id"),
                 "attempts": len(result.get("attempts", []) or []),
+                "resolution_note": self._prompt_excerpt(str(resolution.get("note") or ""), 800),
+                "resolution_provenance": resolution.get("provenance"),
             }
             evidence.append({
                 "id": f"step_result:{index}",
@@ -4065,8 +4569,20 @@ class FeedbackLoopAgent:
             ),
         }
 
-    def _final_project_review(self, attempt: int, step_results: list[dict[str, Any]]) -> dict:
-        feedback_tool_evidence = self._final_feedback_tool_evidence(step_results)
+    def _final_project_review(
+        self,
+        attempt: int,
+        step_results: list[dict[str, Any]],
+        *,
+        _feedback_tool_evidence: dict[str, Any] | None = None,
+        _reviewer_validation_round_used: bool = False,
+        _prior_review: dict[str, Any] | None = None,
+    ) -> dict:
+        feedback_tool_evidence = (
+            _feedback_tool_evidence
+            if _feedback_tool_evidence is not None
+            else self._final_feedback_tool_evidence(step_results)
+        )
         evidence_findings = self._project_evidence_findings(step_results, feedback_tool_evidence)
         workspace_artifact_paths = self._workspace_artifact_paths(feedback_tool_evidence)
         prompt = {
@@ -4079,19 +4595,43 @@ class FeedbackLoopAgent:
             "feedback_tool_evidence": self._compact_final_evidence_for_prompt(feedback_tool_evidence),
             "workspace_artifact_paths": workspace_artifact_paths,
             "deterministic_evidence_findings": evidence_findings,
+            "reviewer_validation_round": {
+                "used": _reviewer_validation_round_used,
+                "terminal_available": bool(self.config.mcp_tools.terminal),
+                "additional_round_available": (
+                    not _reviewer_validation_round_used and bool(self.config.mcp_tools.terminal)
+                ),
+                "prior_review": (
+                    self._clip_nested_for_transcript(
+                        _prior_review,
+                        string_limit=800,
+                        list_limit=6,
+                    )
+                    if _prior_review
+                    else None
+                ),
+            },
             "expected_json": {
                 "status": "resolved|needs_rework|cannot_resolve|needs_requirements_change|needs_plan_change|skipped_with_note|resolved_with_compromise",
                 "summary": "concrete final review summary",
                 "required_changes": ["concrete final change, or empty when resolved"],
                 "verification_evidence": ["specific command result, file evidence, or reviewer fact"],
+                "validation_commands": [],
             },
         }
+        validation_round_instruction = (
+            "A reviewer-requested validation round has already been used. Decide from the supplied results; "
+            "leave validation_commands empty and name any remaining concrete gap directly.\n"
+            if _reviewer_validation_round_used
+            else ""
+        )
         raw = self._feedback_chat_with_compact_context(
             "FINAL_PROJECT_REVIEW_PHASE\n"
             "Review the final project against the original request using the supplied current artifacts, "
             "reviewer-owned validation, git state, and deterministic findings. Do not treat implementation claims "
             "or generated requirements and tests as proof of completion.\n"
-                f"{_review_prompt_guidance(ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE, deliverable_evidence=True, completion_countercheck=True)}\n"
+                f"{validation_round_instruction}"
+                f"{_review_prompt_guidance(ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE, REVIEWER_VALIDATION_REQUEST_GUIDANCE, deliverable_evidence=True, completion_countercheck=True)}\n"
                 + json.dumps(prompt),
             context_note=(
                 "Use the active recent turns, compacted durable memory, this final-review payload, and "
@@ -4109,6 +4649,52 @@ class FeedbackLoopAgent:
             record_feedback_decision=False,
             critical_reasoning=True,
         ))
+        requested_validation = list(review.get("validation_commands") or [])
+        if requested_validation and not _reviewer_validation_round_used:
+            validation_round = self._run_reviewer_validation_round(
+                review,
+                source="final_reviewer_requested_validation",
+                context={
+                    "attempt": attempt,
+                    "review_gap": review.get("required_changes", []),
+                    "step_results": self._compact_step_results_for_prompt(step_results),
+                },
+            )
+            augmented_evidence = self._evidence_with_reviewer_validation(
+                feedback_tool_evidence,
+                validation_round,
+            )
+            final_review = self._final_project_review(
+                attempt,
+                step_results,
+                _feedback_tool_evidence=augmented_evidence,
+                _reviewer_validation_round_used=True,
+                _prior_review={
+                    "status": review.get("status"),
+                    "summary": review.get("summary"),
+                    "required_changes": review.get("required_changes", []),
+                    "validation_commands": requested_validation,
+                },
+            )
+            final_review["reviewer_validation_request"] = {
+                "review": {
+                    "status": review.get("status"),
+                    "summary": review.get("summary"),
+                    "required_changes": review.get("required_changes", []),
+                },
+                "commands": validation_round.get("commands", []),
+                "result_count": len(validation_round.get("results", [])),
+                "terminal_unavailable": validation_round.get("terminal_unavailable", False),
+            }
+            return final_review
+        if requested_validation and _reviewer_validation_round_used:
+            evidence_findings = [
+                *evidence_findings,
+                (
+                    "Reviewer requested another validation round after the one-round evidence limit. "
+                    "Use the supplied results or name a concrete remaining final-project gap."
+                ),
+            ]
         if evidence_findings and self._status(review) in {"resolved", "resolved_with_compromise", "skipped_with_note"}:
             review["status"] = "needs_rework"
             review["needs_rework"] = True
@@ -4148,6 +4734,18 @@ class FeedbackLoopAgent:
             )
             summaries.append(
                 f"Step {validation.get('step_id')}: {passed}/{len(results)} reviewer-owned validation commands passed."
+            )
+        reviewer_results = evidence.get("reviewer_validation_results", []) or []
+        if reviewer_results:
+            passed = sum(
+                1
+                for result in reviewer_results
+                if self._command_returncode_matches_expected(result)
+                and not result.get("timed_out")
+                and not result.get("stopped_by_progress_review")
+            )
+            summaries.append(
+                f"Final reviewer-requested validation: {passed}/{len(reviewer_results)} commands passed."
             )
         files = evidence.get("workspace_files", []) or []
         if files:
@@ -4274,6 +4872,7 @@ class FeedbackLoopAgent:
             reviewer_validation_summary = self._command_result_counts(
                 reviewer_evidence.get("validation_results", [])
             )
+            reviewer_requested_results = reviewer_evidence.get("reviewer_validation_results", []) or []
             item = {
                 "step_id": result.get("step_id"),
                 "status": result.get("status"),
@@ -4287,10 +4886,36 @@ class FeedbackLoopAgent:
                 "last_review_summary": self._prompt_excerpt(str(review.get("summary") or ""), 1200),
                 "implementation_command_summary": implementation_command_summary,
                 "reviewer_validation_summary": reviewer_validation_summary,
+                "reviewer_requested_validation_summary": self._command_result_counts(
+                    reviewer_requested_results
+                ),
             }
+            if reviewer_requested_results:
+                item["reviewer_requested_validation_results"] = self._compact_command_results_for_prompt(
+                    reviewer_requested_results,
+                    max_total_output_chars=3000,
+                )
+                item["reviewer_requested_validation_note"] = (
+                    "Historical evidence from the accepted step review; use current final-state reruns for any "
+                    "behavior that later steps could have changed."
+                )
             phase_result = result.get("phase_result")
             if isinstance(phase_result, dict):
                 item["phase_failure"] = self._compact_phase_result_for_prompt(phase_result)
+            resolution = result.get("resolution")
+            if isinstance(resolution, dict):
+                item["resolution"] = self._clip_nested_for_transcript(
+                    resolution,
+                    string_limit=1200,
+                    list_limit=6,
+                )
+            no_progress_guard = last_attempt.get("no_progress_guard")
+            if isinstance(no_progress_guard, dict):
+                item["no_progress_guard"] = self._clip_nested_for_transcript(
+                    no_progress_guard,
+                    string_limit=500,
+                    list_limit=4,
+                )
             claimed_evidence = raw.get("test_evidence", [])
             if claimed_evidence:
                 item["implementation_test_evidence_claims"] = self._clip_list_for_transcript(claimed_evidence)
@@ -4503,6 +5128,8 @@ class FeedbackLoopAgent:
         validation_results = evidence.get("validation_results", [])
         accepted_commands = evidence.get("accepted_validation_commands", [])
         accepted_results = evidence.get("accepted_validation_results", [])
+        reviewer_commands = evidence.get("reviewer_validation_commands", [])
+        reviewer_results = evidence.get("reviewer_validation_results", [])
         return {
             "kind": evidence.get("kind"),
             "step_id": evidence.get("step_id"),
@@ -4530,6 +5157,19 @@ class FeedbackLoopAgent:
                 max_total_output_chars=5000,
             ),
             "accepted_validation_result_count": len(accepted_results),
+            "reviewer_validation_commands": self._compact_commands_for_prompt(
+                reviewer_commands,
+                max_total_chars=3000,
+            ),
+            "reviewer_validation_command_count": len(reviewer_commands),
+            "reviewer_validation_results": self._compact_command_results_for_prompt(
+                reviewer_results,
+                max_total_output_chars=5000,
+            ),
+            "reviewer_validation_result_count": len(reviewer_results),
+            "reviewer_validation_terminal_unavailable": bool(
+                evidence.get("reviewer_validation_terminal_unavailable")
+            ),
             "git": {
                 "enabled": git.get("enabled"),
                 "head": git.get("head"),
@@ -4601,6 +5241,8 @@ class FeedbackLoopAgent:
                 ),
             })
         git = evidence.get("git") or {}
+        reviewer_commands = evidence.get("reviewer_validation_commands", [])
+        reviewer_results = evidence.get("reviewer_validation_results", [])
         return {
             "kind": evidence.get("kind"),
             "workspace_files": files,
@@ -4608,6 +5250,19 @@ class FeedbackLoopAgent:
             "workspace_files_omitted_count": len(omitted_paths),
             "workspace_files_omitted_paths": omitted_paths[:20],
             "step_validations": validations,
+            "reviewer_validation_commands": self._compact_commands_for_prompt(
+                reviewer_commands,
+                max_total_chars=3000,
+            ),
+            "reviewer_validation_command_count": len(reviewer_commands),
+            "reviewer_validation_results": self._compact_command_results_for_prompt(
+                reviewer_results,
+                max_total_output_chars=5000,
+            ),
+            "reviewer_validation_result_count": len(reviewer_results),
+            "reviewer_validation_terminal_unavailable": bool(
+                evidence.get("reviewer_validation_terminal_unavailable")
+            ),
             "git": {
                 "enabled": git.get("enabled"),
                 "head": git.get("head"),
@@ -5020,7 +5675,7 @@ class FeedbackLoopAgent:
         return findings
 
     def _validation_command_protocol_findings(self, step: dict[str, Any]) -> list[str]:
-        """Validate only the command transport schema; models own semantic adequacy."""
+        """Validate command transport and statically parseable inline programs."""
         step_id = str(step.get("id") or "step")
         commands = step.get("validation_commands") or []
         if not isinstance(commands, list):
@@ -5028,12 +5683,15 @@ class FeedbackLoopAgent:
         findings: list[str] = []
         for index, command in enumerate(commands):
             label = f"{step_id} validation command {index}"
+            parts: list[str] | None = None
             if isinstance(command, dict):
-                parts = command.get("cmd")
-                if not isinstance(parts, list) or not parts:
+                command_parts = command.get("cmd")
+                if not isinstance(command_parts, list) or not command_parts:
                     findings.append(f"{label} must contain a non-empty list-valued cmd.")
-                elif not all(isinstance(part, str) and part for part in parts):
+                elif not all(isinstance(part, str) and part for part in command_parts):
                     findings.append(f"{label} cmd must contain only non-empty strings.")
+                else:
+                    parts = list(command_parts)
                 for field in ("timeout_seconds", "expected_returncode"):
                     if field in command and (
                         isinstance(command[field], bool) or not isinstance(command[field], int)
@@ -5042,9 +5700,20 @@ class FeedbackLoopAgent:
                 for field in ("validation", "final_state"):
                     if field in command and not isinstance(command[field], bool):
                         findings.append(f"{label} has a non-boolean {field} value.")
-                continue
-            if not isinstance(command, list) or not command:
+            elif not isinstance(command, list) or not command:
                 findings.append(f"{label} must be a non-empty argv list or command object.")
+            elif not all(isinstance(part, str) and part for part in command):
+                findings.append(f"{label} must contain only non-empty strings.")
+            else:
+                parts = list(command)
+            if parts is None:
+                continue
+            inline_error = self._inline_python_static_syntax_error(parts)
+            if inline_error:
+                findings.append(f"{label} contains invalid inline Python: {inline_error}.")
+            shell_error = self._shell_static_syntax_error(parts)
+            if shell_error:
+                findings.append(f"{label} contains invalid shell syntax: {shell_error}.")
         return findings
 
 
@@ -5312,6 +5981,7 @@ class FeedbackLoopAgent:
         if (
             feedback_tool_evidence.get("validation_results")
             or feedback_tool_evidence.get("accepted_validation_results")
+            or feedback_tool_evidence.get("reviewer_validation_results")
         ):
             # Reviewer-owned validation already supplies the authoritative
             # outcome for an unchanged artifact. A failed check is reported by
@@ -6608,7 +7278,12 @@ class FeedbackLoopAgent:
         if expected:
             spec["expected_returncode"] = expected
         if metadata.get("timeout_explicit"):
-            spec["timeout_seconds"] = int(result.get("timeout_seconds", 0))
+            timeout = result.get("timeout_seconds")
+            if timeout is None and result.get("hard_timeout_disabled") is True:
+                timeout = 0
+            if isinstance(timeout, bool) or not isinstance(timeout, int):
+                raise ValueError("Executed command evidence has inconsistent explicit timeout metadata.")
+            spec["timeout_seconds"] = timeout
         if result.get("final_state") is False:
             spec["final_state"] = False
         return spec if len(spec) > 1 else command
@@ -6648,8 +7323,10 @@ class FeedbackLoopAgent:
         evidence = feedback_tool_evidence or {}
         validation_results = evidence.get("validation_results") or []
         accepted_results = evidence.get("accepted_validation_results") or []
+        reviewer_results = evidence.get("reviewer_validation_results") or []
         validation_commands = step.get("validation_commands") or []
         accepted_commands = evidence.get("accepted_validation_commands") or []
+        reviewer_commands = evidence.get("reviewer_validation_commands") or []
         if len(validation_results) != len(validation_commands):
             findings.append(
                 f"{step.get('id', 'step')} produced {len(validation_results)} reviewer-owned results for "
@@ -6659,6 +7336,11 @@ class FeedbackLoopAgent:
             findings.append(
                 f"{step.get('id', 'step')} produced {len(accepted_results)} reviewer-owned results for "
                 f"{len(accepted_commands)} accepted validation commands."
+            )
+        if len(reviewer_results) != len(reviewer_commands):
+            findings.append(
+                f"{step.get('id', 'step')} produced {len(reviewer_results)} results for "
+                f"{len(reviewer_commands)} reviewer-requested validation commands."
             )
         accepted_all_passed = bool(accepted_results) and all(
             isinstance(result, dict)
@@ -6670,6 +7352,7 @@ class FeedbackLoopAgent:
         if not accepted_all_passed:
             findings.extend(self._command_result_findings(validation_results, "Reviewer validation"))
         findings.extend(self._command_result_findings(accepted_results, "Accepted validation rerun"))
+        findings.extend(self._command_result_findings(reviewer_results, "Reviewer-requested validation"))
         findings.extend(self._git_diff_findings(step, implementation, evidence))
         return findings
 
@@ -6811,6 +7494,16 @@ class FeedbackLoopAgent:
             if not accepted_all_passed:
                 findings.extend(self._command_result_findings(planned_results, f"Step {step_id} final validation"))
             findings.extend(self._command_result_findings(accepted_results, f"Step {step_id} accepted validation"))
+        reviewer_commands = evidence.get("reviewer_validation_commands") or []
+        reviewer_results = evidence.get("reviewer_validation_results") or []
+        if len(reviewer_results) != len(reviewer_commands):
+            findings.append(
+                "Final review produced "
+                f"{len(reviewer_results)} results for {len(reviewer_commands)} reviewer-requested commands."
+            )
+        findings.extend(
+            self._command_result_findings(reviewer_results, "Final reviewer-requested validation")
+        )
         return list(dict.fromkeys(findings))
 
 
@@ -6868,6 +7561,14 @@ class FeedbackLoopAgent:
 
     def _status(self, review: dict[str, Any]) -> str:
         status = str(review.get("status") or "").strip()
+        if status == HARNESS_PROTOCOL_ERROR_STATUS:
+            return HARNESS_PROTOCOL_ERROR_STATUS
+        if review.get("review_protocol_error") is True and status not in {
+            "resolved",
+            "resolved_with_compromise",
+            "skipped_with_note",
+        }:
+            return HARNESS_PROTOCOL_ERROR_STATUS
         if status in REVIEW_STATUSES:
             return status
         return "needs_rework"
@@ -6880,7 +7581,12 @@ class FeedbackLoopAgent:
         }
         status = self._status(review)
         review["status"] = status
-        review["needs_rework"] = status not in {"resolved", "skipped_with_note", "resolved_with_compromise"}
+        review["needs_rework"] = status not in {
+            "resolved",
+            "skipped_with_note",
+            "resolved_with_compromise",
+            HARNESS_PROTOCOL_ERROR_STATUS,
+        }
         review.setdefault("summary", "no summary")
         for key in (
             "required_changes",
@@ -6888,6 +7594,7 @@ class FeedbackLoopAgent:
             "verification_evidence",
             "evidence_reviewed",
             "runbook_updates",
+            "validation_commands",
         ):
             review[key] = self._as_list_field(review.get(key))
         return review
@@ -6906,6 +7613,16 @@ class FeedbackLoopAgent:
             status = "cannot_resolve"
             note = f"Bounded retries exhausted for {scope}; cannot resolve. Last review: {summary}"
         return {"status": status, "note": note}
+
+    @staticmethod
+    def _protocol_error_resolution(scope: str, review: dict[str, Any]) -> dict[str, str]:
+        """Record missing machine control state without judging task feasibility."""
+        summary = str(review.get("summary") or "No parseable reviewer decision was available.")
+        return {
+            "status": HARNESS_PROTOCOL_ERROR_STATUS,
+            "note": f"Protocol validation failed for {scope}; no task verdict was accepted. {summary}",
+            "provenance": "harness_protocol_validation",
+        }
 
     def _git_baseline_commit(self) -> dict[str, Any]:
         if not self.config.git_policy.enabled:
@@ -6966,10 +7683,14 @@ class FeedbackLoopAgent:
             item for item in step_results
             if str(item.get("status")) not in {"superseded", "rescheduled"}
         ]
+        final_status = self._status(final_review or {})
+        if final_status == HARNESS_PROTOCOL_ERROR_STATUS:
+            return HARNESS_PROTOCOL_ERROR_STATUS
         if not effective_results:
             return "no_steps"
         statuses = {item["status"] for item in effective_results}
-        final_status = self._status(final_review or {})
+        if HARNESS_PROTOCOL_ERROR_STATUS in statuses:
+            return HARNESS_PROTOCOL_ERROR_STATUS
         if statuses == {"resolved"} and final_status in {"resolved", "resolved_with_compromise", "skipped_with_note"}:
             iterations = (final_review or {}).get("iterations") or []
             last_review = iterations[-1].get("review", {}) if iterations else {}

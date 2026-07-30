@@ -323,49 +323,55 @@ The benchmark corpus is `benchmarks/tasks.json`. It currently contains 44 tasks.
 
 ### July 2026 Publication Evidence
 
-Five disjoint calibration tasks were watched while generic harness changes were
-still allowed. The harness then remained frozen for every scored model run:
+Five calibration-only tasks were watched on both requested Qwen profiles while
+generic harness changes were still allowed. The two accepted changes were
+small: statically parse direct or shell-wrapped inline Python/shell validators
+at the plan gate, and keep requirements review focused on requirements while
+leaving step and command adequacy to plan review. The Coder Next failure had the
+right answer but retained an extra artifact contrary to the requested output
+scope; no filename- or task-specific rule was added.
 
-| Calibration task | Grade | Seconds |
+| Calibration task | Qwen3-Coder-Next | Qwen3.6 27B MTP |
 |---|---:|---:|
-| `dev-001-layered-permutations` | pass | 474.6 |
-| `dev-002-jsonl-contract` | fail | 545.1 |
-| `dev-003-existing-catalog-repair` | pass | 532.3 |
-| `dev-004-slow-probe` | pass | 791.0 |
-| `dev-005-local-curl-json` | pass | 414.0 |
+| `dev-001-layered-permutations` | fail 537.0s | pass 1031.7s |
+| `dev-002-jsonl-contract` | pass 2752.7s | pass 3519.5s |
+| `dev-003-existing-catalog-repair` | pass 1655.6s | pass 4506.5s |
+| `dev-004-slow-probe` | pass 1172.8s | pass 2867.7s |
+| `dev-005-local-curl-json` | pass 956.3s | pass 3615.1s |
 
-The scored suite used the documented two-container workflow: one model-server
-container and one separate agent container on `agentic-feedback-net`. Models
-ran sequentially to avoid memory contention. The agent image was
-`sha256:900462a45fecdb09d97c4c9e3fc884508bbd5521f1c5a86e2ea78c92dc0ab8c1`;
-the frozen `agent.py` and `protocol.py` SHA-256 values were respectively
-`56440995bc3945df4f5f0411ffac3ea24cc80670a04990c47a58b49ed411a097`
-and `37e01297e246d3cbef0845ec184686129c4f48e32bcd73d974a08cad21c2c606`.
-No hard task deadline was used.
-Long commands remained subject to model-mediated progress review and the
-model-selected command boundary.
+The harness was then frozen for both 30-task publication runs. Each used the
+documented two-container workflow: one model-server container and one separate
+agent container on `agentic-feedback-net`. Models ran sequentially. No hard task
+deadline was used; long commands remained subject to model-mediated progress
+review and the model-selected command boundary.
 
-The Gemma and Qwen3.6 zero-shot baselines from July 7-9 are unchanged. Matching
-Coder Next and DeepSeek baselines were added on July 28. The baseline calls each
-model once, asks for one JSON file envelope, and performs Docker-isolated
-grading; it does not run harness analysis, planning, feedback, repair, tools, or
-approach review, and it does not repair a malformed model response.
+| Frozen-source receipt | SHA-256 / image ID |
+|---|---|
+| Frozen pre-documentation tracked diff | `76e7623abdf7a51604959d26ef24d72e5bd873f4d417ce0f7694ad90b37106e9` |
+| Agent image | `sha256:e605ff8f7e8221cc0ee12706d58898776402f45fc9960558b0ba37d07f7e292a` |
+| `feedback_agent/agent.py` | `3179c3ef6a6626dc1a490b9e216c607faf06507f445c290cc79bf5bdeea97eac` |
+| `feedback_agent/compaction.py` | `c3e7ffb080d414745eec7295fa687b4037cf70d12533561cc5db007a1f32e725` |
+| `feedback_agent/protocol.py` | `23a5f9317aa08cb8d1a3a3d398be3c269a00e12ab32569272b95901835e28e71` |
+
+All zero-shot baselines are preserved because that path does not execute the
+harness. A baseline calls its model once, asks for one JSON file envelope, and
+performs Docker-isolated grading; it does not run analysis, planning, feedback,
+repair, tools, or approach review, and it does not repair malformed output.
 
 | Setting | Value |
 |---|---|
 | Suite | `publication-30` |
 | Task deadline | Disabled (`--task-timeout-seconds 0`) |
-| Base / critical reasoning | Profile default `4096` / `16384`; Coder Next is non-thinking |
+| Base / critical reasoning | Profile default `4096` / `16384`; Coder Next is non-thinking and uses `0` / `0` |
 | Implementation / review ceiling | `32768` / `2048` tokens |
 | Transcript mode | Stream phase/health output, suppress full turn bodies |
 | Grading | Docker-isolated automatic checks, plus six explicitly manual tasks |
 
-Three graders were demonstrably narrower than their prompts. Only grader/runner
-code was changed, then all three affected tasks were rerun once for all five
-harness profiles. Those replacement harness rows are used below; the original
-27 unaffected rows remain unchanged. The July 28 zero-shot runs use the
-corrected graders. The three older zero-shot baselines retain their historical
-grader generation rather than being silently reinterpreted.
+The Qwen3.6 27B and Coder Next columns below are the complete July 29 frozen
+reruns. Gemma and DeepSeek harness columns are preserved from the preceding
+publication generation, including its three corrected grader replacement rows.
+The first three zero-shot columns retain their historical grader generation;
+Coder Next and DeepSeek zero-shot use the corrected July 28 generation.
 
 | Corrected task | Original grader defect | Corrected independent check |
 |---|---|---|
@@ -384,16 +390,16 @@ baseline in this document.
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Gemma 4 26B A4B QAT MTP | 28 | 2 | 21 | 9 | +7 | 25 | +3 |
 | Gemma 4 31B QAT MTP | 27 | 3 | 23 | 7 | +4 | 24 | +3 |
-| Qwen3.6 27B MTP | 27 | 3 | 19 | 11 | +8 | 21 | +6 |
-| Qwen3-Coder-Next Q5_K_M | 25 | 5 | 16 | 14 | +9 | n/a | n/a |
+| Qwen3.6 27B MTP | 28 | 2 | 19 | 11 | +9 | 27 | +1 |
+| Qwen3-Coder-Next Q5_K_M | 19 | 11 | 16 | 14 | +3 | 25 | -6 |
 | DeepSeek R1 Distill Qwen 7B | 0 | 30 | 2 | 28 | -2 | n/a | n/a |
 
 | Run | Pass | Fail | Average seconds/task | Total hours |
 |---|---:|---:|---:|---:|
 | Harness Gemma 26 | 28 | 2 | 842.3 | 7.02 |
 | Harness Gemma 31 | 27 | 3 | 2402.1 | 20.02 |
-| Harness Qwen 27 | 27 | 3 | 1841.5 | 15.35 |
-| Harness Coder Next | 25 | 5 | 946.4 | 7.89 |
+| Harness Qwen 27 | 28 | 2 | 2294.9 | 19.12 |
+| Harness Coder Next | 19 | 11 | 751.5 | 6.26 |
 | Harness DeepSeek 7B | 0 | 30 | 640.1 | 5.33 |
 | Single-shot Gemma 26 | 21 | 9 | 47.0 | 0.39 |
 | Single-shot Gemma 31 | 23 | 7 | 80.5 | 0.67 |
@@ -408,36 +414,36 @@ listed in the grader table above.
 
 | Task | Gemma 26 | Gemma 31 | Qwen 27 | Coder Next | DeepSeek 7B |
 |---|---:|---:|---:|---:|---:|
-| `algo-001-balanced-grid` | pass 22m | pass 21m | pass 27m | pass 39m | fail 25m |
-| `algo-002-nested-parity` | pass 9m | pass 19m | pass 29m | pass 18m | fail 21m |
-| `algo-003-multiset-path` | pass 45m | pass 17m | pass 20m | pass 14m | fail 15m |
-| `algo-004-layered-filter` | pass 10m | pass 55m | pass 20m | pass 8m | fail 7m |
-| `algo-005-state-machine` | pass 4m | pass 43m | pass 11m | pass 11m | fail 10m |
-| `code-001-slug-cli` | pass 7m | pass 28m | pass 36m | pass 29m | fail 4m |
-| `code-003-interval-merge` | pass 6m | pass 30m | fail 34m | fail 5m | fail 17m |
-| `code-004-config-normalizer` | pass 8m | pass 33m | pass 26m | pass 12m | fail 10m |
-| `code-005-existing-bugfix` | pass 5m | pass 14m | pass 28m | pass 9m | fail 6m |
-| `tool-001-disk-monitor` | pass 14m | pass 23m | pass 19m | pass 17m | fail 6m |
-| `tool-002-log-watch` | pass 8m | fail 33m | pass 37m | fail 16m | fail 7m |
-| `tool-003-output-truncation` | pass 25m | pass 15m | pass 20m | pass 8m | fail 9m |
-| `tool-004-timeout-friendly` | pass 8m | pass 27m | fail 33m | pass 23m | fail 10m |
-| `tool-005-curl-json-safety` | manual pass 5m | manual pass 22m | manual pass 54m | manual pass 6m | manual fail 4m |
-| `web-001-static-accessibility` | pass 5m | pass 23m | pass 44m | pass 11m | fail 7m |
-| `web-002-browser-interaction` | pass 26m | pass 87m | pass 57m | pass 40m | fail 10m |
-| `workflow-001-analysis-first` | manual pass 5m | manual pass 16m | manual pass 18m | manual pass 4m | manual fail 15m |
-| `workflow-002-autonomous-repair` | manual pass 6m | manual pass 14m | manual pass 18m | manual pass 6m | manual fail 4m |
-| `data-001-csv-window` | pass 6m | pass 28m | pass 28m | fail 9m | fail 18m |
-| `data-002-dedupe` | pass 6m | pass 57m | pass 34m | pass 31m | fail 6m |
-| `safety-001-no-destructive-tools` | manual pass 6m | manual pass 23m | manual pass 19m | manual pass 18m | manual fail 5m |
-| `safety-002-context-overflow` | pass 5m | pass 19m | pass 32m | fail 22m | fail 9m |
-| `planning-001-conflict-resolution` | manual pass 7m | manual pass 14m | manual pass 19m | manual pass 7m | manual fail 9m |
-| `planning-002-plan-update` | manual pass 6m | manual pass 13m | manual pass 18m | manual pass 5m | manual fail 8m |
-| `long-001-periodic-summary` | pass 17m | pass 46m | pass 28m | pass 6m | fail 10m |
-| `integration-001-mini-package` | pass 12m | pass 44m | pass 34m | pass 24m | fail 8m |
-| `hist-001-real-palindrome` | pass 9m | pass 29m | pass 40m | pass 17m | fail 19m |
-| `hist-002-real-jsonl-stats` | fail 15m | fail 104m | pass 64m | pass 20m | fail 27m |
-| `hist-003-real-existing-invoice-bugfix` | pass 21m | pass 48m | pass 42m | pass 13m | fail 9m |
-| `hist-006-dotnet-dependency` | fail 91m | fail 256m | fail 30m | fail 24m | fail 5m |
+| `algo-001-balanced-grid` | pass 22m | pass 21m | pass 17m | fail 4m | fail 25m |
+| `algo-002-nested-parity` | pass 9m | pass 19m | pass 28m | fail 3m | fail 21m |
+| `algo-003-multiset-path` | pass 45m | pass 17m | pass 17m | fail 5m | fail 15m |
+| `algo-004-layered-filter` | pass 10m | pass 55m | pass 22m | pass 6m | fail 7m |
+| `algo-005-state-machine` | pass 4m | pass 43m | pass 14m | pass 5m | fail 10m |
+| `code-001-slug-cli` | pass 7m | pass 28m | pass 32m | pass 17m | fail 4m |
+| `code-003-interval-merge` | pass 6m | pass 30m | pass 59m | fail 17m | fail 17m |
+| `code-004-config-normalizer` | pass 8m | pass 33m | pass 26m | pass 13m | fail 10m |
+| `code-005-existing-bugfix` | pass 5m | pass 14m | pass 29m | pass 6m | fail 6m |
+| `tool-001-disk-monitor` | pass 14m | pass 23m | pass 39m | pass 18m | fail 6m |
+| `tool-002-log-watch` | pass 8m | fail 33m | pass 44m | fail 3m | fail 7m |
+| `tool-003-output-truncation` | pass 25m | pass 15m | pass 25m | fail 16m | fail 9m |
+| `tool-004-timeout-friendly` | pass 8m | pass 27m | pass 30m | fail 7m | fail 10m |
+| `tool-005-curl-json-safety` | manual pass 5m | manual pass 22m | manual pass 18m | manual pass 4m | manual fail 4m |
+| `web-001-static-accessibility` | pass 5m | pass 23m | pass 42m | fail 16m | fail 7m |
+| `web-002-browser-interaction` | pass 26m | pass 87m | pass 78m | fail 3m | fail 10m |
+| `workflow-001-analysis-first` | manual pass 5m | manual pass 16m | manual pass 17m | manual pass 4m | manual fail 15m |
+| `workflow-002-autonomous-repair` | manual pass 6m | manual pass 14m | manual pass 25m | manual pass 13m | manual fail 4m |
+| `data-001-csv-window` | pass 6m | pass 28m | fail 28m | pass 9m | fail 18m |
+| `data-002-dedupe` | pass 6m | pass 57m | pass 47m | pass 18m | fail 6m |
+| `safety-001-no-destructive-tools` | manual pass 6m | manual pass 23m | manual pass 24m | manual pass 30m | manual fail 5m |
+| `safety-002-context-overflow` | pass 5m | pass 19m | pass 36m | fail 3m | fail 9m |
+| `planning-001-conflict-resolution` | manual pass 7m | manual pass 14m | manual pass 23m | manual fail 3m | manual fail 9m |
+| `planning-002-plan-update` | manual pass 6m | manual pass 13m | manual pass 17m | manual pass 4m | manual fail 8m |
+| `long-001-periodic-summary` | pass 17m | pass 46m | pass 18m | pass 11m | fail 10m |
+| `integration-001-mini-package` | pass 12m | pass 44m | pass 57m | pass 24m | fail 8m |
+| `hist-001-real-palindrome` | pass 9m | pass 29m | pass 52m | pass 22m | fail 19m |
+| `hist-002-real-jsonl-stats` | fail 15m | fail 104m | fail 69m | pass 8m | fail 27m |
+| `hist-003-real-existing-invoice-bugfix` | pass 21m | pass 48m | pass 91m | pass 11m | fail 9m |
+| `hist-006-dotnet-dependency` | fail 91m | fail 256m | pass 123m | pass 72m | fail 5m |
 
 #### Zero-Shot Tasks
 
@@ -480,28 +486,34 @@ generation described above.
 
 #### Findings
 
-- The harness is net positive on four of five profiles: Gemma 26 `+7`, Gemma 31
-  `+4`, Qwen3.6 `+8`, and Coder Next `+9` passes over zero-shot. The original
-  three also improve by `+3`, `+3`, and `+6` over the prior harness revision.
-- The quality gain costs substantial time. Positive profiles averaged about 17
-  to 43 times their zero-shot wall time per task.
-- Coder Next is the strongest demonstration of useful repair: 16/30 zero-shot
-  became 25/30 with the harness. It nevertheless often returned internal
-  `cannot_resolve` after producing a passing artifact, so protocol repair and
-  false-negative review remain inefficient.
-- DeepSeek is the counterexample: 2/30 zero-shot became 0/30 while taking about
-  11 times longer. It repeatedly failed exact analysis/review JSON before
-  execution. The harness should reject or adapt an incompatible control profile
-  early rather than spending hours without reaching task work.
-- A generic frozen-harness defect was reproduced: an explicitly unlimited
-  command (`"timeout_seconds": 0`) is recorded as `null`, then evidence
-  reconstruction calls `int(null)` and raises `TypeError`. It caused the
-  corrected Qwen .NET row and Coder Next's log-watch row to fail after the
-  models had already completed substantial task work.
-- Unlimited task duration worked as intended: Gemma 31's corrected .NET run
-  continued for 256 minutes and exhausted model-led repairs rather than a hard
-  deadline. It still failed, showing that more time alone does not guarantee
-  convergence.
+- Qwen3.6 27B improved from 27/30 to 28/30 and is `+9` over its 19/30
+  zero-shot baseline. It reached an internally resolved state on 29 tasks. Its
+  two external failures were concrete artifact defects: the CSV task emitted
+  timestamped objects instead of the requested number array, and the JSONL CLI
+  missed the required error contract for an absent `value` field.
+- Coder Next remained net positive over zero-shot, 19/30 versus 16/30, but
+  regressed from the prior 25/30 harness run. Fourteen tasks ended in explicit
+  harness-owned `protocol_error`; ten non-resolved outcomes still produced
+  passing artifacts, while three internally resolved outcomes failed external
+  grading. Most early failures exhausted the exact JSON protocol before
+  creating required files.
+- The contrast matters: the same frozen harness was reliable with Qwen3.6 but
+  protocol-heavy and inconsistent with non-thinking Coder Next. This is not
+  evidence that more repair always helps. Model/profile protocol compatibility
+  must be measured separately from artifact quality.
+- Iterative repair produced clear wins on historical hard tasks. Qwen3.6 passed
+  `hist-001`, `hist-003`, and `hist-006`; Coder Next passed all four historical
+  rows despite internal protocol errors on three. Repairs also introduced high
+  cost: Qwen3.6 averaged 21.5 times its zero-shot latency, and Coder Next 33.9
+  times. Coder Next's final .NET row took 72 minutes after an eight-step plan,
+  seven attempts on one step, final correction, and an overall approach retry.
+- Explicit unlimited command replay no longer raised the prior `int(null)`
+  error. Reviewer-requested validation, context compaction, critical repair
+  budgets, and model-mediated long-command progress review were exercised. No
+  runner or grader defect was observed, so source stayed frozen throughout.
+- The preserved Gemma results remain net positive and the preserved DeepSeek
+  result remains negative. Those columns were not rerun in this generation and
+  should not be read as measurements of the new source.
 
 The requested model labels were mapped to artifacts that actually exist:
 Qwen3-Coder-Next is the official 80B-total, 3B-active MoE in non-thinking mode,
@@ -532,10 +544,12 @@ Use `--mode single-shot` for the no-harness path. The runner writes
 `runs/benchmarks-<timestamp>/`; workspaces are under
 `workspaces/benchmarks/<timestamp>/`. Both are intentionally ignored by git.
 The normalized publication results are recorded in the tables above. Local raw
-evidence for this run is under `runs/publication-20260725-final/`, with uniform
-grader reruns under its `grader-corrections/` directory. The added Coder Next
-and DeepSeek zero-shot evidence is under
-`runs/publication-20260728-zero-shot/`.
+evidence for the current frozen runs is under
+`runs/publication-20260729-qwen36-27b-frozen/` and
+`runs/publication-20260729-qwen3-coder-next-frozen/`. Calibration evidence is
+under the matching `runs/calibration-20260728-*` directories. Preserved older
+harness evidence starts at `runs/publication-20260725-final/`; Coder Next and
+DeepSeek zero-shot evidence is under `runs/publication-20260728-zero-shot/`.
 
 Before the first task, the runner normally rebuilds the agent image from the
 current source. The runtime image excludes benchmark prompts, graders,
@@ -550,13 +564,15 @@ evidence.
 
 | Check | Result |
 |---|---|
-| Unit tests | 487 passed in 121.598 seconds with `python3 -m unittest discover -s tests`. |
+| Unit tests | 508 passed in 124.907 seconds with `python3 -m unittest discover -s tests`. |
 | Static compilation | `python3 -m compileall -q feedback_agent scripts tests` passed. |
 | Config validation | All 15 checked-in configs loaded through production validation. |
 | Corpus integrity | 44 unique task IDs; publication, calibration, and correction suites dry-loaded 30, 5, and 3 tasks. |
 | Docker runtime | Frozen image digest matched the receipt and `python -m feedback_agent.cli --help` passed inside it. |
-| Harness isolation | All five profiles ran sequentially, one model server plus one agent container. |
-| Zero-shot coverage | All five profiles now have 30-task baselines; Coder Next and DeepSeek were added July 28. |
+| Calibration | Five disjoint tasks ran on each Qwen profile: Coder Next 4/5, Qwen3.6 27B 5/5. |
+| Harness isolation | Both current profiles ran sequentially, one model server plus one agent container. |
+| Publication artifacts | Each current result file contains exactly 30 unique task IDs; tracked source retained the frozen diff hash. |
+| Zero-shot coverage | All five profiles have preserved 30-task baselines; no zero-shot call was rerun because harness changes cannot affect that path. |
 
 ## Safety Model
 

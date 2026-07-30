@@ -8,6 +8,7 @@ from typing import Any
 
 HARNESS_EFFECTIVE_REVIEW_MARKER = "HARNESS_EFFECTIVE_REVIEW:"
 HARNESS_RESPONSE_OMISSION_MARKER = "HARNESS_RESPONSE_OMISSION:"
+HARNESS_PROTOCOL_ERROR_STATUS = "protocol_error"
 VALIDATED_FEEDBACK_DECISION_MARKER = "VALIDATED_FEEDBACK_DECISION:"
 
 FEEDBACK_REPAIR_PHASE_SUFFIXES = ("_JSON_REPAIR", "_MINIMAL_JSON_REPAIR")
@@ -115,7 +116,10 @@ REVIEW_STATUSES = frozenset().union(*(
 ))
 
 
-CONTROL_STATUS_VALUES = frozenset().union(*PHASE_STATUS_VALUES.values())
+CONTROL_STATUS_VALUES = (
+    frozenset().union(*PHASE_STATUS_VALUES.values())
+    | frozenset({HARNESS_PROTOCOL_ERROR_STATUS})
+)
 
 
 def review_directive_text(marker: str, instruction: str, review: dict[str, Any]) -> str:

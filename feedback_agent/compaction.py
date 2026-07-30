@@ -13,6 +13,7 @@ from .protocol import (
     FEEDBACK_PHASES,
     FEEDBACK_REPAIR_PHASE_SUFFIXES,
     HARNESS_EFFECTIVE_REVIEW_MARKER,
+    HARNESS_PROTOCOL_ERROR_STATUS,
     HARNESS_RESPONSE_OMISSION_MARKER,
     PHASE_STATUS_VALUES,
     VALIDATED_FEEDBACK_DECISION_MARKER,
@@ -623,7 +624,12 @@ def latest_control_state(turns: list[Turn]) -> str:
                 lines,
                 label,
                 review_turn.content,
-                allowed_statuses=PHASE_STATUS_VALUES[review_phase],
+                allowed_statuses=(
+                    PHASE_STATUS_VALUES[review_phase]
+                    | frozenset({HARNESS_PROTOCOL_ERROR_STATUS})
+                    if review_turn.content.startswith(HARNESS_EFFECTIVE_REVIEW_MARKER)
+                    else PHASE_STATUS_VALUES[review_phase]
+                ),
             )
         else:
             raw_final_response = _last_paired_feedback_response(
@@ -678,15 +684,19 @@ def latest_control_state(turns: list[Turn]) -> str:
                 marker = "Last harness effective review"
             else:
                 marker = "Last reviewer response"
+            if source_phase is None:
+                allowed_statuses = CONTROL_STATUS_VALUES
+            elif source_turn.content.startswith(HARNESS_EFFECTIVE_REVIEW_MARKER):
+                allowed_statuses = PHASE_STATUS_VALUES[source_phase] | frozenset({
+                    HARNESS_PROTOCOL_ERROR_STATUS,
+                })
+            else:
+                allowed_statuses = PHASE_STATUS_VALUES[source_phase]
             _append_reviewer_state(
                 lines,
                 marker,
                 source_turn.content,
-                allowed_statuses=(
-                    PHASE_STATUS_VALUES[source_phase]
-                    if source_phase is not None
-                    else CONTROL_STATUS_VALUES
-                ),
+                allowed_statuses=allowed_statuses,
             )
         elif _last_paired_feedback_response(
             active_turns,

@@ -33,6 +33,7 @@ from feedback_agent.agent import (
     IMPLEMENTATION_CONTRACT,
     JSON_OUTPUT_RULES,
     PLAN_REFINEMENT_CONTRACT,
+    PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
     REQUIREMENTS_CONTRACT,
     RESEARCH_DECISION_CONTRACT,
     REVIEW_DECISION_OUTPUT_GUIDANCE,
@@ -64,6 +65,7 @@ from feedback_agent.llm import OpenAICompatClient, ModelRequestHeartbeat, ModelR
 from feedback_agent.model_profiles import resolve_profile
 from feedback_agent.protocol import (
     HARNESS_EFFECTIVE_REVIEW_MARKER,
+    HARNESS_PROTOCOL_ERROR_STATUS,
     HARNESS_RESPONSE_OMISSION_MARKER,
     VALIDATED_FEEDBACK_DECISION_MARKER,
 )
@@ -2151,6 +2153,40 @@ class FeedbackLoopAgentTests(unittest.TestCase):
         self.assertIn("deterministic evidence still fails", state)
         self.assertNotIn("raw reviewer pass", state)
 
+    def test_latest_control_state_preserves_harness_protocol_error(self) -> None:
+        turns = [
+            Turn("user", "IMPLEMENTATION_AGENT_REQUEST:\nIMPLEMENT_PLAN_STEP_PHASE step_id=S6 attempt=2"),
+            Turn("user", "FEEDBACK_AGENT_REQUEST:\nSTEP_REVIEW_PHASE"),
+            Turn(
+                "user",
+                HARNESS_EFFECTIVE_REVIEW_MARKER
+                + '\n{"phase":"STEP_REVIEW_PHASE","status":"protocol_error",'
+                '"needs_rework":false,"summary":"no validated reviewer decision"}',
+            ),
+        ]
+
+        state = latest_control_state(turns)
+
+        self.assertIn("Last harness effective review: status=protocol_error", state)
+        self.assertIn("no validated reviewer decision", state)
+
+    def test_latest_control_state_preserves_final_review_protocol_error(self) -> None:
+        turns = [
+            Turn("user", "IMPLEMENTATION_AGENT_REQUEST:\nIMPLEMENT_PLAN_STEP_PHASE step_id=S6 attempt=2"),
+            Turn("user", "FEEDBACK_AGENT_REQUEST:\nFINAL_PROJECT_REVIEW_PHASE"),
+            Turn(
+                "user",
+                HARNESS_EFFECTIVE_REVIEW_MARKER
+                + '\n{"phase":"FINAL_PROJECT_REVIEW_PHASE","status":"protocol_error",'
+                '"needs_rework":false,"summary":"no validated final-review decision"}',
+            ),
+        ]
+
+        state = latest_control_state(turns)
+
+        self.assertIn("Harness effective final project review: status=protocol_error", state)
+        self.assertIn("no validated final-review decision", state)
+
     def test_latest_control_state_rejects_wrapped_final_review_json(self) -> None:
         turns = [
             Turn("user", "IMPLEMENTATION_AGENT_REQUEST:\nIMPLEMENT_PLAN_STEP_PHASE step_id=S6 attempt=2"),
@@ -2889,6 +2925,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             self.assertEqual(review["status"], "resolved")
             prompt = agent.feedback_client.calls[-1]["messages"][-1]["content"]
             self.assertIn("Do not demand later-phase work", " ".join(prompt.split()))
+            self.assertIn("semantic command adequacy belong to the separate plan-validation phase", prompt)
             self.assertNotIn("Deliverable evidence review", prompt)
             self.assertNotIn("Completion countercheck", prompt)
 
@@ -8606,7 +8643,7 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                 {"status": "cannot_resolve", "iterations": []},
             )
 
-            self.assertEqual(review["status"], "cannot_resolve")
+            self.assertEqual(review["status"], HARNESS_PROTOCOL_ERROR_STATUS)
             self.assertEqual(review["decision"], "stop_unresolved")
             transcript = (workspace / ".agent_state" / "conversation.jsonl").read_text(encoding="utf-8")
             self.assertIn(HARNESS_EFFECTIVE_REVIEW_MARKER, transcript)
@@ -9109,6 +9146,72 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                 agent._repair_progress_signature(second),
             )
 
+    def test_repair_progress_signature_is_independent_from_artifact_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            failing_result = {
+                "command": ["python", "validate.py"],
+                "returncode": 1,
+                "expected_returncode": 0,
+                "stderr": "same observable failure",
+            }
+            first = {
+                "status": "needs_rework",
+                "feedback_tool_evidence": {
+                    "workspace_files": [{
+                        "path": "main.py",
+                        "content": "print('first repair')\n",
+                        "size": 22,
+                        "truncated": False,
+                    }],
+                    "validation_results": [failing_result],
+                },
+            }
+            second = {
+                "status": "needs_rework",
+                "feedback_tool_evidence": {
+                    "workspace_files": [{
+                        "path": "main.py",
+                        "content": "print('different repair')\n",
+                        "size": 26,
+                        "truncated": False,
+                    }],
+                    "validation_results": [failing_result],
+                },
+            }
+
+            self.assertEqual(
+                agent._repair_progress_signature(first),
+                agent._repair_progress_signature(second),
+            )
+            self.assertNotEqual(
+                agent._repair_artifact_signature(first),
+                agent._repair_artifact_signature(second),
+            )
+
+    def test_repair_progress_signature_is_empty_without_observable_validation_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            review = {
+                "status": "needs_rework",
+                "required_changes": ["Reviewer prose alone must not become a progress fingerprint."],
+                "feedback_tool_evidence": {
+                    "workspace_files": [{
+                        "path": "artifact.txt",
+                        "content": "manual-review artifact\n",
+                        "size": 23,
+                        "truncated": False,
+                    }],
+                },
+            }
+
+            self.assertEqual(agent._repair_progress_signature(review), "")
+            self.assertTrue(agent._repair_artifact_signature(review))
+
     def test_artifact_progress_checkpoint_survives_validator_churn(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -9190,6 +9293,182 @@ class FeedbackLoopAgentTests(unittest.TestCase):
             evidence = review["feedback_tool_evidence"]
             self.assertEqual(evidence["validation_results"][0]["returncode"], 0)
             self.assertIn("ok.txt", {item["path"] for item in evidence["workspace_files"]})
+
+    def test_step_reviewer_can_request_one_bounded_validation_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            command = ["python", "-c", "print('independent-check')"]
+            agent = load_test_agent(
+                root,
+                workspace,
+                feedback_responses=[
+                    json.dumps({
+                        "status": "needs_rework",
+                        "summary": "One acceptance criterion lacks independent evidence.",
+                        "required_changes": ["Run the smallest independent check."],
+                        "verification_evidence": [],
+                        "validation_commands": [command],
+                    }),
+                    json.dumps({
+                        "status": "resolved",
+                        "summary": "The requested check supplied the missing evidence.",
+                        "required_changes": [],
+                        "verification_evidence": ["independent-check returned exit code 0"],
+                        "validation_commands": [],
+                    }),
+                ],
+            )
+            agent.config = replace(
+                agent.config,
+                git_policy=replace(agent.config.git_policy, enabled=False),
+            )
+            agent.initialize()
+            step = {
+                "id": "S1",
+                "title": "Review an artifact",
+                "description": "Confirm the current artifact behavior.",
+                "depends_on": [],
+                "acceptance_criteria": ["The requested behavior is independently checked."],
+                "validation_method": "Inspect the current artifact.",
+                "validation_commands": [],
+                "status": "pending",
+            }
+            agent.requirements = base_requirements("Reviewer-selected validation")
+            agent.plan_steps = [step]
+            run_calls: list[dict[str, Any]] = []
+
+            agent._step_feedback_tool_evidence = types.MethodType(
+                lambda self, current, implementation=None: {
+                    "kind": "step_validation",
+                    "step_id": current["id"],
+                    "workspace_files": [],
+                    "validation_commands": [],
+                    "validation_results": [],
+                    "accepted_validation_commands": [],
+                    "accepted_validation_results": [],
+                    "git": {"enabled": False},
+                },
+                agent,
+            )
+
+            def run_verified(
+                self: FeedbackLoopAgent,
+                commands: list[Any],
+                *,
+                source: str,
+                context: dict[str, Any],
+            ) -> list[dict[str, Any]]:
+                run_calls.append({"commands": commands, "source": source, "context": context})
+                return [{
+                    "command": command,
+                    "returncode": 0,
+                    "expected_returncode": 0,
+                    "returncode_matches_expected": True,
+                    "stdout": "independent-check\n",
+                    "stderr": "",
+                    "timed_out": False,
+                }]
+
+            agent._run_verified_commands = types.MethodType(run_verified, agent)
+
+            review = agent._step_review_pass(
+                step,
+                1,
+                {"written": [], "commands": [], "raw": {"test_evidence": []}},
+                "hard_pushback",
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertEqual(len(run_calls), 1)
+            self.assertEqual(run_calls[0]["source"], "step_reviewer_requested_validation")
+            self.assertEqual(review["feedback_tool_evidence"]["reviewer_validation_results"][0]["returncode"], 0)
+            self.assertEqual(review["reviewer_validation_request"]["result_count"], 1)
+            second_prompt = agent.feedback_client.calls[1]["messages"][-1]["content"]
+            self.assertIn("reviewer_validation_results", second_prompt)
+            self.assertIn("independent-check", second_prompt)
+
+    def test_step_reviewer_second_validation_request_is_not_executed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            first_command = ["python", "-c", "print('first')"]
+            second_command = ["python", "-c", "print('second')"]
+            agent = load_test_agent(
+                root,
+                workspace,
+                feedback_responses=[
+                    json.dumps({
+                        "status": "needs_rework",
+                        "summary": "Request one focused check.",
+                        "required_changes": ["Run the first check."],
+                        "validation_commands": [first_command],
+                    }),
+                    json.dumps({
+                        "status": "needs_rework",
+                        "summary": "Request another check.",
+                        "required_changes": ["Run a second check."],
+                        "validation_commands": [second_command],
+                    }),
+                ],
+            )
+            agent.config = replace(
+                agent.config,
+                git_policy=replace(agent.config.git_policy, enabled=False),
+            )
+            agent.initialize()
+            step = {
+                "id": "S1",
+                "title": "Bound reviewer validation",
+                "description": "Keep independent validation bounded.",
+                "depends_on": [],
+                "acceptance_criteria": ["Only one requested round runs."],
+                "validation_method": "Inspect supplied evidence.",
+                "validation_commands": [],
+                "status": "pending",
+            }
+            agent.requirements = base_requirements("Bound reviewer validation")
+            agent.plan_steps = [step]
+            run_calls: list[list[Any]] = []
+            agent._step_feedback_tool_evidence = types.MethodType(
+                lambda self, current, implementation=None: {
+                    "kind": "step_validation",
+                    "step_id": current["id"],
+                    "workspace_files": [],
+                    "validation_commands": [],
+                    "validation_results": [],
+                    "accepted_validation_commands": [],
+                    "accepted_validation_results": [],
+                    "git": {"enabled": False},
+                },
+                agent,
+            )
+            agent._run_verified_commands = types.MethodType(
+                lambda self, commands, **_kwargs: run_calls.append(commands) or [{
+                    "command": first_command,
+                    "returncode": 0,
+                    "expected_returncode": 0,
+                    "returncode_matches_expected": True,
+                    "stdout": "first\n",
+                    "stderr": "",
+                    "timed_out": False,
+                }],
+                agent,
+            )
+
+            review = agent._step_review_pass(
+                step,
+                1,
+                {"written": [], "commands": [], "raw": {"test_evidence": []}},
+                "hard_pushback",
+            )
+
+            self.assertEqual(run_calls, [[first_command]])
+            self.assertEqual(review["status"], "needs_rework")
+            self.assertTrue(any(
+                "one-round evidence limit" in finding
+                for finding in review["deterministic_evidence_findings"]
+            ))
 
     def test_compact_step_results_labels_claims_when_command_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -11285,6 +11564,53 @@ assert "ok" in stdout
             FeedbackLoopAgent._phase_contract_issue(payload, "FINAL_PROJECT_REVIEW_PHASE"),
         )
 
+    def test_reviewer_validation_commands_use_the_existing_argv_protocol(self) -> None:
+        payload = {
+            "status": "needs_rework",
+            "summary": "One independent observation is still needed.",
+            "required_changes": ["Run the requested observation."],
+            "validation_commands": ["python validate.py"],
+        }
+
+        issue = FeedbackLoopAgent._phase_contract_issue(payload, "STEP_REVIEW_PHASE")
+
+        self.assertIn("non-list, non-object item", issue)
+
+    def test_model_review_cannot_supply_harness_protocol_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = load_test_agent(root, root / "workspace")
+            payload = agent._extract_phase_json(
+                json.dumps({
+                    "status": "needs_rework",
+                    "summary": "A concrete gap remains.",
+                    "required_changes": ["Address the concrete gap."],
+                    "review_protocol_error": True,
+                    "status_provenance": "harness_protocol_validation",
+                    "_harness_effective_review": True,
+                }),
+                phase="STEP_REVIEW_PHASE",
+            )
+
+            self.assertEqual(agent._status(payload), "needs_rework")
+            self.assertNotIn("review_protocol_error", payload)
+            self.assertNotIn("status_provenance", payload)
+            self.assertNotIn("_harness_effective_review", payload)
+
+    def test_lifecycle_model_cannot_supply_harness_status(self) -> None:
+        normalized = FeedbackLoopAgent._normalize_phase_protocol(
+            {
+                "decision": "valid",
+                "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                "summary": "The validation lifecycle is sound.",
+                "required_changes": [],
+            },
+            phase="PLAN_VALIDATION_LIFECYCLE_PHASE",
+        )
+
+        self.assertNotIn("status", normalized)
+        self.assertEqual(normalized["decision"], "valid")
+
     def test_plan_lifecycle_review_is_needed_only_across_later_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -11383,6 +11709,47 @@ assert "ok" in stdout
 
             self.assertEqual(result, initial)
             self.assertEqual(len(agent.feedback_client.calls), 1)
+
+    def test_plan_validation_lifecycle_protocol_failure_is_not_a_task_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            malformed = "not lifecycle json"
+            agent = load_test_agent(
+                root,
+                workspace,
+                feedback_responses=[malformed, malformed, malformed],
+            )
+            agent.initialize()
+            initial = {
+                "status": "resolved",
+                "summary": "The semantic plan review passed.",
+                "required_changes": [],
+            }
+            prompt = {
+                "phase": "PLAN_VALIDATION_PHASE",
+                "original_request": "Create a checked artifact.",
+                "plan": [
+                    {"id": "S1", "validation_commands": [["test", "-f", "temporary.txt"]]},
+                    {"id": "S2", "description": "Produce the final state."},
+                ],
+                "expected_json": {},
+            }
+
+            result = agent._confirm_plan_validation_lifecycle(initial, prompt=prompt)
+
+            self.assertEqual(result["status"], HARNESS_PROTOCOL_ERROR_STATUS)
+            self.assertFalse(result["needs_rework"])
+            self.assertTrue(result["_harness_effective_review"])
+            self.assertEqual(result["status_provenance"], "harness_protocol_validation")
+            self.assertIn(
+                "plan_validation_lifecycle_protocol_failure",
+                agent.conversation.turns[-1].content,
+            )
+            self.assertNotIn(
+                VALIDATED_FEEDBACK_DECISION_MARKER,
+                "\n".join(turn.content for turn in agent.conversation.turns),
+            )
 
     def test_plan_validation_lifecycle_contract_rejects_conflicting_decision(self) -> None:
         payload = {
@@ -11705,12 +12072,97 @@ assert "ok" in stdout
                 feedback=True,
             )
 
-            self.assertEqual(review["status"], "cannot_resolve")
+            self.assertEqual(review["status"], HARNESS_PROTOCOL_ERROR_STATUS)
             self.assertTrue(review["review_protocol_error"])
-            self.assertIn("Reviewer protocol repair failed", "\n".join(review["required_changes"]))
+            self.assertFalse(review["needs_rework"])
+            self.assertIn("No reviewer decision was accepted", "\n".join(review["required_changes"]))
             self.assertNotIn("focused directly verifiable change", "\n".join(review["required_changes"]))
             self.assertIn("parse_error", review)
             self.assertIn("final_repair_error", review)
+            self.assertTrue(agent.conversation.turns[-1].content.startswith(HARNESS_EFFECTIVE_REVIEW_MARKER))
+            self.assertIn("harness_protocol_validation", agent.conversation.turns[-1].content)
+
+    def test_feedback_protocol_repairs_cap_reasoning_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                feedback_responses=[json.dumps({
+                    "status": "resolved",
+                    "summary": "The repaired response follows the review protocol.",
+                    "required_changes": [],
+                })],
+            )
+            agent.config = replace(
+                agent.config,
+                implementation_model=replace(
+                    agent.config.implementation_model,
+                    max_tokens=16384,
+                    reasoning_budget_tokens=2048,
+                    critical_reasoning_budget_tokens=8192,
+                ),
+            )
+            agent.initialize()
+
+            review = agent._extract_json_or_retry(
+                "not valid json",
+                phase="STEP_REVIEW_PHASE",
+                contract=(
+                    '{"status":"resolved|needs_rework","summary":"review summary",'
+                    '"required_changes":["specific change"]}'
+                ),
+                feedback=True,
+                critical_reasoning=True,
+            )
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertEqual(
+                agent.feedback_client.calls[0]["reasoning_budget_tokens"],
+                PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
+            )
+            self.assertFalse(agent.feedback_client.calls[0]["request_label"].endswith("/critical"))
+
+    def test_implementation_protocol_repairs_cap_reasoning_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(
+                root,
+                workspace,
+                implementation_responses=[json.dumps({
+                    "plan_note": "Returned the current step payload in the required format.",
+                    "files": [],
+                    "commands": [],
+                    "test_evidence": [],
+                    "resolution_request": "none",
+                })],
+            )
+            agent.config = replace(
+                agent.config,
+                implementation_model=replace(
+                    agent.config.implementation_model,
+                    max_tokens=16384,
+                    reasoning_budget_tokens=2048,
+                    critical_reasoning_budget_tokens=8192,
+                ),
+            )
+            agent.initialize()
+
+            payload = agent._extract_json_or_retry(
+                "not valid json",
+                phase="IMPLEMENT_PLAN_STEP_PHASE",
+                contract=IMPLEMENTATION_CONTRACT,
+                critical_reasoning=True,
+            )
+
+            self.assertEqual(payload["resolution_request"], "none")
+            self.assertEqual(
+                agent.impl_client.calls[0]["reasoning_budget_tokens"],
+                PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
+            )
+            self.assertFalse(agent.impl_client.calls[0]["request_label"].endswith("/critical"))
 
     def test_final_review_protocol_failure_compromises_when_all_evidence_passed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -11766,6 +12218,10 @@ assert "ok" in stdout
 
             self.assertEqual(result["status"], "resolved_with_compromise")
             self.assertEqual(result["resolution"]["status"], "resolved_with_compromise")
+            self.assertEqual(
+                result["resolution"]["provenance"],
+                "harness_verified_evidence_protocol_compromise",
+            )
             self.assertIn("review-protocol compromise", result["resolution"]["note"])
 
     def test_feedback_json_repair_omits_malformed_review_tail(self) -> None:
@@ -12939,6 +13395,30 @@ assert "ok" in stdout
             self.assertIn("Reviewer validation returned 3", findings)
             self.assertNotIn("no implementation changes", findings.lower())
 
+    def test_git_diff_gate_accepts_reviewer_requested_evidence_as_fresh_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = load_test_agent(root, root / "workspace")
+            step = {
+                "id": "T2B",
+                "title": "Confirm existing behavior",
+                "acceptance_criteria": ["The existing behavior is independently checked."],
+                "validation_commands": [],
+            }
+            evidence = {
+                "reviewer_validation_results": [{
+                    "command": ["python", "check_existing.py"],
+                    "returncode": 0,
+                    "expected_returncode": 0,
+                }],
+                "git": {
+                    "meaningful_changed_paths": [],
+                    "status_truncated": False,
+                },
+            }
+
+            self.assertEqual(agent._git_diff_findings(step, {}, evidence), [])
+
     def test_git_diff_gate_defers_explicit_non_command_evidence_to_reviewer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -13738,6 +14218,81 @@ assert "ok" in stdout
             validations = review["feedback_tool_evidence"]["step_validations"]
             self.assertEqual(validations[0]["validation_results"][0]["returncode"], 0)
 
+    def test_final_reviewer_can_request_one_independent_validation_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            command = ["python", "-c", "print('final-independent-check')"]
+            agent = load_test_agent(
+                root,
+                workspace,
+                feedback_responses=[
+                    json.dumps({
+                        "status": "needs_rework",
+                        "summary": "The final evidence leaves one material behavior unchecked.",
+                        "required_changes": ["Run one independent final check."],
+                        "verification_evidence": [],
+                        "validation_commands": [command],
+                    }),
+                    json.dumps({
+                        "status": "resolved",
+                        "summary": "The independent final check closes the evidence gap.",
+                        "required_changes": [],
+                        "verification_evidence": ["final-independent-check returned exit code 0"],
+                        "validation_commands": [],
+                    }),
+                ],
+            )
+            agent.config = replace(
+                agent.config,
+                git_policy=replace(agent.config.git_policy, enabled=False),
+            )
+            agent.initialize()
+            step_results = [{
+                "step_id": "S1",
+                "status": "resolved",
+                "attempts": [{"implementation": {"commands": []}}],
+            }]
+            agent._final_feedback_tool_evidence = types.MethodType(
+                lambda self, results: {
+                    "kind": "final_validation",
+                    "workspace_files": [],
+                    "step_validations": [{
+                        "step_id": "S1",
+                        "final_validation_commands_run": [],
+                        "validation_results": [],
+                        "accepted_validation_commands_run": [],
+                        "accepted_validation_results": [],
+                    }],
+                    "git": {"enabled": False},
+                },
+                agent,
+            )
+            run_calls: list[list[Any]] = []
+            agent._run_verified_commands = types.MethodType(
+                lambda self, commands, **_kwargs: run_calls.append(commands) or [{
+                    "command": command,
+                    "returncode": 0,
+                    "expected_returncode": 0,
+                    "returncode_matches_expected": True,
+                    "stdout": "final-independent-check\n",
+                    "stderr": "",
+                    "timed_out": False,
+                }],
+                agent,
+            )
+
+            review = agent._final_project_review(1, step_results)
+
+            self.assertEqual(review["status"], "resolved")
+            self.assertEqual(run_calls, [[command]])
+            self.assertEqual(review["reviewer_validation_request"]["result_count"], 1)
+            self.assertEqual(review["feedback_tool_evidence"]["reviewer_validation_results"][0]["returncode"], 0)
+            self.assertIn(
+                "final-independent-check",
+                agent.feedback_client.calls[1]["messages"][-1]["content"],
+            )
+
 
     def test_final_review_accepts_rerun_step_validation_when_plan_path_is_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -14224,6 +14779,148 @@ assert "ok" in stdout
             self.assertEqual(result["status"], "cannot_resolve")
             self.assertEqual(len(result["attempts"]), 2)
 
+    def test_implementation_loop_stops_after_one_no_progress_reassessment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.config = replace(
+                agent.config,
+                git_policy=replace(agent.config.git_policy, enabled=False),
+                phases=replace(
+                    agent.config.phases,
+                    implementation=replace(agent.config.phases.implementation, max_iterations=5),
+                ),
+            )
+            step = {
+                "id": "S1",
+                "title": "Repair checked behavior",
+                "description": "Repair until observable validation changes.",
+                "depends_on": [],
+                "acceptance_criteria": ["Validation passes."],
+                "validation_commands": [["python", "validate.py"]],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            implementation_attempts: list[int] = []
+
+            def implementation_pass(self, current, attempt, **_kwargs):
+                implementation_attempts.append(attempt)
+                return {"commands": [], "attempt": attempt}
+
+            def review_pass(self, current, attempt, implementation, review_mode, **_kwargs):
+                return {
+                    "status": "needs_rework",
+                    "summary": "The same observed failure remains.",
+                    "required_changes": ["Reassess the blocker."],
+                    "deterministic_evidence_findings": ["Validation still returns 1."],
+                    "feedback_tool_evidence": {
+                        "workspace_files": [{
+                            "path": "artifact.txt",
+                            "content": f"repair attempt {attempt}\n",
+                            "size": 20,
+                            "truncated": False,
+                        }],
+                        "validation_results": [{
+                            "command": ["python", "validate.py"],
+                            "returncode": 1,
+                            "expected_returncode": 0,
+                            "returncode_matches_expected": False,
+                            "stdout": "",
+                            "stderr": "same observed failure",
+                            "timed_out": False,
+                        }],
+                    },
+                }
+
+            agent._implementation_pass = types.MethodType(implementation_pass, agent)
+            agent._step_review_pass = types.MethodType(review_pass, agent)
+
+            result = agent._implementation_loop_for_step(step)
+
+            self.assertEqual(implementation_attempts, [1, 2, 3])
+            self.assertEqual(result["status"], "cannot_resolve")
+            self.assertEqual(result["resolution"]["provenance"], "harness_no_progress_guard")
+            self.assertEqual(
+                result["attempts"][1]["no_progress_guard"]["decision"],
+                "reassess_once",
+            )
+            self.assertEqual(
+                result["attempts"][2]["no_progress_guard"]["decision"],
+                "stop_after_reassessment",
+            )
+            transcript = "\n".join(turn.content for turn in agent.conversation.turns)
+            self.assertEqual(transcript.count("REPAIR_PROGRESS_CHECKPOINT"), 1)
+
+    def test_implementation_no_progress_reassessment_clears_when_evidence_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent.initialize()
+            agent.config = replace(
+                agent.config,
+                git_policy=replace(agent.config.git_policy, enabled=False),
+                phases=replace(
+                    agent.config.phases,
+                    implementation=replace(agent.config.phases.implementation, max_iterations=4),
+                ),
+            )
+            step = {
+                "id": "S1",
+                "title": "Repair with changing evidence",
+                "description": "Continue when reassessment changes the observed failure.",
+                "depends_on": [],
+                "acceptance_criteria": ["Validation passes."],
+                "validation_commands": [["python", "validate.py"]],
+                "status": "pending",
+            }
+            agent.plan_steps = [step]
+            agent._implementation_pass = types.MethodType(
+                lambda self, current, attempt, **_kwargs: {"commands": [], "attempt": attempt},
+                agent,
+            )
+
+            def review_pass(self, current, attempt, implementation, review_mode, **_kwargs):
+                if attempt == 4:
+                    return {
+                        "status": "resolved",
+                        "summary": "Changed evidence led to a verified repair.",
+                        "required_changes": [],
+                        "feedback_tool_evidence": {
+                            "validation_results": [{
+                                "command": ["python", "validate.py"],
+                                "returncode": 0,
+                                "expected_returncode": 0,
+                                "returncode_matches_expected": True,
+                            }],
+                        },
+                    }
+                failure = "first failure" if attempt < 3 else "different failure after reassessment"
+                return {
+                    "status": "needs_rework",
+                    "summary": failure,
+                    "required_changes": ["Continue from the changed evidence."],
+                    "feedback_tool_evidence": {
+                        "validation_results": [{
+                            "command": ["python", "validate.py"],
+                            "returncode": 1,
+                            "expected_returncode": 0,
+                            "returncode_matches_expected": False,
+                            "stderr": failure,
+                        }],
+                    },
+                }
+
+            agent._step_review_pass = types.MethodType(review_pass, agent)
+
+            result = agent._implementation_loop_for_step(step)
+
+            self.assertEqual(result["status"], "resolved")
+            self.assertEqual(len(result["attempts"]), 4)
+            self.assertNotIn("resolution", result)
+
     def test_implementation_loop_honors_allocated_review_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -14304,6 +15001,112 @@ assert "ok" in stdout
             self.assertEqual(summary["final_status"], "cannot_resolve")
             self.assertEqual(summary["steps"][0]["step_id"], "plan_phase")
             self.assertIn("malformed", summary["steps"][0]["last_review_summary"])
+
+    def test_run_stops_protocol_failure_without_semantic_approach_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent._web_research_phase = types.MethodType(lambda self: {"status": "skipped"}, agent)
+            agent._analysis_phase = types.MethodType(
+                lambda self, **_kwargs: {
+                    "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                    "resolution": {
+                        "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                        "note": "No parseable analysis-review decision was accepted.",
+                        "provenance": "harness_protocol_validation",
+                    },
+                    "iterations": [],
+                },
+                agent,
+            )
+            agent._requirements_refinement_phase = types.MethodType(
+                lambda self, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("requirements must not run after protocol failure")
+                ),
+                agent,
+            )
+            agent._approach_review_phase = types.MethodType(
+                lambda self, *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("semantic approach review must not run without validated control state")
+                ),
+                agent,
+            )
+            agent._git_finalize_policy = types.MethodType(lambda self: {"enabled": False}, agent)
+
+            summary = agent.run()
+
+            self.assertEqual(summary["final_status"], HARNESS_PROTOCOL_ERROR_STATUS)
+            self.assertEqual(summary["steps"][0]["status"], HARNESS_PROTOCOL_ERROR_STATUS)
+            self.assertEqual(summary["approach_review"]["status"], HARNESS_PROTOCOL_ERROR_STATUS)
+            self.assertEqual(summary["approach_review"]["decision"], "stop_unresolved")
+            self.assertEqual(
+                summary["approach_review"]["status_provenance"],
+                "harness_protocol_validation",
+            )
+
+    def test_run_skips_final_and_approach_reviews_after_step_protocol_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            agent = load_test_agent(root, workspace)
+            agent._web_research_phase = types.MethodType(lambda self: {"status": "skipped"}, agent)
+            agent._analysis_phase = types.MethodType(
+                lambda self, **_kwargs: {"status": "resolved", "iterations": []},
+                agent,
+            )
+            agent._requirements_refinement_phase = types.MethodType(
+                lambda self, **_kwargs: {"status": "resolved", "iterations": []},
+                agent,
+            )
+
+            def plan_validation(self, **_kwargs):
+                self.plan_steps = [{
+                    "id": "S1",
+                    "title": "Protocol-gated step",
+                    "description": "Stop when review control state is unavailable.",
+                    "depends_on": [],
+                    "acceptance_criteria": ["A validated review decision exists."],
+                    "validation_method": "Inspect current evidence.",
+                    "validation_commands": [],
+                    "status": "pending",
+                }]
+                return {"status": "resolved", "iterations": []}
+
+            def implementation_loop(self, step, **_kwargs):
+                step["status"] = HARNESS_PROTOCOL_ERROR_STATUS
+                return {
+                    "step_id": step["id"],
+                    "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                    "attempts": [],
+                    "resolution": {
+                        "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                        "note": "Step reviewer did not provide validated control state.",
+                        "provenance": "harness_protocol_validation",
+                    },
+                }
+
+            agent._plan_validation_phase = types.MethodType(plan_validation, agent)
+            agent._implementation_loop_for_step = types.MethodType(implementation_loop, agent)
+            agent._final_review_phase = types.MethodType(
+                lambda self, steps: (_ for _ in ()).throw(
+                    AssertionError("final review must not run after step protocol failure")
+                ),
+                agent,
+            )
+            agent._approach_review_phase = types.MethodType(
+                lambda self, *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("approach review must not run after step protocol failure")
+                ),
+                agent,
+            )
+            agent._git_finalize_policy = types.MethodType(lambda self: {"enabled": False}, agent)
+
+            summary = agent.run()
+
+            self.assertEqual(summary["final_status"], HARNESS_PROTOCOL_ERROR_STATUS)
+            self.assertEqual(summary["final_review"]["status"], HARNESS_PROTOCOL_ERROR_STATUS)
+            self.assertEqual(summary["approach_review"]["decision"], "stop_unresolved")
 
     def test_run_creates_baseline_when_later_approach_reaches_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -15019,6 +15822,29 @@ assert "ok" in stdout
             findings = agent._plan_structural_findings()
             self.assertTrue(any("list-valued cmd" in finding for finding in findings))
 
+    def test_plan_command_checks_reject_statically_invalid_inline_programs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = load_test_agent(root, root / "workspace")
+            agent.requirements = base_requirements("Executable plan checks")
+            agent.plan_steps = [{
+                "id": "S1",
+                "title": "Validate current behavior",
+                "description": "Run an executable validation command.",
+                "depends_on": [],
+                "acceptance_criteria": ["The current behavior is checked."],
+                "validation_commands": [[
+                    "python",
+                    "-c",
+                    "items = []; for item in range(3): items.append(item)",
+                ]],
+            }]
+
+            findings = agent._plan_structural_findings()
+
+            self.assertTrue(any("invalid inline Python" in finding for finding in findings))
+            self.assertTrue(any("invalid syntax" in finding for finding in findings))
+
     def test_run_commands_preserves_explicit_validation_lifecycle_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_commands(
@@ -15036,6 +15862,40 @@ assert "ok" in stdout
             self.assertTrue(result["declared_validation"])
             self.assertFalse(result["final_state"])
             self.assertTrue(result["command_metadata"]["timeout_explicit"])
+
+    def test_command_evidence_reconstructs_explicit_unlimited_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = load_test_agent(root, root / "workspace")
+            result = {
+                "command": ["tail", "-f", "service.log"],
+                "returncode": 0,
+                "expected_returncode": 0,
+                "timeout_seconds": None,
+                "hard_timeout_disabled": True,
+                "command_metadata": {"timeout_explicit": True},
+            }
+
+            self.assertEqual(
+                agent._command_spec_from_result(result),
+                {"cmd": ["tail", "-f", "service.log"], "timeout_seconds": 0},
+            )
+
+    def test_command_evidence_rejects_inconsistent_explicit_timeout_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = load_test_agent(root, root / "workspace")
+            result = {
+                "command": ["python", "validate.py"],
+                "returncode": 0,
+                "expected_returncode": 0,
+                "timeout_seconds": None,
+                "hard_timeout_disabled": False,
+                "command_metadata": {"timeout_explicit": True},
+            }
+
+            with self.assertRaisesRegex(ValueError, "inconsistent explicit timeout metadata"):
+                agent._command_spec_from_result(result)
 
     def test_blocked_command_cannot_pass_by_expectation_matching_block_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
