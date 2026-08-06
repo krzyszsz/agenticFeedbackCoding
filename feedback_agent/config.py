@@ -19,6 +19,9 @@ class ModelConfig:
     temperature: float
     top_p: float | None
     top_k: int | None
+    min_p: float | None
+    presence_penalty: float | None
+    repeat_penalty: float | None
     request_timeout_seconds: int
     retry_attempts: int
     retry_sleep_seconds: int
@@ -28,6 +31,7 @@ class ModelConfig:
     critical_reasoning_budget_tokens: int | None
     send_reasoning_budget: bool
     request_json_object: bool
+    system_prompt_as_user: bool
 
 
 @dataclass(frozen=True)
@@ -170,6 +174,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 64,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
         "request_timeout_seconds": 21_600,
         "retry_attempts": 20,
         "retry_sleep_seconds": 30,
@@ -179,6 +186,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "critical_reasoning_budget_tokens": None,
         "send_reasoning_budget": True,
         "request_json_object": True,
+        "system_prompt_as_user": False,
     },
     "feedback_model": None,
     "mcp_tools": {
@@ -329,6 +337,11 @@ def _model(data: dict[str, Any], *, base_url_override: str | None = None) -> Mod
         temperature=float(data.get("temperature", 1.0)),
         top_p=None if data.get("top_p") is None else float(data["top_p"]),
         top_k=None if data.get("top_k") is None else int(data["top_k"]),
+        min_p=None if data.get("min_p") is None else float(data["min_p"]),
+        presence_penalty=(
+            None if data.get("presence_penalty") is None else float(data["presence_penalty"])
+        ),
+        repeat_penalty=None if data.get("repeat_penalty") is None else float(data["repeat_penalty"]),
         request_timeout_seconds=int(data.get("request_timeout_seconds", 21_600)),
         retry_attempts=int(data.get("retry_attempts", 20)),
         retry_sleep_seconds=int(data.get("retry_sleep_seconds", 30)),
@@ -338,6 +351,7 @@ def _model(data: dict[str, Any], *, base_url_override: str | None = None) -> Mod
         critical_reasoning_budget_tokens=critical_reasoning_budget,
         send_reasoning_budget=bool(data.get("send_reasoning_budget", False)),
         request_json_object=bool(data.get("request_json_object", True)),
+        system_prompt_as_user=bool(data.get("system_prompt_as_user", False)),
     )
 
 
@@ -440,6 +454,7 @@ _BOOLEAN_CONFIG_PATHS = (
     "implementation_model.preserve_reasoning",
     "implementation_model.send_reasoning_budget",
     "implementation_model.request_json_object",
+    "implementation_model.system_prompt_as_user",
     "mcp_tools.terminal",
     "mcp_tools.web_scraping",
     "mcp_tools.web_interaction",
@@ -468,6 +483,7 @@ def _raw_boolean_type_errors(data: dict[str, Any]) -> list[str]:
             "feedback_model.preserve_reasoning",
             "feedback_model.send_reasoning_budget",
             "feedback_model.request_json_object",
+            "feedback_model.system_prompt_as_user",
         ))
     for path in paths:
         value: Any = data
@@ -501,8 +517,14 @@ def validate_config(config: AgentConfig) -> None:
             errors.append(f"{label}.temperature must be zero or greater")
         if model.top_p is not None and not 0 < model.top_p <= 1:
             errors.append(f"{label}.top_p must be greater than zero and at most one")
-        if model.top_k is not None and model.top_k <= 0:
-            errors.append(f"{label}.top_k must be greater than zero")
+        if model.top_k is not None and model.top_k < 0:
+            errors.append(f"{label}.top_k must be zero or greater")
+        if model.min_p is not None and not 0 <= model.min_p <= 1:
+            errors.append(f"{label}.min_p must be between zero and one")
+        if model.presence_penalty is not None and not -2 <= model.presence_penalty <= 2:
+            errors.append(f"{label}.presence_penalty must be between -2 and 2")
+        if model.repeat_penalty is not None and model.repeat_penalty <= 0:
+            errors.append(f"{label}.repeat_penalty must be greater than zero")
         if model.request_timeout_seconds <= 0:
             errors.append(f"{label}.request_timeout_seconds must be greater than zero")
         if model.retry_attempts <= 0:

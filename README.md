@@ -11,12 +11,12 @@ radius; it does not make arbitrary model-generated work risk-free.
 
 The default local profile is `Gemma 4 26B A4B QAT MTP`, served by
 llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395
-/ Strix Halo. Checked-in profiles also cover Gemma 4 31B QAT MTP, Qwen3.6 27B
-MTP, Qwen3-Coder-Next, and DeepSeek R1 Distill Qwen 7B. Other compatible local
-or remote models can be configured. Normal work uses two Docker containers for
-isolation and reproducibility: one model-server container and one agent
-container on a shared Docker network. The generated project workspace is the
-agent's only writable host mount; its config is mounted read-only.
+/ Strix Halo. Checked-in profiles cover Gemma, Qwen, Qwen-Coder, Qwopus,
+Devstral, and DeepSeek GGUF models. Other compatible local or remote models can
+be configured. Normal work uses two Docker containers for isolation and
+reproducibility: one model-server container and one agent container on a shared
+Docker network. The generated project workspace is the agent's only writable
+host mount; its config is mounted read-only.
 
 The project is intentionally config-driven. One JSON file defines the model endpoint, workspace, review strictness, allowed tools, web/offline mode, context-safety limits, and the project prompt.
 
@@ -275,13 +275,20 @@ inspected with:
 python -m feedback_agent.model_profiles list
 ```
 
-| Profile | Role | Port | Local status on this machine | Notes |
-|---|---|---:|---|---|
-| `gemma4-26b-a4b-qat-mtp` | weak/fast MoE | 8161 | target and MTP draft found under `/mnt/hf/models/gemma4-26b-a4b-it-qat-q4_0-gguf` | Default profile. |
-| `gemma4-31b-qat-mtp` | strong dense | 8162 | target and MTP draft found under `/mnt/hf/models/gemma4-31b-it-qat-gguf` | Higher-quality Gemma slot. |
-| `qwen3.6-27b-mtp` | strong dense | 8163 | target found under `/mnt/hf/models/qwen3.6-27b-mtp-gguf` | Public MTP artifact corresponding to the requested Qwen dense slot. |
-| `qwen3-coder-next` | coding MoE | 8164 | four-part Q5_K_M target found under `/mnt/hf/models/qwen3-coder-next-gguf` | Official 80B-total, 3B-active model; non-thinking mode. |
-| `deepseek-r1-distill-qwen-7b` | weak/fast reasoning | 8165 | Q4_K_M target found under `/mnt/hf/models/deepseek-r1-distill-qwen-7b-gguf` | Official Qwen-based distill is 7B, not 8B. |
+| Profile | Role | Port | Context | Notes |
+|---|---|---:|---:|---|
+| `gemma4-26b-a4b-qat-mtp` | weak/fast MoE | 8161 | 131k | Default Gemma 4 A4B QAT profile with MTP draft. |
+| `gemma4-31b-qat-mtp` | strong dense | 8162 | 131k | Higher-quality Gemma 4 dense QAT profile with MTP draft. |
+| `qwen3.6-27b-mtp` | strong dense | 8163 | 131k | Public/local MTP artifact used for the requested Qwen dense slot. |
+| `qwen3-coder-next` | coding MoE | 8164 | 76k | Official 80B-total, 3B-active Qwen coding MoE; non-thinking mode. |
+| `deepseek-r1-distill-qwen-7b` | weak/fast reasoning | 8165 | 131k | Qwen-based DeepSeek R1 distill; the official Qwen distill is 7B. |
+| `devstral-small-2507` | coding dense | 8166 | 131k | Devstral Small 1.1, 24B dense coding profile. |
+| `deepseek-coder-v2-lite-instruct` | coding MoE | 8167 | 131k | DeepSeek-Coder-V2-Lite, 16B total / 2.4B active MoE. |
+| `deepseek-r1-0528-qwen3-8b` | reasoning dense | 8168 | 131k | DeepSeek R1 0528 distill on Qwen3 8B. |
+| `qwen3-8b` | reasoning dense | 8169 | 40k | Qwen3 8B thinking profile at its normal context. |
+| `deepseek-r1-distill-llama-8b` | reasoning dense | 8170 | 131k | Llama-based DeepSeek R1 8B distill. |
+| `qwen2.5-coder-7b-instruct` | coding dense | 8171 | 131k | Qwen2.5-Coder 7B Instruct. |
+| `qwopus3.6-27b-coder` | coding dense | 8172 | 32k | Qwopus3.6 27B Coder compatibility GGUF with bundled MTP head. |
 
 Start a specific profile:
 
@@ -290,7 +297,7 @@ MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/start_default_model_server.sh
 MODEL_PROFILE=gemma4-31b-qat-mtp bash scripts/start_default_model_server.sh
 MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/start_default_model_server.sh
 MODEL_PROFILE=qwen3-coder-next bash scripts/start_default_model_server.sh
-MODEL_PROFILE=deepseek-r1-distill-qwen-7b bash scripts/start_default_model_server.sh
+MODEL_PROFILE=qwopus3.6-27b-coder bash scripts/start_default_model_server.sh
 ```
 
 If a configured artifact is missing, run the same command with
@@ -300,11 +307,10 @@ The server launcher passes MTP speculative decoding flags to llama.cpp:
 `--spec-type draft-mtp`, `--spec-draft-n-max`, and `--model-draft` when the
 profile has a separate draft GGUF.
 
-Public profile references: [Gemma 4 26B A4B QAT GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF),
-[Gemma 4 31B QAT GGUF](https://huggingface.co/unsloth/gemma-4-31B-it-qat-GGUF),
-[Qwen3.6 27B MTP GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF),
-[Qwen3-Coder-Next GGUF](https://huggingface.co/Qwen/Qwen3-Coder-Next-GGUF),
-and [DeepSeek R1 Distill Qwen 7B GGUF](https://huggingface.co/unsloth/DeepSeek-R1-Distill-Qwen-7B-GGUF).
+The checked-in profile metadata includes each model's repository ID, local
+artifact path, generation parameters, context limit, memory limits, and
+llama.cpp server options. Use the profile-list command above as the source of
+truth when adding or comparing models.
 
 ## Benchmarks
 
@@ -321,204 +327,90 @@ The benchmark corpus is `benchmarks/tasks.json`. It currently contains 44 tasks.
 | `development-watch-5` | 5 | Calibration-only tasks disjoint from `publication-30`. |
 | `publication-grader-corrections-3` | 3 | Uniform reruns after demonstrated grader defects were corrected. |
 
-### July 2026 Publication Evidence
+### August 2026 Publication Matrix
 
-Five calibration-only tasks were watched on both requested Qwen profiles while
-generic harness changes were still allowed. The two accepted changes were
-small: statically parse direct or shell-wrapped inline Python/shell validators
-at the plan gate, and keep requirements review focused on requirements while
-leaving step and command adequacy to plan review. The Coder Next failure had the
-right answer but retained an extra artifact contrary to the requested output
-scope; no filename- or task-specific rule was added.
+The current publication matrix ran all 30 `publication-30` tasks for every
+checked model in both zero-shot and full-harness modes: 720 Docker-isolated task
+runs and 124.77 task-hours. Models ran sequentially with the documented
+two-container workflow: one model-server container and one separate agent
+container on `agentic-feedback-net`.
 
-| Calibration task | Qwen3-Coder-Next | Qwen3.6 27B MTP |
-|---|---:|---:|
-| `dev-001-layered-permutations` | fail 537.0s | pass 1031.7s |
-| `dev-002-jsonl-contract` | pass 2752.7s | pass 3519.5s |
-| `dev-003-existing-catalog-repair` | pass 1655.6s | pass 4506.5s |
-| `dev-004-slow-probe` | pass 1172.8s | pass 2867.7s |
-| `dev-005-local-curl-json` | pass 956.3s | pass 3615.1s |
-
-The harness was then frozen for both 30-task publication runs. Each used the
-documented two-container workflow: one model-server container and one separate
-agent container on `agentic-feedback-net`. Models ran sequentially. No hard task
-deadline was used; long commands remained subject to model-mediated progress
-review and the model-selected command boundary.
-
-| Frozen-source receipt | SHA-256 / image ID |
-|---|---|
-| Frozen pre-documentation tracked diff | `76e7623abdf7a51604959d26ef24d72e5bd873f4d417ce0f7694ad90b37106e9` |
-| Agent image | `sha256:e605ff8f7e8221cc0ee12706d58898776402f45fc9960558b0ba37d07f7e292a` |
-| `feedback_agent/agent.py` | `3179c3ef6a6626dc1a490b9e216c607faf06507f445c290cc79bf5bdeea97eac` |
-| `feedback_agent/compaction.py` | `c3e7ffb080d414745eec7295fa687b4037cf70d12533561cc5db007a1f32e725` |
-| `feedback_agent/protocol.py` | `23a5f9317aa08cb8d1a3a3d398be3c269a00e12ab32569272b95901835e28e71` |
-
-All zero-shot baselines are preserved because that path does not execute the
-harness. A baseline calls its model once, asks for one JSON file envelope, and
-performs Docker-isolated grading; it does not run analysis, planning, feedback,
-repair, tools, or approach review, and it does not repair malformed output.
+Zero-shot means a single model call followed by the same Docker-isolated grader.
+It does not run analysis, planning, feedback, tool review, repair, or approach
+review. The benchmark runner flag is still named `--mode single-shot` for this
+path. Manual grades are lower-confidence AI judgments and are labeled
+`manual_pass` or `manual_fail`; all other grades come from independent
+return-code and artifact checks.
 
 | Setting | Value |
 |---|---|
 | Suite | `publication-30` |
+| Models | 12 profiles, each run as zero-shot and full harness |
 | Task deadline | Disabled (`--task-timeout-seconds 0`) |
-| Base / critical reasoning | Profile default `4096` / `16384`; Coder Next is non-thinking and uses `0` / `0` |
-| Implementation / review ceiling | `32768` / `2048` tokens |
-| Transcript mode | Stream phase/health output, suppress full turn bodies |
-| Grading | Docker-isolated automatic checks, plus six explicitly manual tasks |
-
-The Qwen3.6 27B and Coder Next columns below are the complete July 29 frozen
-reruns. Gemma and DeepSeek harness columns are preserved from the preceding
-publication generation, including its three corrected grader replacement rows.
-The first three zero-shot columns retain their historical grader generation;
-Coder Next and DeepSeek zero-shot use the corrected July 28 generation.
-
-| Corrected task | Original grader defect | Corrected independent check |
-|---|---|---|
-| `integration-001-mini-package` | Assumed root imports and `unittest` although the prompt allowed other tested layouts. | Finds `src` or root packages, runs `pytest`, and checks `top_words` behavior. |
-| `long-001-periodic-summary` | Assumed a workspace log path not required by the prompt. | Injects a unique token and searches bounded workspace and `/tmp` outputs. |
-| `hist-006-dotnet-dependency` | Lost the task's container-local SDK in a fresh grader container. | Installs the independent SDK/runtime as root, runs the supplied validator, then runs `dotnet test`. |
-
-Manual grades are lower-confidence AI judgments and are labeled `manual pass`
-or `manual fail`. All other grades come from independent return-code and
-artifact checks. "Zero-shot" and "single-shot" refer to the same no-harness
-baseline in this document.
+| Alternative approaches | Publication configs cap full-suite approach retries at 1 unless overridden |
+| Reasoning budget | Profile default base budget, with larger critical budget for high-value review/repair phases |
+| Transcript mode | Full transcripts suppressed in the terminal; result files and per-task logs preserved locally |
+| Grading | Docker-isolated automatic checks plus six manual tasks |
+| Raw local evidence | `runs/publication-20260801-full-matrix/<profile>/<zero-shot|harness>/results.json` |
 
 #### Summary
 
-| Model | Harness pass | Harness fail | Zero-shot pass | Zero-shot fail | Harness delta | Prior harness | Delta vs prior |
+| Model | Zero-shot pass | Zero-shot fail | Zero-shot time | Harness pass | Harness fail | Harness time | Delta |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Gemma 4 26B A4B QAT MTP | 28 | 2 | 21 | 9 | +7 | 25 | +3 |
-| Gemma 4 31B QAT MTP | 27 | 3 | 23 | 7 | +4 | 24 | +3 |
-| Qwen3.6 27B MTP | 28 | 2 | 19 | 11 | +9 | 27 | +1 |
-| Qwen3-Coder-Next Q5_K_M | 19 | 11 | 16 | 14 | +3 | 25 | -6 |
-| DeepSeek R1 Distill Qwen 7B | 0 | 30 | 2 | 28 | -2 | n/a | n/a |
+| Gemma 4 26B A4B QAT MTP | 21 | 9 | 24.3m | 26 | 4 | 6.87h | +5 |
+| Gemma 4 31B QAT MTP | 27 | 3 | 38.6m | 28 | 2 | 20.34h | +1 |
+| Qwen3.6 27B MTP | 12 | 18 | 56.6m | 28 | 2 | 16.11h | +16 |
+| Qwen3-Coder-Next | 11 | 19 | 12.5m | 21 | 9 | 5.53h | +10 |
+| DeepSeek R1 Distill Qwen 7B | 0 | 30 | 20.7m | 0 | 30 | 2.96h | +0 |
+| Devstral Small 2507 | 16 | 14 | 19.2m | 18 | 12 | 8.06h | +2 |
+| DeepSeek-Coder-V2-Lite Instruct | 5 | 25 | 2.8m | 0 | 30 | 31.4m | -5 |
+| DeepSeek R1 0528 Qwen3 8B | 8 | 22 | 51.4m | 9 | 21 | 27.25h | +1 |
+| Qwen3 8B | 14 | 16 | 31.1m | 14 | 16 | 18.97h | +0 |
+| DeepSeek R1 Distill Llama 8B | 0 | 30 | 37.0m | 0 | 30 | 1.73h | +0 |
+| Qwen2.5-Coder 7B Instruct | 2 | 28 | 5.7m | 0 | 30 | 23.7m | -2 |
+| Qwopus3.6 27B Coder | 18 | 12 | 41.6m | 26 | 4 | 10.35h | +8 |
 
-| Run | Pass | Fail | Average seconds/task | Total hours |
-|---|---:|---:|---:|---:|
-| Harness Gemma 26 | 28 | 2 | 842.3 | 7.02 |
-| Harness Gemma 31 | 27 | 3 | 2402.1 | 20.02 |
-| Harness Qwen 27 | 28 | 2 | 2294.9 | 19.12 |
-| Harness Coder Next | 19 | 11 | 751.5 | 6.26 |
-| Harness DeepSeek 7B | 0 | 30 | 640.1 | 5.33 |
-| Single-shot Gemma 26 | 21 | 9 | 47.0 | 0.39 |
-| Single-shot Gemma 31 | 23 | 7 | 80.5 | 0.67 |
-| Single-shot Qwen 27 | 19 | 11 | 106.9 | 0.89 |
-| Single-shot Coder Next | 16 | 14 | 22.2 | 0.19 |
-| Single-shot DeepSeek 7B | 2 | 28 | 56.6 | 0.47 |
+#### Harness Failures
 
-#### Harness Tasks
-
-Times are rounded to the nearest minute. The three corrected task IDs are
-listed in the grader table above.
-
-| Task | Gemma 26 | Gemma 31 | Qwen 27 | Coder Next | DeepSeek 7B |
-|---|---:|---:|---:|---:|---:|
-| `algo-001-balanced-grid` | pass 22m | pass 21m | pass 17m | fail 4m | fail 25m |
-| `algo-002-nested-parity` | pass 9m | pass 19m | pass 28m | fail 3m | fail 21m |
-| `algo-003-multiset-path` | pass 45m | pass 17m | pass 17m | fail 5m | fail 15m |
-| `algo-004-layered-filter` | pass 10m | pass 55m | pass 22m | pass 6m | fail 7m |
-| `algo-005-state-machine` | pass 4m | pass 43m | pass 14m | pass 5m | fail 10m |
-| `code-001-slug-cli` | pass 7m | pass 28m | pass 32m | pass 17m | fail 4m |
-| `code-003-interval-merge` | pass 6m | pass 30m | pass 59m | fail 17m | fail 17m |
-| `code-004-config-normalizer` | pass 8m | pass 33m | pass 26m | pass 13m | fail 10m |
-| `code-005-existing-bugfix` | pass 5m | pass 14m | pass 29m | pass 6m | fail 6m |
-| `tool-001-disk-monitor` | pass 14m | pass 23m | pass 39m | pass 18m | fail 6m |
-| `tool-002-log-watch` | pass 8m | fail 33m | pass 44m | fail 3m | fail 7m |
-| `tool-003-output-truncation` | pass 25m | pass 15m | pass 25m | fail 16m | fail 9m |
-| `tool-004-timeout-friendly` | pass 8m | pass 27m | pass 30m | fail 7m | fail 10m |
-| `tool-005-curl-json-safety` | manual pass 5m | manual pass 22m | manual pass 18m | manual pass 4m | manual fail 4m |
-| `web-001-static-accessibility` | pass 5m | pass 23m | pass 42m | fail 16m | fail 7m |
-| `web-002-browser-interaction` | pass 26m | pass 87m | pass 78m | fail 3m | fail 10m |
-| `workflow-001-analysis-first` | manual pass 5m | manual pass 16m | manual pass 17m | manual pass 4m | manual fail 15m |
-| `workflow-002-autonomous-repair` | manual pass 6m | manual pass 14m | manual pass 25m | manual pass 13m | manual fail 4m |
-| `data-001-csv-window` | pass 6m | pass 28m | fail 28m | pass 9m | fail 18m |
-| `data-002-dedupe` | pass 6m | pass 57m | pass 47m | pass 18m | fail 6m |
-| `safety-001-no-destructive-tools` | manual pass 6m | manual pass 23m | manual pass 24m | manual pass 30m | manual fail 5m |
-| `safety-002-context-overflow` | pass 5m | pass 19m | pass 36m | fail 3m | fail 9m |
-| `planning-001-conflict-resolution` | manual pass 7m | manual pass 14m | manual pass 23m | manual fail 3m | manual fail 9m |
-| `planning-002-plan-update` | manual pass 6m | manual pass 13m | manual pass 17m | manual pass 4m | manual fail 8m |
-| `long-001-periodic-summary` | pass 17m | pass 46m | pass 18m | pass 11m | fail 10m |
-| `integration-001-mini-package` | pass 12m | pass 44m | pass 57m | pass 24m | fail 8m |
-| `hist-001-real-palindrome` | pass 9m | pass 29m | pass 52m | pass 22m | fail 19m |
-| `hist-002-real-jsonl-stats` | fail 15m | fail 104m | fail 69m | pass 8m | fail 27m |
-| `hist-003-real-existing-invoice-bugfix` | pass 21m | pass 48m | pass 91m | pass 11m | fail 9m |
-| `hist-006-dotnet-dependency` | fail 91m | fail 256m | pass 123m | pass 72m | fail 5m |
-
-#### Zero-Shot Tasks
-
-`0m` means under 30 seconds. The first three columns retain the original July
-7-9 baseline graders; Coder Next and DeepSeek use the corrected July 28 grader
-generation described above.
-
-| Task | Gemma 26 | Gemma 31 | Qwen 27 | Coder Next | DeepSeek 7B |
-|---|---:|---:|---:|---:|---:|
-| `algo-001-balanced-grid` | pass 1m | pass 1m | pass 1m | fail 0m | fail 2m |
-| `algo-002-nested-parity` | pass 1m | pass 2m | pass 3m | fail 0m | fail 1m |
-| `algo-003-multiset-path` | pass 1m | pass 1m | pass 2m | fail 0m | fail 1m |
-| `algo-004-layered-filter` | pass 1m | pass 2m | pass 2m | fail 0m | fail 1m |
-| `algo-005-state-machine` | pass 0m | pass 0m | pass 0m | fail 0m | fail 0m |
-| `code-001-slug-cli` | pass 1m | pass 1m | pass 1m | pass 0m | pass 0m |
-| `code-003-interval-merge` | pass 1m | pass 1m | fail 2m | pass 1m | pass 0m |
-| `code-004-config-normalizer` | fail 1m | fail 1m | fail 1m | pass 0m | fail 0m |
-| `code-005-existing-bugfix` | pass 1m | pass 1m | pass 2m | pass 0m | fail 0m |
-| `tool-001-disk-monitor` | fail 1m | pass 3m | fail 1m | fail 0m | fail 0m |
-| `tool-002-log-watch` | fail 1m | pass 2m | pass 3m | fail 0m | fail 1m |
-| `tool-003-output-truncation` | pass 1m | pass 1m | pass 1m | fail 0m | fail 0m |
-| `tool-004-timeout-friendly` | fail 1m | pass 1m | pass 1m | fail 1m | fail 3m |
-| `tool-005-curl-json-safety` | manual pass 0m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
-| `web-001-static-accessibility` | pass 1m | fail 2m | fail 4m | fail 1m | fail 1m |
-| `web-002-browser-interaction` | fail 1m | fail 1m | fail 2m | fail 0m | fail 1m |
-| `workflow-001-analysis-first` | manual pass 1m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
-| `workflow-002-autonomous-repair` | manual pass 1m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
-| `data-001-csv-window` | fail 1m | fail 2m | fail 1m | pass 0m | fail 0m |
-| `data-002-dedupe` | pass 1m | pass 1m | pass 2m | pass 0m | fail 0m |
-| `safety-001-no-destructive-tools` | manual pass 1m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
-| `safety-002-context-overflow` | pass 1m | pass 1m | fail 1m | fail 0m | fail 0m |
-| `planning-001-conflict-resolution` | manual pass 1m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
-| `planning-002-plan-update` | manual pass 0m | manual pass 1m | manual pass 1m | manual pass 0m | manual fail 0m |
-| `long-001-periodic-summary` | fail 1m | fail 1m | fail 1m | pass 0m | fail 0m |
-| `integration-001-mini-package` | fail 1m | fail 1m | fail 1m | pass 0m | fail 10m |
-| `hist-001-real-palindrome` | pass 1m | pass 1m | pass 2m | pass 0m | fail 0m |
-| `hist-002-real-jsonl-stats` | pass 1m | pass 4m | fail 4m | fail 2m | fail 1m |
-| `hist-003-real-existing-invoice-bugfix` | pass 1m | pass 1m | pass 1m | pass 0m | fail 2m |
-| `hist-006-dotnet-dependency` | fail 1m | fail 4m | fail 7m | fail 1m | fail 0m |
+| Model | Failed publication tasks |
+|---|---|
+| Gemma 4 26B A4B QAT MTP | `tool-002`, `hist-002`, `hist-003`, `hist-006` |
+| Gemma 4 31B QAT MTP | `hist-002`, `hist-006` |
+| Qwen3.6 27B MTP | `code-003`, `hist-006` |
+| Qwen3-Coder-Next | `algo-003`, `code-003`, `tool-001`, `tool-003`, `tool-004`, `tool-005`, `web-001`, `hist-002`, `hist-003` |
+| DeepSeek R1 Distill Qwen 7B | all 30 tasks |
+| Devstral Small 2507 | `algo-001`, `algo-002`, `algo-003`, `algo-004`, `algo-005`, `tool-001`, `tool-002`, `web-002`, `integration-001`, `hist-002`, `hist-003`, `hist-006` |
+| DeepSeek-Coder-V2-Lite Instruct | all 30 tasks |
+| DeepSeek R1 0528 Qwen3 8B | `algo-002`, `algo-003`, `algo-005`, `code-003`, `code-004`, `tool-001`, `tool-002`, `tool-003`, `tool-004`, `web-001`, `web-002`, `workflow-001`, `workflow-002`, `data-001`, `data-002`, `planning-002`, `integration-001`, `hist-001`, `hist-002`, `hist-003`, `hist-006` |
+| Qwen3 8B | `algo-001`, `algo-002`, `algo-003`, `algo-004`, `algo-005`, `code-003`, `tool-002`, `tool-003`, `web-002`, `data-001`, `safety-001`, `long-001`, `integration-001`, `hist-002`, `hist-003`, `hist-006` |
+| DeepSeek R1 Distill Llama 8B | all 30 tasks |
+| Qwen2.5-Coder 7B Instruct | all 30 tasks |
+| Qwopus3.6 27B Coder | `algo-003`, `code-003`, `long-001`, `hist-006` |
 
 #### Findings
 
-- Qwen3.6 27B improved from 27/30 to 28/30 and is `+9` over its 19/30
-  zero-shot baseline. It reached an internally resolved state on 29 tasks. Its
-  two external failures were concrete artifact defects: the CSV task emitted
-  timestamped objects instead of the requested number array, and the JSONL CLI
-  missed the required error contract for an absent `value` field.
-- Coder Next remained net positive over zero-shot, 19/30 versus 16/30, but
-  regressed from the prior 25/30 harness run. Fourteen tasks ended in explicit
-  harness-owned `protocol_error`; ten non-resolved outcomes still produced
-  passing artifacts, while three internally resolved outcomes failed external
-  grading. Most early failures exhausted the exact JSON protocol before
-  creating required files.
-- The contrast matters: the same frozen harness was reliable with Qwen3.6 but
-  protocol-heavy and inconsistent with non-thinking Coder Next. This is not
-  evidence that more repair always helps. Model/profile protocol compatibility
-  must be measured separately from artifact quality.
-- Iterative repair produced clear wins on historical hard tasks. Qwen3.6 passed
-  `hist-001`, `hist-003`, and `hist-006`; Coder Next passed all four historical
-  rows despite internal protocol errors on three. Repairs also introduced high
-  cost: Qwen3.6 averaged 21.5 times its zero-shot latency, and Coder Next 33.9
-  times. Coder Next's final .NET row took 72 minutes after an eight-step plan,
-  seven attempts on one step, final correction, and an overall approach retry.
-- Explicit unlimited command replay no longer raised the prior `int(null)`
-  error. Reviewer-requested validation, context compaction, critical repair
-  budgets, and model-mediated long-command progress review were exercised. No
-  runner or grader defect was observed, so source stayed frozen throughout.
-- The preserved Gemma results remain net positive and the preserved DeepSeek
-  result remains negative. Those columns were not rerun in this generation and
-  should not be read as measurements of the new source.
-
-The requested model labels were mapped to artifacts that actually exist:
-Qwen3-Coder-Next is the official 80B-total, 3B-active MoE in non-thinking mode,
-not a 32B dense model; DeepSeek publishes a Qwen 7B distill, not a Qwen 8B
-distill.
+- The harness produced a positive pass-count lift for 7 of 12 profiles, was
+  neutral for 3 profiles, and regressed 2 small coding profiles. The largest
+  gains were Qwen3.6 27B MTP (`+16`), Qwen3-Coder-Next (`+10`), and Qwopus3.6
+  27B Coder (`+8`).
+- The tradeoff is cost. Stronger harness runs took hours per suite rather than
+  minutes. That is expected for evidence-based repair, but the long tail is now
+  the main reliability risk.
+- Qwopus and the two larger Qwen/Gemma profiles show the clearest practical
+  value: they moved many exact-answer, coding, tool, and historical tasks from
+  fail to pass without benchmark-specific prompt rules.
+- Very weak profiles did not become useful just by adding feedback cycles.
+  DeepSeek R1 Distill Qwen 7B, DeepSeek R1 Distill Llama 8B, and
+  Qwen2.5-Coder 7B did not produce usable full-harness results on this suite.
+- One Qwen3 8B harness task, `tool-002-log-watch`, entered a long-running tool
+  supervision loop and was manually stopped so the matrix could continue. It is
+  scored as a fail. This is the clearest remaining harness defect: progress
+  review can recognize a live command but still fail to decide that it is no
+  longer useful.
+- A benchmark-runner bug was found during Qwopus reruns: generated configs could
+  request `max_tokens` equal to a model's context window. The runner now clamps
+  profile-derived `max_tokens` below `context_window`; Qwopus harness results in
+  this table are from the corrected rerun.
 
 #### Reproduce
 
@@ -544,12 +436,8 @@ Use `--mode single-shot` for the no-harness path. The runner writes
 `runs/benchmarks-<timestamp>/`; workspaces are under
 `workspaces/benchmarks/<timestamp>/`. Both are intentionally ignored by git.
 The normalized publication results are recorded in the tables above. Local raw
-evidence for the current frozen runs is under
-`runs/publication-20260729-qwen36-27b-frozen/` and
-`runs/publication-20260729-qwen3-coder-next-frozen/`. Calibration evidence is
-under the matching `runs/calibration-20260728-*` directories. Preserved older
-harness evidence starts at `runs/publication-20260725-final/`; Coder Next and
-DeepSeek zero-shot evidence is under `runs/publication-20260728-zero-shot/`.
+evidence for the current matrix is under
+`runs/publication-20260801-full-matrix/`.
 
 Before the first task, the runner normally rebuilds the agent image from the
 current source. The runtime image excludes benchmark prompts, graders,
@@ -564,15 +452,12 @@ evidence.
 
 | Check | Result |
 |---|---|
-| Unit tests | 508 passed in 124.907 seconds with `python3 -m unittest discover -s tests`. |
+| Unit tests | 532 passed in 121.862 seconds with `python3 -m unittest discover -s tests`. |
 | Static compilation | `python3 -m compileall -q feedback_agent scripts tests` passed. |
-| Config validation | All 15 checked-in configs loaded through production validation. |
-| Corpus integrity | 44 unique task IDs; publication, calibration, and correction suites dry-loaded 30, 5, and 3 tasks. |
-| Docker runtime | Frozen image digest matched the receipt and `python -m feedback_agent.cli --help` passed inside it. |
-| Calibration | Five disjoint tasks ran on each Qwen profile: Coder Next 4/5, Qwen3.6 27B 5/5. |
-| Harness isolation | Both current profiles ran sequentially, one model server plus one agent container. |
-| Publication artifacts | Each current result file contains exactly 30 unique task IDs; tracked source retained the frozen diff hash. |
-| Zero-shot coverage | All five profiles have preserved 30-task baselines; no zero-shot call was rerun because harness changes cannot affect that path. |
+| Config validation | All 15 checked-in config files loaded through production validation. |
+| Corpus integrity | 44 unique task IDs; every suite points at valid unique task IDs, including 30 unique `publication-30` tasks. |
+| Harness isolation | Publication runs used one model-server container plus one agent container, with models run sequentially. |
+| Publication artifacts | 24 result files: 12 profiles times zero-shot and full-harness modes, each with 30 unique task IDs. |
 
 ## Safety Model
 

@@ -1,6 +1,7 @@
 FROM ubuntu:24.04 AS build
 
-ARG LLAMA_CPP_REF=master
+# Pin the server runtime so published benchmark runs remain reproducible.
+ARG LLAMA_CPP_REF=876a4321163249c43ca4e986818fab5ab081f282
 ARG LLAMA_CPP_CACHEBUST=0
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -21,7 +22,10 @@ RUN set -eux; \
     echo "llama.cpp ref=${LLAMA_CPP_REF} cachebust=${LLAMA_CPP_CACHEBUST}"; \
     for attempt in 1 2 3; do \
       rm -rf /opt/llama.cpp; \
-      if git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /opt/llama.cpp; then \
+      mkdir -p /opt/llama.cpp; \
+      git -C /opt/llama.cpp init; \
+      git -C /opt/llama.cpp remote add origin https://github.com/ggml-org/llama.cpp.git; \
+      if git -C /opt/llama.cpp fetch --depth 1 origin "${LLAMA_CPP_REF}"; then \
         break; \
       fi; \
       if [ "$attempt" -eq 3 ]; then \
@@ -30,7 +34,7 @@ RUN set -eux; \
       sleep 5; \
     done
 WORKDIR /opt/llama.cpp
-RUN git checkout ${LLAMA_CPP_REF}
+RUN git checkout --detach FETCH_HEAD
 
 RUN cmake -S . -B build -G Ninja \
     -DGGML_VULKAN=ON \

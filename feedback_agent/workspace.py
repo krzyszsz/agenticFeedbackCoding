@@ -377,6 +377,7 @@ def normalize_step(step: dict[str, Any], index: int) -> dict[str, Any]:
         "title": str(step.get("title") or f"Step {index}"),
         "description": str(step.get("description") or ""),
         "depends_on": [str(x) for x in step.get("depends_on", [])],
+        "persistent_paths": [str(x) for x in step.get("persistent_paths", [])],
         "acceptance_criteria": [str(x) for x in step.get("acceptance_criteria", [])],
         "validation_method": str(step.get("validation_method") or ""),
         "validation_commands": step.get("validation_commands", []),
@@ -403,6 +404,18 @@ def write_requirements_doc(
     lines.append("## Requirements")
     for item in requirements.get("refined_requirements", []):
         lines.append(f"- {item}")
+    final_state = requirements.get("final_state", {})
+    if isinstance(final_state, dict):
+        lines.append("")
+        lines.append("## Final State")
+        paths = final_state.get("required_project_paths", [])
+        lines.append(f"- Unrequested new paths allowed: {final_state.get('allow_unrequested_new_paths')}")
+        if final_state.get("path_policy_basis"):
+            lines.append(f"- Path policy basis: {final_state['path_policy_basis']}")
+        for path in paths:
+            lines.append(f"- Required project path: {path}")
+        for item in final_state.get("other_constraints", []):
+            lines.append(f"- Constraint: {item}")
     lines.append("")
     lines.append("## Assumptions and Gap Resolutions")
     assumptions = requirements.get("assumptions", []) or requirements.get("open_questions", [])
@@ -457,6 +470,19 @@ def write_plan_doc(
     lines.append("")
     for item in requirements.get("refined_requirements", []):
         lines.append(f"- {item}")
+    final_state = requirements.get("final_state", {})
+    if isinstance(final_state, dict):
+        lines.append("")
+        lines.append("## Final State")
+        lines.append("")
+        paths = final_state.get("required_project_paths", [])
+        lines.append(f"- Unrequested new paths allowed: {final_state.get('allow_unrequested_new_paths')}")
+        if final_state.get("path_policy_basis"):
+            lines.append(f"- Path policy basis: {final_state['path_policy_basis']}")
+        for path in paths:
+            lines.append(f"- Required project path: {path}")
+        for item in final_state.get("other_constraints", []):
+            lines.append(f"- Constraint: {item}")
     lines.append("")
     lines.append("## Assumptions and Resolutions")
     lines.append("")
@@ -496,6 +522,8 @@ def write_plan_doc(
             lines.append(f"  - Description: {step['description']}")
         if step.get("depends_on"):
             lines.append(f"  - Depends on: {', '.join(step['depends_on'])}")
+        if step.get("persistent_paths"):
+            lines.append(f"  - Persistent paths: {', '.join(step['persistent_paths'])}")
         if step.get("acceptance_criteria"):
             lines.append("  - Acceptance criteria:")
             for criterion in step["acceptance_criteria"]:

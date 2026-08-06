@@ -11,6 +11,7 @@ from .bounds import clamp_text, estimate_tokens
 from .protocol import (
     HARNESS_EFFECTIVE_REVIEW_MARKER,
     HARNESS_RESPONSE_OMISSION_MARKER,
+    SHARED_SYSTEM_CONTEXT_MARKER,
     VALIDATED_FEEDBACK_DECISION_MARKER,
 )
 
@@ -228,32 +229,90 @@ class Conversation:
     def messages(
         self,
         *,
+        recipient: str | None = None,
         system_as_user: bool = False,
         reviewer_view: bool = False,
     ) -> list[dict[str, str]]:
         """Return chat messages with roles appropriate to the receiving model.
 
-        Feedback responses are stored as user turns so the implementation model
-        receives them as external critique. When the feedback model reads the
-        shared transcript, those same turns are its prior assistant decisions,
-        not new user instructions. Presenting the correct role avoids turning a
-        previous reviewer opinion into a new instruction. Harness-owned effective
-        reviews keep their user role so their provenance remains explicit.
+        Audit labels record which participant produced a turn, but they are not
+        model protocol. Replaying those labels taught smaller models to emit the
+        same wrappers even though the current phase requires bare JSON. Each
+        participant therefore sees its own requests as user turns, its own
+        responses as assistant turns, and the other participant's output as
+        external user evidence. Requests addressed only to the other participant
+        stay in the audit transcript but are omitted from this model-facing view.
         """
+        if recipient is None:
+            recipient = "reviewer" if reviewer_view else "implementation"
+        if recipient not in {"implementation", "reviewer"}:
+            raise ValueError("recipient must be 'implementation' or 'reviewer'")
+
         messages: list[dict[str, str]] = []
         for turn in self.turns:
             if system_as_user and turn.role == "system":
-                messages.append({"role": "user", "content": "TRANSCRIPT_SYSTEM_NOTE:\n" + turn.content})
-            elif reviewer_view and turn.content.startswith("FEEDBACK_AGENT_RESPONSE:"):
-                messages.append({"role": "assistant", "content": turn.content})
-            else:
+                messages.append({"role": "user", "content": "Shared harness context:\n" + turn.content})
+                continue
+            if turn.role == "system":
                 messages.append(asdict(turn))
+                continue
+
+            marker, separator, body = turn.content.partition("\n")
+            if not separator:
+                messages.append(asdict(turn))
+                continue
+
+            if marker == "IMPLEMENTATION_AGENT_REQUEST:":
+                if recipient == "implementation":
+                    messages.append({"role": "user", "content": body})
+                continue
+            if marker == "IMPLEMENTATION_AGENT_RESPONSE:":
+                body = self._strip_repeated_audit_wrapper(
+                    body,
+                    "IMPLEMENTATION_AGENT_RESPONSE:",
+                )
+                if recipient == "implementation":
+                    messages.append({"role": "assistant", "content": body})
+                else:
+                    messages.append({"role": "user", "content": "Implementation output to review:\n" + body})
+                continue
+            if marker == "FEEDBACK_AGENT_REQUEST:":
+                if recipient == "reviewer":
+                    messages.append({"role": "user", "content": body})
+                continue
+            if marker == "FEEDBACK_AGENT_RESPONSE:":
+                body = self._strip_repeated_audit_wrapper(
+                    body,
+                    "FEEDBACK_AGENT_RESPONSE:",
+                )
+                if recipient == "reviewer":
+                    messages.append({"role": "assistant", "content": body})
+                else:
+                    messages.append({"role": "user", "content": "External review of prior work:\n" + body})
+                continue
+            messages.append(asdict(turn))
         return messages
+
+    @staticmethod
+    def _strip_repeated_audit_wrapper(content: str, marker: str) -> str:
+        """Remove only duplicated harness transport labels from a model view."""
+        prefix = marker + "\n"
+        while content.startswith(prefix):
+            content = content[len(prefix):]
+        return content
 
     def estimated_tokens(self) -> int:
         return max(1, sum(estimate_tokens(t.content) for t in self.turns))
 
     def replace_with_memory(self, memory: str, keep_recent_turns: int) -> None:
+        base_system = next(
+            (
+                turn
+                for turn in self.turns
+                if turn.role == "system" and turn.content.startswith(SHARED_SYSTEM_CONTEXT_MARKER)
+            ),
+            None,
+        )
         raw_recent = self.turns[-keep_recent_turns:] if keep_recent_turns > 0 else []
         recent = [turn for turn in raw_recent if turn.role != "system"]
         memory_turn = Turn(
@@ -263,7 +322,7 @@ class Conversation:
                 "constraints, and unresolved risks:\n\n" + memory
             ),
         )
-        self.turns = [memory_turn, *recent]
+        self.turns = [turn for turn in (base_system, memory_turn) if turn is not None] + recent
         self._write_turns(self.path, self.turns)
         if self.full_path and self.full_path != self.path:
             self._append_turn_to_path(

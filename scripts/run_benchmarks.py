@@ -102,6 +102,7 @@ def benchmark_config(
 ) -> dict[str, Any]:
     impl = resolve_profile(implementation_profile)
     feedback = resolve_profile(feedback_profile) if feedback_profile else None
+    implementation_max_tokens = profile_safe_max_tokens(impl, max_tokens)
     implementation_reasoning_budget = (
         reasoning_budget_tokens
         if reasoning_budget_tokens is not None
@@ -109,12 +110,12 @@ def benchmark_config(
     )
     implementation_critical_reasoning_budget = derive_critical_reasoning_budget(
         implementation_reasoning_budget,
-        max_tokens,
+        implementation_max_tokens,
         critical_reasoning_budget_tokens,
     )
     _validate_direct_model_budget(
         implementation_profile,
-        max_tokens=max_tokens,
+        max_tokens=implementation_max_tokens,
         reasoning_budget_tokens=implementation_reasoning_budget,
         critical_reasoning_budget_tokens=implementation_critical_reasoning_budget,
     )
@@ -124,10 +125,13 @@ def benchmark_config(
         "api_key": "not-needed",
         "model": "local-gguf",
         "context_window": impl.context_window,
-        "max_tokens": max_tokens,
+        "max_tokens": implementation_max_tokens,
         "temperature": impl.temperature,
         "top_p": impl.top_p,
         "top_k": impl.top_k,
+        "min_p": impl.min_p,
+        "presence_penalty": impl.presence_penalty,
+        "repeat_penalty": impl.repeat_penalty,
         "request_timeout_seconds": 21600,
         "retry_attempts": 20,
         "retry_sleep_seconds": 30,
@@ -136,6 +140,7 @@ def benchmark_config(
         "reasoning_budget_tokens": implementation_reasoning_budget,
         "critical_reasoning_budget_tokens": critical_reasoning_budget_tokens,
         "send_reasoning_budget": True,
+        "system_prompt_as_user": impl.system_prompt_as_user,
     }
     data: dict[str, Any] = {
         "implementation_model": model_cfg,
@@ -160,7 +165,7 @@ def benchmark_config(
             "web_interaction": True,
         },
         "loop": {
-            "max_approach_reattempts": 5,
+            "max_approach_reattempts": 1,
         },
         "phases": {
             "analysis": {"max_iterations": 2},
@@ -176,6 +181,7 @@ def benchmark_config(
     if task.get("web_research", False):
         data["web_research"] = {"enabled": True}
     if feedback:
+        feedback_max_tokens = profile_safe_max_tokens(feedback, max_tokens)
         feedback_reasoning_budget = (
             reasoning_budget_tokens
             if reasoning_budget_tokens is not None
@@ -183,12 +189,12 @@ def benchmark_config(
         )
         feedback_critical_reasoning_budget = derive_critical_reasoning_budget(
             feedback_reasoning_budget,
-            max_tokens,
+            feedback_max_tokens,
             critical_reasoning_budget_tokens,
         )
         _validate_direct_model_budget(
             feedback.name,
-            max_tokens=max_tokens,
+            max_tokens=feedback_max_tokens,
             reasoning_budget_tokens=feedback_reasoning_budget,
             critical_reasoning_budget_tokens=feedback_critical_reasoning_budget,
         )
@@ -197,11 +203,16 @@ def benchmark_config(
             "name": feedback.name,
             "base_url": f"http://127.0.0.1:{feedback.port}/v1",
             "context_window": feedback.context_window,
+            "max_tokens": feedback_max_tokens,
             "temperature": feedback.temperature,
             "top_p": feedback.top_p,
             "top_k": feedback.top_k,
+            "min_p": feedback.min_p,
+            "presence_penalty": feedback.presence_penalty,
+            "repeat_penalty": feedback.repeat_penalty,
             "reasoning_budget_tokens": feedback_reasoning_budget,
             "critical_reasoning_budget_tokens": critical_reasoning_budget_tokens,
+            "system_prompt_as_user": feedback.system_prompt_as_user,
         }
     if task.get("config_overrides"):
         data = _deep_merge(data, task["config_overrides"])
@@ -235,6 +246,7 @@ def direct_model_config(
     critical_reasoning_budget_tokens: int | None = None,
 ) -> ModelConfig:
     profile = resolve_profile(profile_name)
+    effective_max_tokens = profile_safe_max_tokens(profile, max_tokens)
     effective_reasoning_budget = (
         reasoning_budget_tokens
         if reasoning_budget_tokens is not None
@@ -242,12 +254,12 @@ def direct_model_config(
     )
     effective_critical_reasoning_budget = derive_critical_reasoning_budget(
         effective_reasoning_budget,
-        max_tokens,
+        effective_max_tokens,
         critical_reasoning_budget_tokens,
     )
     _validate_direct_model_budget(
         profile_name,
-        max_tokens=max_tokens,
+        max_tokens=effective_max_tokens,
         reasoning_budget_tokens=effective_reasoning_budget,
         critical_reasoning_budget_tokens=effective_critical_reasoning_budget,
     )
@@ -257,10 +269,13 @@ def direct_model_config(
         api_key="not-needed",
         model="local-gguf",
         context_window=profile.context_window,
-        max_tokens=max_tokens,
+        max_tokens=effective_max_tokens,
         temperature=profile.temperature,
         top_p=profile.top_p,
         top_k=profile.top_k,
+        min_p=profile.min_p,
+        presence_penalty=profile.presence_penalty,
+        repeat_penalty=profile.repeat_penalty,
         request_timeout_seconds=21600,
         retry_attempts=20,
         retry_sleep_seconds=30,
@@ -270,7 +285,16 @@ def direct_model_config(
         critical_reasoning_budget_tokens=effective_critical_reasoning_budget,
         send_reasoning_budget=True,
         request_json_object=True,
+        system_prompt_as_user=profile.system_prompt_as_user,
     )
+
+
+def profile_safe_max_tokens(profile: ModelProfile, requested_max_tokens: int) -> int:
+    if requested_max_tokens <= 0:
+        raise ValueError(f"{profile.name}: max_tokens must be greater than zero")
+    if profile.context_window <= 0 or requested_max_tokens < profile.context_window:
+        return requested_max_tokens
+    return max(1, profile.context_window - 1)
 
 
 def _validate_direct_model_budget(
@@ -364,7 +388,6 @@ def run_single_shot(
                 {"role": "user", "content": prompt},
             ],
             max_tokens=max_tokens,
-            temperature=0.2,
         )
         payload = extract_json_object(raw)
         files = payload.get("files", [])
@@ -429,7 +452,9 @@ def manual_grade_task(
     prompt = (
         "You are grading one completed benchmark task. Decide whether the produced workspace satisfies the task.\n"
         "Return strict JSON only with this shape:\n"
-        '{ "grade": "manual_pass" | "manual_fail", "evidence": ["short concrete evidence"], "concerns": ["short concerns"] }\n'
+        '{ "grade": "manual_fail", "evidence": [], "concerns": ["missing or failed requirement"] }\n'
+        "Set grade to exactly manual_pass or manual_fail; the example is the conservative failure shape, "
+        "not a predetermined verdict.\n"
         "Use manual_pass only when the artifacts satisfy the user prompt and all pass criteria. "
         "Use manual_fail when required evidence is missing, invalid, or ambiguous.\n\n"
         f"Task title: {task['title']}\n"

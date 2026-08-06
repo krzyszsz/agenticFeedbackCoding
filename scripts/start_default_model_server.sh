@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LLAMA_CPP_PIN="876a4321163249c43ca4e986818fab5ab081f282"
 source "$REPO_ROOT/scripts/env.sh"
 
 if [ -n "${MODEL_PROFILE:-}" ]; then
@@ -35,6 +36,7 @@ REASONING_BUDGET="${REASONING_BUDGET:-4096}"
 REASONING_FORMAT="${REASONING_FORMAT:-deepseek}"
 SPEC_TYPE="${SPEC_TYPE:-}"
 SPEC_DRAFT_N_MAX="${SPEC_DRAFT_N_MAX:-0}"
+PROFILE_LLAMA_EXTRA_ARGS="${PROFILE_LLAMA_EXTRA_ARGS:-}"
 
 if [ ! -f "$MODEL_PATH" ]; then
   echo "Missing model: $MODEL_PATH" >&2
@@ -59,6 +61,9 @@ fi
 if [ "$SPEC_DRAFT_N_MAX" -gt 0 ]; then
   EXTRA_ARGS="$EXTRA_ARGS --spec-draft-n-max $SPEC_DRAFT_N_MAX"
 fi
+if [ -n "$PROFILE_LLAMA_EXTRA_ARGS" ]; then
+  EXTRA_ARGS="$EXTRA_ARGS $PROFILE_LLAMA_EXTRA_ARGS"
+fi
 if [ -n "$LLAMA_DEVICE" ] && [ "$USE_DRI" = "1" ]; then
   EXTRA_ARGS="$EXTRA_ARGS --device $LLAMA_DEVICE"
 fi
@@ -78,7 +83,7 @@ if [ "${REBUILD_SERVER_IMAGE:-0}" = "1" ] || ! "${DOCKER[@]}" image inspect "$SE
   fi
   "${DOCKER[@]}" build \
     -f "$REPO_ROOT/docker/llama-cpp-vulkan.Dockerfile" \
-    --build-arg "LLAMA_CPP_REF=${LLAMA_CPP_REF:-master}" \
+    --build-arg "LLAMA_CPP_REF=${LLAMA_CPP_REF:-$LLAMA_CPP_PIN}" \
     --build-arg "LLAMA_CPP_CACHEBUST=$LLAMA_CPP_CACHEBUST_VALUE" \
     -t "$SERVER_IMAGE" \
     "$REPO_ROOT"

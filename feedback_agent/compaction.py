@@ -132,13 +132,11 @@ def maybe_compact(
                 memory = compaction_chat(
                     [{"role": "user", "content": prompt}],
                     max_tokens=cfg.summary_max_tokens,
-                    temperature=0.1,
                 )
             else:
                 memory = client.chat(
                     [{"role": "user", "content": prompt}],
                     max_tokens=cfg.summary_max_tokens,
-                    temperature=0.1,
                 )
         except Exception:
             memory = deterministic_compact_turns(

@@ -14,6 +14,7 @@ from .config import ModelConfig
 
 MIN_MODEL_RESPONSE_BYTES = 1_000_000
 MAX_MODEL_RESPONSE_BYTES = 64 * 1024 * 1024
+JSON_OBJECT_RESPONSE_FORMAT = {"type": "json_object"}
 
 
 class ModelRequestRetrier:
@@ -253,9 +254,13 @@ class OpenAICompatClient:
         request_json_object: bool,
     ) -> str:
         response_tokens = self.cfg.max_tokens if max_tokens is None else max_tokens
+        model_messages = _messages_for_model(
+            messages,
+            system_prompt_as_user=self.cfg.system_prompt_as_user,
+        )
         payload = {
             "model": self.cfg.model,
-            "messages": messages,
+            "messages": model_messages,
             "temperature": self.cfg.temperature if temperature is None else temperature,
             "max_tokens": response_tokens,
         }
@@ -263,10 +268,16 @@ class OpenAICompatClient:
             payload["top_p"] = self.cfg.top_p
         if self.cfg.top_k is not None:
             payload["top_k"] = self.cfg.top_k
+        if self.cfg.min_p is not None:
+            payload["min_p"] = self.cfg.min_p
+        if self.cfg.presence_penalty is not None:
+            payload["presence_penalty"] = self.cfg.presence_penalty
+        if self.cfg.repeat_penalty is not None:
+            payload["repeat_penalty"] = self.cfg.repeat_penalty
         if self.cfg.send_reasoning_budget and reasoning_budget_tokens is not None:
             payload["reasoning_budget"] = reasoning_budget_tokens
         if request_json_object:
-            payload["response_format"] = {"type": "json_object"}
+            payload["response_format"] = JSON_OBJECT_RESPONSE_FORMAT
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             f"{self.cfg.base_url}/chat/completions",
@@ -303,7 +314,7 @@ class OpenAICompatClient:
             return format_assistant_message(msg, preserve_reasoning=self.cfg.preserve_reasoning)
 
         def send_with_heartbeat() -> str:
-            input_tokens = sum(max(1, len(str(message.get("content") or "")) // 4) for message in messages)
+            input_tokens = sum(max(1, len(str(message.get("content") or "")) // 4) for message in model_messages)
             print(
                 f"[model-call] starting {request_label}: input~{input_tokens} tokens; "
                 f"max_output={response_tokens}; reasoning_budget={reasoning_budget_tokens}.",
@@ -370,6 +381,32 @@ def format_assistant_message(msg: dict, *, preserve_reasoning: bool) -> str:
     if content:
         return f"{reasoning_block}\n{content}"
     return reasoning_block
+
+
+def _messages_for_model(
+    messages: list[dict[str, str]],
+    *,
+    system_prompt_as_user: bool,
+) -> list[dict[str, str]]:
+    """Apply role constraints and produce a template-safe turn sequence.
+
+    Recipient filtering and compaction can legitimately leave adjacent messages
+    with the same role. Coalescing those messages preserves their full labelled
+    content while avoiding model-template assumptions that roles alternate or
+    that only one initial system turn exists.
+    """
+    converted: list[dict[str, str]] = []
+    for message in messages:
+        original_role = str(message.get("role") or "user")
+        role = "user" if system_prompt_as_user and original_role == "system" else original_role
+        content = str(message.get("content") or "")
+        if system_prompt_as_user and original_role == "system":
+            content = "Harness instructions:\n" + content
+        if converted and converted[-1]["role"] == role:
+            converted[-1]["content"] += "\n\n" + content
+        else:
+            converted.append({"role": role, "content": content})
+    return converted
 
 
 def _message_reasoning_content(msg: dict) -> str:
