@@ -12,8 +12,9 @@ radius; it does not make arbitrary model-generated work risk-free.
 The default local profile is `Gemma 4 26B A4B QAT MTP`, served by
 llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395
 / Strix Halo. Checked-in profiles cover Gemma, Qwen, Qwen-Coder, Qwopus,
-Devstral, and DeepSeek GGUF models. Other compatible local or remote models can
-be configured. Normal work uses two Docker containers for isolation and
+Devstral, DeepSeek, KAT-Coder, Fable Fusion, and Qwythos GGUF models. Other
+compatible local or remote models can be configured. Normal work uses two
+Docker containers for isolation and
 reproducibility: one model-server container and one agent container on a shared
 Docker network. The generated project workspace is the agent's only writable
 host mount; its config is mounted read-only.
@@ -289,6 +290,10 @@ python -m feedback_agent.model_profiles list
 | `deepseek-r1-distill-llama-8b` | reasoning dense | 8170 | 131k | Llama-based DeepSeek R1 8B distill. |
 | `qwen2.5-coder-7b-instruct` | coding dense | 8171 | 131k | Qwen2.5-Coder 7B Instruct. |
 | `qwopus3.6-27b-coder` | coding dense | 8172 | 32k | Qwopus3.6 27B Coder compatibility GGUF with bundled MTP head. |
+| `devstral-small-2512` | coding dense | 8173 | 131k | Devstral Small 2 24B Instruct 2512. |
+| `qwen36-fable-fusion-mtp` | strong dense | 8174 | 131k | DavidAU Qwen3.6 Fable Fusion MTP Q4_K_M profile. |
+| `kat-coder-v2.5-dev` | coding MoE | 8175 | 131k | KAT-Coder V2.5 Dev 35B total / 3B active MoE. |
+| `qwythos-27b-mtp` | reasoning dense | 8176 | 131k | Qwythos 27B v1 MTP with agentic/tool-use sampling. |
 
 Start a specific profile:
 
@@ -298,6 +303,10 @@ MODEL_PROFILE=gemma4-31b-qat-mtp bash scripts/start_default_model_server.sh
 MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/start_default_model_server.sh
 MODEL_PROFILE=qwen3-coder-next bash scripts/start_default_model_server.sh
 MODEL_PROFILE=qwopus3.6-27b-coder bash scripts/start_default_model_server.sh
+MODEL_PROFILE=devstral-small-2512 bash scripts/start_default_model_server.sh
+MODEL_PROFILE=qwen36-fable-fusion-mtp bash scripts/start_default_model_server.sh
+MODEL_PROFILE=kat-coder-v2.5-dev bash scripts/start_default_model_server.sh
+MODEL_PROFILE=qwythos-27b-mtp bash scripts/start_default_model_server.sh
 ```
 
 If a configured artifact is missing, run the same command with
@@ -329,88 +338,70 @@ The benchmark corpus is `benchmarks/tasks.json`. It currently contains 44 tasks.
 
 ### August 2026 Publication Matrix
 
-The current publication matrix ran all 30 `publication-30` tasks for every
-checked model in both zero-shot and full-harness modes: 720 Docker-isolated task
-runs and 124.77 task-hours. Models ran sequentially with the documented
-two-container workflow: one model-server container and one separate agent
-container on `agentic-feedback-net`.
+The current public evidence uses the 30-task `publication-30` suite. Zero-shot
+baselines were refreshed on 2026-08-06 for all 16 checked profiles with the
+current model parameters. Full-harness rows combine the 2026-08-01 12-model
+matrix with the 2026-08-06 refresh for the newly added profiles. All completed
+runs used the documented two-container workflow: one model-server container and
+one separate benchmark-agent container on `agentic-feedback-net`.
 
-Zero-shot means a single model call followed by the same Docker-isolated grader.
-It does not run analysis, planning, feedback, tool review, repair, or approach
-review. The benchmark runner flag is still named `--mode single-shot` for this
-path. Manual grades are lower-confidence AI judgments and are labeled
-`manual_pass` or `manual_fail`; all other grades come from independent
-return-code and artifact checks.
+Zero-shot means one model call followed by the same Docker-isolated grader. It
+does not run analysis, planning, feedback, tool review, repair, or approach
+review. The runner flag is still named `--mode single-shot` for this path.
 
 | Setting | Value |
 |---|---|
 | Suite | `publication-30` |
-| Models | 12 profiles, each run as zero-shot and full harness |
+| Completed zero-shot evidence | 16 profiles, 480 tasks, 8.99 task-hours |
+| Completed full-harness evidence | 15 profiles, 450 tasks, 144.49 task-hours |
+| Qwythos full-harness status | Incomplete: stopped after >64m on task 1 while repeating `S1` repair attempts |
 | Task deadline | Disabled (`--task-timeout-seconds 0`) |
 | Alternative approaches | Publication configs cap full-suite approach retries at 1 unless overridden |
-| Reasoning budget | Profile default base budget, with larger critical budget for high-value review/repair phases |
-| Transcript mode | Full transcripts suppressed in the terminal; result files and per-task logs preserved locally |
-| Grading | Docker-isolated automatic checks plus six manual tasks |
-| Raw local evidence | `runs/publication-20260801-full-matrix/<profile>/<zero-shot|harness>/results.json` |
+| Reasoning budget | Profile default base budget, with larger critical budget for high-value review and repair phases |
+| Grading | Docker-isolated automatic checks plus manual grades labeled `manual_pass` or `manual_fail` |
+| Raw local evidence | `runs/publication-20260801-full-matrix/` and `runs/publication-20260806-model-refresh/` |
+| Failure analysis | `docs/benchmark-failure-analysis-20260806.md` |
 
 #### Summary
 
-| Model | Zero-shot pass | Zero-shot fail | Zero-shot time | Harness pass | Harness fail | Harness time | Delta |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Gemma 4 26B A4B QAT MTP | 21 | 9 | 24.3m | 26 | 4 | 6.87h | +5 |
-| Gemma 4 31B QAT MTP | 27 | 3 | 38.6m | 28 | 2 | 20.34h | +1 |
-| Qwen3.6 27B MTP | 12 | 18 | 56.6m | 28 | 2 | 16.11h | +16 |
-| Qwen3-Coder-Next | 11 | 19 | 12.5m | 21 | 9 | 5.53h | +10 |
-| DeepSeek R1 Distill Qwen 7B | 0 | 30 | 20.7m | 0 | 30 | 2.96h | +0 |
-| Devstral Small 2507 | 16 | 14 | 19.2m | 18 | 12 | 8.06h | +2 |
-| DeepSeek-Coder-V2-Lite Instruct | 5 | 25 | 2.8m | 0 | 30 | 31.4m | -5 |
-| DeepSeek R1 0528 Qwen3 8B | 8 | 22 | 51.4m | 9 | 21 | 27.25h | +1 |
-| Qwen3 8B | 14 | 16 | 31.1m | 14 | 16 | 18.97h | +0 |
-| DeepSeek R1 Distill Llama 8B | 0 | 30 | 37.0m | 0 | 30 | 1.73h | +0 |
-| Qwen2.5-Coder 7B Instruct | 2 | 28 | 5.7m | 0 | 30 | 23.7m | -2 |
-| Qwopus3.6 27B Coder | 18 | 12 | 41.6m | 26 | 4 | 10.35h | +8 |
-
-#### Harness Failures
-
-| Model | Failed publication tasks |
-|---|---|
-| Gemma 4 26B A4B QAT MTP | `tool-002`, `hist-002`, `hist-003`, `hist-006` |
-| Gemma 4 31B QAT MTP | `hist-002`, `hist-006` |
-| Qwen3.6 27B MTP | `code-003`, `hist-006` |
-| Qwen3-Coder-Next | `algo-003`, `code-003`, `tool-001`, `tool-003`, `tool-004`, `tool-005`, `web-001`, `hist-002`, `hist-003` |
-| DeepSeek R1 Distill Qwen 7B | all 30 tasks |
-| Devstral Small 2507 | `algo-001`, `algo-002`, `algo-003`, `algo-004`, `algo-005`, `tool-001`, `tool-002`, `web-002`, `integration-001`, `hist-002`, `hist-003`, `hist-006` |
-| DeepSeek-Coder-V2-Lite Instruct | all 30 tasks |
-| DeepSeek R1 0528 Qwen3 8B | `algo-002`, `algo-003`, `algo-005`, `code-003`, `code-004`, `tool-001`, `tool-002`, `tool-003`, `tool-004`, `web-001`, `web-002`, `workflow-001`, `workflow-002`, `data-001`, `data-002`, `planning-002`, `integration-001`, `hist-001`, `hist-002`, `hist-003`, `hist-006` |
-| Qwen3 8B | `algo-001`, `algo-002`, `algo-003`, `algo-004`, `algo-005`, `code-003`, `tool-002`, `tool-003`, `web-002`, `data-001`, `safety-001`, `long-001`, `integration-001`, `hist-002`, `hist-003`, `hist-006` |
-| DeepSeek R1 Distill Llama 8B | all 30 tasks |
-| Qwen2.5-Coder 7B Instruct | all 30 tasks |
-| Qwopus3.6 27B Coder | `algo-003`, `code-003`, `long-001`, `hist-006` |
+| Model | Zero-shot | Zero-shot time | Harness | Harness time | Delta | Harness evidence |
+|---|---:|---:|---:|---:|---:|---|
+| Gemma 4 31B QAT MTP | 28/30 | 40.0m | 28/30 | 20.34h | +0 | 2026-08-01 |
+| Qwen3.6 Fable Fusion MTP | 24/30 | 57.2m | 28/30 | 15.60h | +4 | 2026-08-06 |
+| Qwen3.6 27B MTP | 8/30 | 67.3m | 28/30 | 16.11h | +20 | 2026-08-01 |
+| Gemma 4 26B A4B QAT MTP | 21/30 | 25.8m | 26/30 | 6.87h | +5 | 2026-08-01 |
+| Qwopus3.6 27B Coder | 14/30 | 40.6m | 26/30 | 10.35h | +12 | 2026-08-01 |
+| KAT-Coder V2.5 Dev | 7/30 | 17.5m | 22/30 | 4.95h | +15 | 2026-08-06 |
+| Qwen3-Coder-Next | 14/30 | 12.2m | 21/30 | 5.53h | +7 | 2026-08-01 |
+| Qwythos 27B MTP | 20/30 | 69.3m | incomplete | >64m on task 1 | n/a | 2026-08-06 incomplete |
+| Devstral Small 2 2512 | 18/30 | 27.4m | 2/30 | 4.87h | -16 | 2026-08-06 |
+| Devstral Small 2507 | 15/30 | 20.4m | 18/30 | 8.06h | +3 | 2026-08-01 |
+| Qwen3 8B | 14/30 | 30.2m | 14/30 | 18.97h | +0 | 2026-08-01 |
+| DeepSeek R1 0528 Qwen3 8B | 10/30 | 54.8m | 9/30 | 27.25h | -1 | 2026-08-01 |
+| DeepSeek-Coder-V2-Lite Instruct | 4/30 | 3.0m | 0/30 | 0.52h | -4 | 2026-08-01 |
+| Qwen2.5-Coder 7B Instruct | 7/30 | 5.3m | 0/30 | 0.39h | -7 | 2026-08-01 |
+| DeepSeek R1 Distill Qwen 7B | 0/30 | 32.7m | 0/30 | 2.96h | +0 | 2026-08-01 |
+| DeepSeek R1 Distill Llama 8B | 0/30 | 35.4m | 0/30 | 1.73h | +0 | 2026-08-01 |
 
 #### Findings
 
-- The harness produced a positive pass-count lift for 7 of 12 profiles, was
-  neutral for 3 profiles, and regressed 2 small coding profiles. The largest
-  gains were Qwen3.6 27B MTP (`+16`), Qwen3-Coder-Next (`+10`), and Qwopus3.6
-  27B Coder (`+8`).
-- The tradeoff is cost. Stronger harness runs took hours per suite rather than
-  minutes. That is expected for evidence-based repair, but the long tail is now
-  the main reliability risk.
-- Qwopus and the two larger Qwen/Gemma profiles show the clearest practical
-  value: they moved many exact-answer, coding, tool, and historical tasks from
-  fail to pass without benchmark-specific prompt rules.
-- Very weak profiles did not become useful just by adding feedback cycles.
-  DeepSeek R1 Distill Qwen 7B, DeepSeek R1 Distill Llama 8B, and
-  Qwen2.5-Coder 7B did not produce usable full-harness results on this suite.
-- One Qwen3 8B harness task, `tool-002-log-watch`, entered a long-running tool
-  supervision loop and was manually stopped so the matrix could continue. It is
-  scored as a fail. This is the clearest remaining harness defect: progress
-  review can recognize a live command but still fail to decide that it is no
-  longer useful.
-- A benchmark-runner bug was found during Qwopus reruns: generated configs could
-  request `max_tokens` equal to a model's context window. The runner now clamps
-  profile-derived `max_tokens` below `context_window`; Qwopus harness results in
-  this table are from the corrected rerun.
+- The harness still helps capable profiles substantially, but the effect is
+  profile-dependent. The biggest current lifts are Qwen3.6 27B MTP (`+20`),
+  KAT-Coder V2.5 Dev (`+15`), Qwopus3.6 27B Coder (`+12`), and
+  Qwen3-Coder-Next (`+7`).
+- The cost is large. Strong full-harness suites take hours rather than minutes.
+  This is the expected tradeoff for evidence-based repair, but the long tail is
+  now the main reliability problem.
+- Qwen3.6 Fable Fusion MTP is the strongest newly added model by pass rate
+  (`28/30`), but it required 15.60h. KAT-Coder V2.5 Dev improved from `7/30`
+  zero-shot to `22/30` under the harness in 4.95h.
+- Devstral Small 2 2512 regressed badly under the harness (`18/30` zero-shot to
+  `2/30` harness). Its logs show heavy protocol-repair overhead, so it should
+  not be recommended for this harness profile without more work.
+- Qwythos 27B MTP had a strong zero-shot baseline (`20/30`) but did not produce
+  a usable full-harness score. The first harness task exceeded 64 minutes while
+  still repeating the same `S1` repair loop, so the run is reported as
+  incomplete rather than scored as a 30-task result.
 
 #### Reproduce
 
@@ -436,8 +427,8 @@ Use `--mode single-shot` for the no-harness path. The runner writes
 `runs/benchmarks-<timestamp>/`; workspaces are under
 `workspaces/benchmarks/<timestamp>/`. Both are intentionally ignored by git.
 The normalized publication results are recorded in the tables above. Local raw
-evidence for the current matrix is under
-`runs/publication-20260801-full-matrix/`.
+evidence for the current matrix is under `runs/publication-20260801-full-matrix/`
+and `runs/publication-20260806-model-refresh/`.
 
 Before the first task, the runner normally rebuilds the agent image from the
 current source. The runtime image excludes benchmark prompts, graders,
@@ -452,12 +443,12 @@ evidence.
 
 | Check | Result |
 |---|---|
-| Unit tests | 532 passed in 121.862 seconds with `python3 -m unittest discover -s tests`. |
 | Static compilation | `python3 -m compileall -q feedback_agent scripts tests` passed. |
-| Config validation | All 15 checked-in config files loaded through production validation. |
-| Corpus integrity | 44 unique task IDs; every suite points at valid unique task IDs, including 30 unique `publication-30` tasks. |
-| Harness isolation | Publication runs used one model-server container plus one agent container, with models run sequentially. |
-| Publication artifacts | 24 result files: 12 profiles times zero-shot and full-harness modes, each with 30 unique task IDs. |
+| Unit tests | 532 passed in 121.884s with `python3 -m unittest discover -s tests`. |
+| Config validation | 15 checked-in config files loaded and passed production validation. |
+| Corpus integrity | 44 tasks, 7 valid suites, and 30 unique `publication-30` task IDs. |
+| Profile validation | New model profiles resolved through `python3 -m feedback_agent.model_profiles json <profile>`. |
+| Container cleanup | No benchmark or refresh model containers remained after the run. |
 
 ## Safety Model
 
