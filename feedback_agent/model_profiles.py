@@ -460,6 +460,36 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         presence_penalty=0.0,
         repeat_penalty=1.05,
     ),
+    "qwen3.8-27b": ModelProfile(
+        name="qwen3.8-27b",
+        role="strong_dense",
+        repo_id="unsloth/Qwen3.8-27B-GGUF",
+        local_dir="/mnt/hf/models/qwen3.8-27b-gguf",
+        model_file="Qwen3.8-27B-UD-Q4_K_XL.gguf",
+        draft_file=None,
+        mmproj_file=None,
+        container_name="agentic-qwen38-27b-server",
+        port=8177,
+        context_window=262144,
+        memory_limit="75g",
+        memory_reservation="67g",
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        reasoning_mode="on",
+        reasoning_format="deepseek",
+        reasoning_budget_tokens=8192,
+        spec_type="draft-mtp",
+        spec_draft_n_max=2,
+        notes=(
+            "Qwen3.8 27B Unsloth Dynamic V3.0 UD-Q4_K_XL GGUF profile with "
+            "native 262K context, preserved thinking, and a larger reasoning budget."
+        ),
+        server_extra_args="--reasoning-preserve",
+        min_p=0.0,
+        presence_penalty=0.0,
+        repeat_penalty=1.0,
+    ),
 }
 
 ALIASES = {
@@ -496,6 +526,9 @@ ALIASES = {
     "qwythos": "qwythos-27b-mtp",
     "qwythos-27b": "qwythos-27b-mtp",
     "qwythos-27b-v1": "qwythos-27b-mtp",
+    "qwen38": "qwen3.8-27b",
+    "qwen3.8": "qwen3.8-27b",
+    "qwen38-27b": "qwen3.8-27b",
 }
 
 

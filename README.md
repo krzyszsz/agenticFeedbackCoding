@@ -294,6 +294,7 @@ python -m feedback_agent.model_profiles list
 | `qwen36-fable-fusion-mtp` | strong dense | 8174 | 131k | DavidAU Qwen3.6 Fable Fusion MTP Q4_K_M profile. |
 | `kat-coder-v2.5-dev` | coding MoE | 8175 | 131k | KAT-Coder V2.5 Dev 35B total / 3B active MoE. |
 | `qwythos-27b-mtp` | reasoning dense | 8176 | 131k | Qwythos 27B v1 MTP with agentic/tool-use sampling. |
+| `qwen3.8-27b` | strong dense | 8177 | 262k | Qwen3.8 27B Unsloth Dynamic V3.0 UD-Q4_K_XL GGUF profile with preserved thinking and larger reasoning budget. |
 
 Start a specific profile:
 
@@ -307,6 +308,7 @@ MODEL_PROFILE=devstral-small-2512 bash scripts/start_default_model_server.sh
 MODEL_PROFILE=qwen36-fable-fusion-mtp bash scripts/start_default_model_server.sh
 MODEL_PROFILE=kat-coder-v2.5-dev bash scripts/start_default_model_server.sh
 MODEL_PROFILE=qwythos-27b-mtp bash scripts/start_default_model_server.sh
+MODEL_PROFILE=qwen3.8-27b bash scripts/start_default_model_server.sh
 ```
 
 If a configured artifact is missing, run the same command with
@@ -339,11 +341,13 @@ The benchmark corpus is `benchmarks/tasks.json`. It currently contains 44 tasks.
 ### August 2026 Publication Matrix
 
 The current public evidence uses the 30-task `publication-30` suite. Zero-shot
-baselines were refreshed on 2026-08-06 for all 16 checked profiles with the
-current model parameters. Full-harness rows combine the 2026-08-01 12-model
-matrix with the 2026-08-06 refresh for the newly added profiles. All completed
-runs used the documented two-container workflow: one model-server container and
-one separate benchmark-agent container on `agentic-feedback-net`.
+baselines were refreshed on 2026-08-06 for the first 16 checked profiles, then
+Qwen3.8 27B was added and benchmarked on 2026-08-15 to 2026-08-17. Qwen3.8 was
+rerun on 2026-08-18 to 2026-08-19 with its recommended high-thinking profile.
+Full-harness rows combine the 2026-08-01 12-model matrix, the 2026-08-06 refresh
+for newly added profiles, and the latest Qwen3.8 high-thinking run. All
+completed runs used the documented two-container workflow: one model-server
+container and one separate benchmark-agent container on `agentic-feedback-net`.
 
 Zero-shot means one model call followed by the same Docker-isolated grader. It
 does not run analysis, planning, feedback, tool review, repair, or approach
@@ -352,14 +356,14 @@ review. The runner flag is still named `--mode single-shot` for this path.
 | Setting | Value |
 |---|---|
 | Suite | `publication-30` |
-| Completed zero-shot evidence | 16 profiles, 480 tasks, 8.99 task-hours |
-| Completed full-harness evidence | 15 profiles, 450 tasks, 144.49 task-hours |
+| Completed zero-shot evidence | 17 profiles, 510 tasks, 12.02 task-hours |
+| Completed full-harness evidence | 16 profiles, 480 tasks, 180.34 task-hours |
 | Qwythos full-harness status | Incomplete: stopped after >64m on task 1 while repeating `S1` repair attempts |
 | Task deadline | Disabled (`--task-timeout-seconds 0`) |
 | Alternative approaches | Publication configs cap full-suite approach retries at 1 unless overridden |
 | Reasoning budget | Profile default base budget, with larger critical budget for high-value review and repair phases |
 | Grading | Docker-isolated automatic checks plus manual grades labeled `manual_pass` or `manual_fail` |
-| Raw local evidence | `runs/publication-20260801-full-matrix/` and `runs/publication-20260806-model-refresh/` |
+| Raw local evidence | `runs/publication-20260801-full-matrix/`, `runs/publication-20260806-model-refresh/`, `runs/publication-20260815-qwen38-27b/`, and `runs/publication-20260817-qwen38-27b-high-thinking/` |
 | Failure analysis | `docs/benchmark-failure-analysis-20260806.md` |
 
 #### Summary
@@ -369,6 +373,7 @@ review. The runner flag is still named `--mode single-shot` for this path.
 | Gemma 4 31B QAT MTP | 28/30 | 40.0m | 28/30 | 20.34h | +0 | 2026-08-01 |
 | Qwen3.6 Fable Fusion MTP | 24/30 | 57.2m | 28/30 | 15.60h | +4 | 2026-08-06 |
 | Qwen3.6 27B MTP | 8/30 | 67.3m | 28/30 | 16.11h | +20 | 2026-08-01 |
+| Qwen3.8 27B UD-Q4_K_XL high-thinking | 24/30 | 181.6m | 28/30 | 35.85h | +4 | 2026-08-19 |
 | Gemma 4 26B A4B QAT MTP | 21/30 | 25.8m | 26/30 | 6.87h | +5 | 2026-08-01 |
 | Qwopus3.6 27B Coder | 14/30 | 40.6m | 26/30 | 10.35h | +12 | 2026-08-01 |
 | KAT-Coder V2.5 Dev | 7/30 | 17.5m | 22/30 | 4.95h | +15 | 2026-08-06 |
@@ -392,6 +397,12 @@ review. The runner flag is still named `--mode single-shot` for this path.
 - The cost is large. Strong full-harness suites take hours rather than minutes.
   This is the expected tradeoff for evidence-based repair, but the long tail is
   now the main reliability problem.
+- Qwen3.8 27B improved from `24/30` zero-shot to `28/30` with the recommended
+  high-thinking harness profile. Compared with the earlier Qwen3.8 run, this
+  recovered one more harness task and two more zero-shot tasks, but harness
+  runtime increased from 29.24h to 35.85h. Its logs show high-value repair
+  benefit alongside expensive long-tail behavior in critical review/repair
+  phases.
 - Qwen3.6 Fable Fusion MTP is the strongest newly added model by pass rate
   (`28/30`), but it required 15.60h. KAT-Coder V2.5 Dev improved from `7/30`
   zero-shot to `22/30` under the harness in 4.95h.
@@ -427,8 +438,10 @@ Use `--mode single-shot` for the no-harness path. The runner writes
 `runs/benchmarks-<timestamp>/`; workspaces are under
 `workspaces/benchmarks/<timestamp>/`. Both are intentionally ignored by git.
 The normalized publication results are recorded in the tables above. Local raw
-evidence for the current matrix is under `runs/publication-20260801-full-matrix/`
-and `runs/publication-20260806-model-refresh/`.
+evidence for the current matrix is under `runs/publication-20260801-full-matrix/`,
+`runs/publication-20260806-model-refresh/`,
+`runs/publication-20260815-qwen38-27b/`, and
+`runs/publication-20260817-qwen38-27b-high-thinking/`.
 
 Before the first task, the runner normally rebuilds the agent image from the
 current source. The runtime image excludes benchmark prompts, graders,
