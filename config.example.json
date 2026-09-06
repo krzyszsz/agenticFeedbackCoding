@@ -48,16 +48,23 @@
     "enabled": true,
     "threshold_ratio": 0.8,
     "keep_recent_turns": 8,
-    "summary_max_tokens": 1024,
+    "summary_max_tokens": 2048,
+    "reasoning_budget_tokens": 1024,
+    "critical_reasoning_budget_tokens": 4096,
+    "model_repair_attempts": 1,
+    "initial_request_max_tokens": 0,
+    "initial_request_reference_max_tokens": 8192,
+    "source_max_tokens": 65536,
+    "recompaction_headroom_tokens": 8192,
     "tool_output_max_chars": 4000,
     "workspace_file_max_bytes": 20000,
     "workspace_snapshot_max_files": 1000,
     "workspace_snapshot_max_chars": 2000000,
     "git_diff_max_chars": 20000,
     "transcript_review_max_chars": 24000,
-    "max_uncompacted_tokens": 24000,
-    "recent_turns_max_tokens": 12000,
-    "model_summary_min_new_tokens": 2048
+    "max_uncompacted_tokens": 48000,
+    "recent_turns_max_tokens": 24000,
+    "model_summary_min_new_tokens": 0
   },
   "loop": {
     "max_approach_reattempts": 5

@@ -139,6 +139,11 @@ class ModelRequestHeartbeat:
 class OpenAICompatClient:
     def __init__(self, cfg: ModelConfig):
         self.cfg = cfg
+        # Synchronous callers can inspect why the immediately preceding model
+        # response stopped. Compaction uses this protocol metadata to avoid
+        # accepting a summary cut off by the output-token boundary.
+        self.last_response_finish_reason = ""
+        self.last_response_usage: dict[str, object] = {}
 
     def chat(self, messages: list[dict[str, str]], *, max_tokens: int | None = None, temperature: float | None = None) -> str:
         return self._chat(
@@ -193,11 +198,14 @@ class OpenAICompatClient:
         *,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        reasoning_budget_tokens: int | None = None,
     ) -> str:
         """Summarize context without spending the full task reasoning budget."""
-        reasoning_budget = self.cfg.reasoning_budget_tokens
-        if reasoning_budget is not None:
-            reasoning_budget = min(reasoning_budget, 512)
+        reasoning_budget = reasoning_budget_tokens
+        if reasoning_budget is None:
+            reasoning_budget = self.cfg.reasoning_budget_tokens
+            if reasoning_budget is not None:
+                reasoning_budget = min(reasoning_budget, 512)
         return self._chat(
             messages,
             max_tokens=max_tokens,
@@ -253,6 +261,8 @@ class OpenAICompatClient:
         retry_attempts: int | None = None,
         request_json_object: bool,
     ) -> str:
+        self.last_response_finish_reason = ""
+        self.last_response_usage = {}
         response_tokens = self.cfg.max_tokens if max_tokens is None else max_tokens
         model_messages = _messages_for_model(
             messages,
@@ -310,7 +320,12 @@ class OpenAICompatClient:
             body = json.loads(raw_body.decode("utf-8"))
             if body.get("error"):
                 raise RuntimeError(f"model returned error: {body['error']}")
-            msg = body["choices"][0]["message"]
+            choice = body["choices"][0]
+            self.last_response_finish_reason = str(choice.get("finish_reason") or "")
+            usage = body.get("usage")
+            if isinstance(usage, dict):
+                self.last_response_usage = dict(usage)
+            msg = choice["message"]
             return format_assistant_message(msg, preserve_reasoning=self.cfg.preserve_reasoning)
 
         def send_with_heartbeat() -> str:
@@ -396,12 +411,26 @@ def _messages_for_model(
     that only one initial system turn exists.
     """
     converted: list[dict[str, str]] = []
+    seen_non_system = False
     for message in messages:
         original_role = str(message.get("role") or "user")
-        role = "user" if system_prompt_as_user and original_role == "system" else original_role
         content = str(message.get("content") or "")
-        if system_prompt_as_user and original_role == "system":
-            content = "Harness instructions:\n" + content
+        if original_role == "system":
+            if system_prompt_as_user:
+                role = "user"
+                content = "Harness instructions:\n" + content
+            elif seen_non_system:
+                # Several llama.cpp chat templates permit system context only at
+                # the beginning. Preserve later harness receipts as labelled user
+                # context so protocol repair and compaction cannot create an
+                # invalid role sequence.
+                role = "user"
+                content = "Harness state update:\n" + content
+            else:
+                role = "system"
+        else:
+            role = original_role
+            seen_non_system = True
         if converted and converted[-1]["role"] == role:
             converted[-1]["content"] += "\n\n" + content
         else:

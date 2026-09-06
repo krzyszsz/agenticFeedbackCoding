@@ -1,963 +1,465 @@
 # agenticFeedbackCoding
 
-`agenticFeedbackCoding` runs a Docker-isolated local AI coding workflow. An
-implementation agent analyzes and executes a request while a feedback agent
-reviews plans, tool calls, evidence, repairs, and the final result.
+`agenticFeedbackCoding` is a general-purpose harness for local coding models.
+It does not solve tasks itself. It manages analysis, planning, context, tools,
+evidence, adversarial review, repair, and approach selection so the configured
+models can work more thoroughly than a single response allows.
 
-The project addresses two practical problems: weak model answers receive
-automatic evidence-based pushback, and generated commands run in a separate
-agent container with one writable project mount. Docker reduces the blast
-radius; it does not make arbitrary model-generated work risk-free.
+Normal operation uses two Docker containers:
 
-The default local profile is `Gemma 4 26B A4B QAT MTP`, served by
-llama.cpp/Vulkan through an OpenAI-compatible endpoint on AMD Ryzen AI Max+ 395
-/ Strix Halo. Checked-in profiles cover Gemma, Qwen, Qwen-Coder, Qwopus,
-Devstral, DeepSeek, KAT-Coder, Fable Fusion, and Qwythos GGUF models. Other
-compatible local or remote models can be configured. Normal work uses two
-Docker containers for isolation and
-reproducibility: one model-server container and one agent container on a shared
-Docker network. The generated project workspace is the agent's only writable
-host mount; its config is mounted read-only.
+- a persistent llama.cpp model server exposing an OpenAI-compatible API
+- an ephemeral agent container with one writable project mount
 
-The project is intentionally config-driven. One JSON file defines the model endpoint, workspace, review strictness, allowed tools, web/offline mode, context-safety limits, and the project prompt.
-
-## Architecture
-
-The normal local setup keeps model serving and agent execution in separate
-containers. The CLI script starts the workflow from one JSON config, the agent
-container talks to the model container through an OpenAI-compatible REST API,
-and only the generated workspace is mounted back to the host.
-
-```mermaid
-flowchart LR
-    User["User terminal"]
-    Config["config.*.json<br/>project prompt + knobs"]
-    CLI["scripts/build_and_run.sh<br/>scripts/run_agent.sh"]
-
-    subgraph Host["Host filesystem"]
-        Workspace["Mounted output workspace<br/>workspaces/my-project"]
-    end
-
-    subgraph Net["Docker network: agentic-feedback-net"]
-        subgraph ModelContainer["Model server container"]
-            Model["GGUF model profile<br/>Gemma/Qwen MTP or compatible"]
-            API["llama.cpp server<br/>OpenAI-compatible REST API<br/>:8161/v1"]
-            Model --> API
-        end
-
-        subgraph AgentContainer["Agent container"]
-            Impl["Implementation agent"]
-            Review["Feedback/review agent"]
-            Tools["Tools<br/>terminal, git, Python Playwright,<br/>optional web research"]
-            Impl <--> Review
-            Impl --> Tools
-            Review --> Tools
-        end
-    end
-
-    User --> Config
-    Config --> CLI
-    CLI --> AgentContainer
-    User -->|starts separately| ModelContainer
-    AgentContainer <-->|REST API| API
-    AgentContainer -->|writes files, transcripts, evidence| Workspace
-```
+Docker limits filesystem and device access, but it does not make arbitrary
+model-generated commands risk-free or provide a network air gap.
 
 ## Quick Start
 
-Clone the repo, start the local model server, then give the harness a short
-command-line prompt:
+Clone the repository, prepare the checked-in model-cache root, and run the
+Ubuntu bootstrap for the default Gemma 4 26B A4B QAT MTP profile:
 
 ```bash
-# Ubuntu host prerequisites if you do not already have them:
-# sudo apt-get update && sudo apt-get install -y git docker.io python3 curl ca-certificates
 git clone https://github.com/krzyszsz/agenticFeedbackCoding.git
 cd agenticFeedbackCoding
-MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/start_default_model_server.sh
 
+sudo mkdir -p /mnt/hf/models
+sudo chown -R "$USER:$USER" /mnt/hf
+
+MODEL_PROFILE=gemma4-26b-a4b-qat-mtp \
+  bash scripts/bootstrap_ubuntu.sh --download-model --build-llama-vulkan
+MODEL_PROFILE=gemma4-26b-a4b-qat-mtp \
+  bash scripts/start_default_model_server.sh
+```
+
+Then give the harness a prompt and output directory:
+
+```bash
 bash scripts/build_and_run.sh \
   --config config.minimal.json \
   --workspace workspaces/my-project \
   --prompt "Build a small Python CLI with tests and a README."
 ```
 
-If the model server is already running, only the second command is needed.
-`--workspace` selects the host-visible output folder and `--prompt` replaces the
-prompt from the config for that run. Use `--prompt-file prompt.txt` for a longer
-brief. For known local profiles, the agent runner infers the model container and
-port from the config; explicit endpoint environment variables still take
-priority.
+If bootstrap added you to the Docker group, log out and back in before normal
+use; the scripts fall back to `sudo docker` during bootstrap itself. If the
+model server is already running, the harness command is sufficient for a new
+task. Use `--prompt-file prompt.txt` for a longer request and `--offline` to
+disable built-in research.
 
-That run uses the standard two-container path: the model server runs on the
-`agentic-feedback-net` Docker network, the agent container mounts only the
-configured workspace, and the full transcript plus review evidence is written
-under `workspaces/my-project/.agent_state/`.
+The generated project appears in `workspaces/my-project`. Full transcripts,
+active compacted context, run summaries, and validation evidence are under
+`workspaces/my-project/.agent_state/`.
 
-For a checked benchmark instead of an ad hoc prompt, run:
+## Architecture
 
-```bash
-bash scripts/build_and_run.sh --config config.real-palindrome.json
+```mermaid
+flowchart LR
+    U["CLI prompt or JSON config"] --> A["Agent container"]
+    M["Model-server container<br/>llama.cpp / OpenAI API"] <--> A
+    A --> W["Mounted project workspace"]
+    A --> S["Runbook, transcripts,<br/>evidence, checkpoints"]
 ```
 
-The live transcript is printed while the run is active, so a long job should visibly move through requirements, plan review, implementation attempts, and feedback. While a model call is in flight, the terminal also prints a heartbeat with elapsed time and a lightweight REST health check. Those heartbeat lines are human-facing only; they are not written into the reusable agent transcripts under `.agent_state/`. The final terminal output is compact by default; the full evidence is written under `.agent_state/`.
+The containers share `agentic-feedback-net`. The agent receives the project
+workspace as its only writable host mount and the config as a read-only mount.
+The Docker socket is not mounted.
 
-## One Config File
+Implementation and reviewer roles may use the same model or separate
+OpenAI-compatible endpoints. A separate reviewer can improve independence but
+requires enough memory to serve both selected profiles.
 
-Copy a real config and edit the prompt/workspace:
+## Workflow
 
-```bash
-cp config.example.json config.my-project.json
-```
+The harness keeps one durable conversation and runbook throughout a task.
+Models remain responsible for technical decisions and repairs.
 
-The important fields are usually enough:
+| Phase | Responsibility |
+|---|---|
+| Research decision | Decide whether external evidence is material and, when enabled, select focused queries or public URLs. |
+| Analysis | Restate the request, inspect available context, identify constraints and assumptions, compare plausible approaches, and select a direction. |
+| Requirements | Convert the request and analysis into explicit, testable requirements and an ordered plan. |
+| Plan review | Challenge stale, incomplete, unsafe, unverifiable, or environment-incompatible steps before execution. |
+| Implementation | Execute one runbook step at a time and choose repairs from current evidence and repair history. |
+| Tool review | Review every proposed command, its arguments, paths, quoting, purpose, and risk before execution. |
+| Step review | Inspect changed artifacts and independently rerun declared validation before accepting a step. |
+| Final review | Recheck the complete result against the original request and accumulated evidence. |
+| Approach review | Decide whether the approach answered the request or a materially different attempt is justified. |
+
+Review prompts challenge unsupported confidence without assuming the previous
+answer is wrong. If a model misses the small JSON protocol, the harness repeats
+the same contextual question and requested schema instead of guessing intent
+from phrases or synonyms.
+
+### Reasoning Budgets
+
+Normal calls use `reasoning_budget_tokens`. Unresolved analysis, requirements,
+planning, repair, final review, high-risk tool review, and work inherited from
+a failed approach can use `critical_reasoning_budget_tokens`. When the critical
+budget is `null`, the harness derives a bounded value up to four times the
+normal budget while reserving output space.
+
+Compaction and long-command progress checks have smaller budgets so
+housekeeping does not consume the main critical allowance. Request labels
+ending in `/critical` make escalation visible in logs.
+
+### Long-Running Commands
+
+`runtime.command_timeout_seconds: 0` disables a fixed command deadline. While a
+command runs, the reviewer periodically receives the original request, relevant
+history, bounded current output, elapsed time, and previous progress decisions.
+It may continue, choose another review interval, stop failed work, or end a
+command whose intended observation is already available. Elapsed time alone is
+not a stop reason.
+
+A model may request a positive deadline for one command. Positive values are
+bounded by `runtime.max_command_timeout_seconds`; setting that maximum to `0`
+removes the cap.
+
+## Configuration
+
+`config.minimal.json` relies on production defaults:
 
 ```json
 {
-  "implementation_model": {
-    "name": "gemma4-26b-a4b-qat-mtp",
-    "base_url": "http://127.0.0.1:8161/v1",
-    "model": "local-gguf",
-    "context_window": 131072,
-    "max_tokens": 32768,
-    "temperature": 0.25,
-    "request_timeout_seconds": 21600,
-    "retry_attempts": 20,
-    "retry_sleep_seconds": 30,
-    "request_heartbeat_seconds": 30,
-    "preserve_reasoning": true,
-    "reasoning_budget_tokens": 4096,
-    "critical_reasoning_budget_tokens": null,
-    "send_reasoning_budget": true
-  },
-  "feedback_model": null,
-  "mcp_tools": {
-    "terminal": true,
-    "web_scraping": false,
-    "web_interaction": true
-  },
   "runtime": {
-    "docker_isolation": true,
-    "docker_user": "host",
-    "workspace": "workspaces/my-new-project",
-    "plan_file": "PLAN.md",
-    "requirements_file": "REQUIREMENTS.md",
-    "research_file": "RESEARCH.md",
-    "command_timeout_seconds": 0,
-    "max_command_timeout_seconds": 21600,
-    "command_progress_review_interval_seconds": 300,
-    "command_progress_review_min_interval_seconds": 30,
-    "command_progress_review_max_interval_seconds": 3600,
-    "color_transcript": true,
-    "live_turn_max_chars": 0,
-    "final_summary": "compact",
-    "feedback_response_max_tokens": 2048
-  },
-  "web_research": { "enabled": false },
-  "loop": { "max_approach_reattempts": 5 },
-  "phases": {
-    "analysis": { "max_iterations": 2 },
-    "requirements_refinement": { "max_iterations": 2 },
-    "plan_validation": { "max_iterations": 2 },
-    "implementation": { "max_iterations": 7 }
+    "workspace": "workspaces/my-project"
   },
   "project_design": {
-    "title": "My new project",
-    "prompt": "Build a browser game with tests and documentation."
+    "title": "My project",
+    "prompt": "Build a small, well-tested command-line tool and document how to run it."
   }
 }
 ```
 
-`feedback_model: null` reuses the implementation model. A separate reviewer
-block may contain only its differing fields, such as `name` and `base_url`;
-all omitted reviewer settings inherit from `implementation_model`.
+Use `config.example.json` for explicit model, review, compaction, tool,
+research, and git settings. CLI values for `--workspace`, `--title`,
+`--prompt`, and `--prompt-file` override config fields for one run.
 
-For a very small config, start from `config.minimal.json` or override the prompt
-and workspace from the command line:
+| Field | Purpose | Default |
+|---|---|---:|
+| `implementation_model.max_tokens` | Maximum response size. | `32768` |
+| `implementation_model.reasoning_budget_tokens` | Normal reasoning allowance. | `4096` |
+| `implementation_model.critical_reasoning_budget_tokens` | Higher allowance; `null` derives a bounded 4x value. | `null` |
+| `implementation_model.request_timeout_seconds` | One model HTTP-response deadline. | `21600` |
+| `feedback_model` | Optional reviewer model; `null` reuses the implementation model. | `null` |
+| `runtime.command_timeout_seconds` | Command deadline; `0` delegates stopping to progress review. | `0` |
+| `runtime.command_progress_review_interval_seconds` | First running-command review interval. | `300` |
+| `runtime.feedback_response_max_tokens` | Reviewer response allowance. | `2048` |
+| `loop.max_approach_reattempts` | Materially different attempts after the first. | `5` |
+| `phases.analysis.max_iterations` | Analysis and challenge attempts. | `2` |
+| `phases.requirements_refinement.max_iterations` | Requirements refinement attempts. | `2` |
+| `phases.plan_validation.max_iterations` | Plan repair attempts. | `2` |
+| `phases.implementation.max_iterations` | Repair attempts per step. | `7` |
+| `review_policy.hard_pushback_iterations` | Strict evidence reviews before compromise. | `3` |
+| `review_policy.compromise_iterations` | Attempts to document a defensible partial result. | `4` |
+| `review_policy.final_review_iterations` | Repairs after the first whole-project review. | `1` |
 
-```bash
-bash scripts/build_and_run.sh \
-  --config config.minimal.json \
-  --workspace workspaces/my-project \
-  --prompt "Build a small Python CLI with tests and a README."
-```
-
-For longer prompts, keep the prompt in the JSON file. The command-line override
-is a convenience, not a replacement for versioned task configs.
-
-This command-line form is intentionally simple, but the run is not a one-shot
-file writer. Even small prompts still pass through analysis, requirements,
-plan validation, implementation, tool-call verification, reviewer-owned
-validation, final review, and approach review.
-
-`command_timeout_seconds` controls the default hard wall-clock deadline for one
-terminal command; `0` disables that wall and lets periodic model progress review
-decide whether the command should continue. It is separate from the model HTTP
-timeout. A model can still request a positive command-specific deadline:
-
-```json
-{"cmd": ["python", "long_running_check.py"], "timeout_seconds": 7200}
-```
-
-Positive requests are clamped by a positive
-`runtime.max_command_timeout_seconds`; setting that maximum to `0` disables the
-cap. Model calls use `implementation_model.request_timeout_seconds`, which is set
-high by default for long local-model runs. A live progress-review request is
-different: it makes one attempt bounded by the configured progress-review
-interval. If that advisory check is unavailable, the already-approved command
-keeps running and can be reviewed again later.
-
-Command objects also carry explicit evidence lifecycle metadata. Set
-`"validation": true` when an implementation command may be rerun by the reviewer,
-and set `"final_state": false` only for an intermediate observation that later
-plan work is expected to invalidate. The harness does not guess either property
-from command names or surrounding prose.
-
-Commands use an explicit argv-list protocol, for example `{"cmd": ["python",
-"-m", "pytest"]}`. The harness does not reinterpret shell-like strings. If a
-model omits a required JSON field or decision, the same question and protocol
-are returned conversationally so the model can repair its response. Raw model
-text remains audit evidence until schema validation records a typed receipt;
-parser fallbacks and active-context omissions are labeled as harness-owned state,
-not rewritten as model speech.
-
-`runtime.final_summary` controls only the final stdout block after the live transcript:
-
-- `compact` prints status, step counts, and evidence paths.
-- `full` prints the full nested `summary.json` object.
-- `none` suppresses the final block.
-
-`runtime.live_turn_max_chars` controls live console output for each transcript turn. The default `0` prints each turn fully as it happens. Set a positive value, for example `30000`, if you want progress to remain visible without a single huge tool payload flooding the terminal. Saved transcript files are not truncated by this setting.
-
-## Workflow Policy
-
-The harness uses one durable transcript and a runbook-style plan file. The
-workflow is intentionally model-driven and general purpose:
-
-| Phase | Owner | Purpose |
-|---|---|---|
-| Research decision | Implementation model, when web research is enabled | Decide whether external evidence is material and supply focused queries or source URLs; the harness only validates and fetches them. |
-| Problem analysis | Implementation model, reviewed by feedback model | Restate the request, check available sources/context, name constraints, compare multiple solution paths, and choose a first approach. |
-| Requirements refinement | Implementation model, reviewed by feedback model | Convert the prompt and analysis into explicit requirements, assumptions, and a verifiable ordered plan. |
-| Plan validation | Feedback model plus deterministic checks | Push back on stale, impossible, non-verifying, or environment-incompatible plan steps before implementation starts. |
-| Step implementation | Implementation model | Choose autonomous repairs or edits for one plan step at a time, using failure evidence and prior repair history. |
-| Tool-call verification | Feedback model plus deterministic safety checks | Approve or block each proposed terminal call before execution. |
-| Step/final review | Feedback model plus tools | Re-run validation, inspect files/git diffs, and accept, reject, or request plan/requirements changes. |
-| Approach review | Feedback model | Decide whether the completed approach actually answered the original request or whether another approach should run. |
-
-Deterministic tool checks are transparent transport and safety backstops for
-malformed argv, workspace escapes, device operations, and parse errors. They do
-not approve commands or judge task correctness; every executable command still
-needs an explicit current verifier decision unless a deterministic blocker has
-already rejected it.
-
-Model calls start with `reasoning_budget_tokens`. The harness switches to
-`critical_reasoning_budget_tokens` after an unresolved analysis, requirements,
-plan, or implementation attempt; on work inherited from a failed approach; for
-final and approach decisions; and for risk-bearing tool-call reviews. Request
-labels ending in `/critical` make the choice visible in live logs. Context
-compaction and periodic command-progress checks remain deliberately capped and
-do not use the critical budget, so housekeeping cannot stall command drainage.
-
-`loop.max_approach_reattempts` defaults to `5`. Increase it for long-running or
-periodic tasks where the model may need to re-check logs, metrics, or external
-state several times.
-
-Repository-level harness principles live in `AGENTS.md`. The short version is:
-the harness manages context, iteration, tools, and verification; it must not
-solve benchmark tasks itself or encode one-off prompt fixes that make unrelated
-tasks worse.
+`feedback_model` may be a partial model object; omitted values inherit from the
+implementation model. `AGENT_IMPLEMENTATION_BASE_URL` and
+`AGENT_FEEDBACK_BASE_URL` override endpoint routing for custom servers.
 
 ## Model Profiles
 
-Profile metadata lives in `feedback_agent/model_profiles.py` and can be
-inspected with:
+Profiles define local artifacts, server ports, context windows, memory limits,
+sampling, reasoning behavior, and optional MTP draft models:
 
 ```bash
 python -m feedback_agent.model_profiles list
+python -m feedback_agent.model_profiles json qwen3.8-27b
 ```
 
-| Profile | Role | Port | Context | Notes |
+| Profile | Type | Port | Context | Artifact |
 |---|---|---:|---:|---|
-| `gemma4-26b-a4b-qat-mtp` | weak/fast MoE | 8161 | 131k | Default Gemma 4 A4B QAT profile with MTP draft. |
-| `gemma4-31b-qat-mtp` | strong dense | 8162 | 131k | Higher-quality Gemma 4 dense QAT profile with MTP draft. |
-| `qwen3.6-27b-mtp` | strong dense | 8163 | 131k | Public/local MTP artifact used for the requested Qwen dense slot. |
-| `qwen3-coder-next` | coding MoE | 8164 | 76k | Official 80B-total, 3B-active Qwen coding MoE; non-thinking mode. |
-| `deepseek-r1-distill-qwen-7b` | weak/fast reasoning | 8165 | 131k | Qwen-based DeepSeek R1 distill; the official Qwen distill is 7B. |
-| `devstral-small-2507` | coding dense | 8166 | 131k | Devstral Small 1.1, 24B dense coding profile. |
-| `deepseek-coder-v2-lite-instruct` | coding MoE | 8167 | 131k | DeepSeek-Coder-V2-Lite, 16B total / 2.4B active MoE. |
-| `deepseek-r1-0528-qwen3-8b` | reasoning dense | 8168 | 131k | DeepSeek R1 0528 distill on Qwen3 8B. |
-| `qwen3-8b` | reasoning dense | 8169 | 40k | Qwen3 8B thinking profile at its normal context. |
-| `deepseek-r1-distill-llama-8b` | reasoning dense | 8170 | 131k | Llama-based DeepSeek R1 8B distill. |
-| `qwen2.5-coder-7b-instruct` | coding dense | 8171 | 131k | Qwen2.5-Coder 7B Instruct. |
-| `qwopus3.6-27b-coder` | coding dense | 8172 | 32k | Qwopus3.6 27B Coder compatibility GGUF with bundled MTP head. |
-| `devstral-small-2512` | coding dense | 8173 | 131k | Devstral Small 2 24B Instruct 2512. |
-| `qwen36-fable-fusion-mtp` | strong dense | 8174 | 131k | DavidAU Qwen3.6 Fable Fusion MTP Q4_K_M profile. |
-| `kat-coder-v2.5-dev` | coding MoE | 8175 | 131k | KAT-Coder V2.5 Dev 35B total / 3B active MoE. |
-| `qwythos-27b-mtp` | reasoning dense | 8176 | 131k | Qwythos 27B v1 MTP with agentic/tool-use sampling. |
-| `qwen3.8-27b` | strong dense | 8177 | 262k | Qwen3.8 27B Unsloth Dynamic V3.0 UD-Q4_K_XL GGUF profile with preserved thinking and larger reasoning budget. |
+| `gemma4-26b-a4b-qat-mtp` | fast MoE | 8161 | 131k | Gemma 4 26B A4B QAT with MTP draft |
+| `gemma4-31b-qat-mtp` | dense | 8162 | 131k | Gemma 4 31B QAT with MTP draft |
+| `qwen3.6-27b-mtp` | dense | 8163 | 131k | Qwen3.6 27B MTP |
+| `qwen3-coder-next` | coding MoE | 8164 | 76k | Qwen3-Coder-Next, 80B total / 3B active |
+| `deepseek-r1-distill-qwen-7b` | reasoning dense | 8165 | 131k | DeepSeek R1 Distill Qwen 7B |
+| `devstral-small-2507` | coding dense | 8166 | 131k | Devstral Small 1.1 24B |
+| `deepseek-coder-v2-lite-instruct` | coding MoE | 8167 | 131k | DeepSeek-Coder-V2-Lite, 16B / 2.4B active |
+| `deepseek-r1-0528-qwen3-8b` | reasoning dense | 8168 | 131k | DeepSeek R1 0528 Qwen3 8B |
+| `qwen3-8b` | reasoning dense | 8169 | 40k | Qwen3 8B |
+| `deepseek-r1-distill-llama-8b` | reasoning dense | 8170 | 131k | DeepSeek R1 Distill Llama 8B |
+| `qwen2.5-coder-7b-instruct` | coding dense | 8171 | 131k | Qwen2.5-Coder 7B Instruct |
+| `qwopus3.6-27b-coder` | coding dense | 8172 | 32k | Qwopus3.6 27B Coder compatibility MTP |
+| `devstral-small-2512` | coding dense | 8173 | 131k | Devstral Small 2 24B Instruct 2512 |
+| `qwen36-fable-fusion-mtp` | dense | 8174 | 131k | Qwen3.6 Fable Fusion MTP |
+| `kat-coder-v2.5-dev` | coding MoE | 8175 | 131k | KAT-Coder V2.5 Dev, 35B / 3B active |
+| `qwythos-27b-mtp` | reasoning dense | 8176 | 131k | Qwythos 27B v1 MTP |
+| `qwen3.8-27b` | dense | 8177 | 262k | Qwen3.8 27B UD-Q4_K_XL high-thinking |
 
-Start a specific profile:
+Start any profile with:
 
 ```bash
-MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/start_default_model_server.sh
-MODEL_PROFILE=gemma4-31b-qat-mtp bash scripts/start_default_model_server.sh
-MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/start_default_model_server.sh
-MODEL_PROFILE=qwen3-coder-next bash scripts/start_default_model_server.sh
-MODEL_PROFILE=qwopus3.6-27b-coder bash scripts/start_default_model_server.sh
-MODEL_PROFILE=devstral-small-2512 bash scripts/start_default_model_server.sh
-MODEL_PROFILE=qwen36-fable-fusion-mtp bash scripts/start_default_model_server.sh
-MODEL_PROFILE=kat-coder-v2.5-dev bash scripts/start_default_model_server.sh
-MODEL_PROFILE=qwythos-27b-mtp bash scripts/start_default_model_server.sh
+MODEL_PROFILE=qwen3.8-27b bash scripts/download_default_model.sh
 MODEL_PROFILE=qwen3.8-27b bash scripts/start_default_model_server.sh
 ```
 
-If a configured artifact is missing, run the same command with
-`scripts/download_default_model.sh` first.
+For normal runs, the config's `implementation_model.name` and generation
+settings should match the running server profile. Benchmarks resolve generation
+settings directly from the named profile.
 
-The server launcher passes MTP speculative decoding flags to llama.cpp:
-`--spec-type draft-mtp`, `--spec-draft-n-max`, and `--model-draft` when the
-profile has a separate draft GGUF.
+The launcher uses llama.cpp/Vulkan and enables MTP speculative decoding when a
+profile supplies a draft model. Set `REBUILD_SERVER_IMAGE=1` after changing the
+server Dockerfile or when deliberately rebuilding llama.cpp.
 
-The checked-in profile metadata includes each model's repository ID, local
-artifact path, generation parameters, context limit, memory limits, and
-llama.cpp server options. Use the profile-list command above as the source of
-truth when adding or comparing models.
+## Context And Evidence
+
+The append-only audit transcript is separate from active model context.
+Compaction protects:
+
+- the authoritative initial user request
+- current requirements, runbook state, and research notes
+- validated decisions and evidence receipts
+- unresolved risks, assumptions, and failed or superseded approaches
+- recent turns, with later relevant discoveries receiving higher priority
+
+The local model summarizes only evicted history. Conservative, broad, and
+emergency stages progressively reduce retained material; the least aggressive
+candidate that fits is selected. Compaction accounts for the next prompt and
+response allowance, keeps user instructions separate from model discoveries,
+and records a receipt in the full transcript. Raw reviewer text cannot become
+accepted control state without a harness validation receipt.
+
+Tool stdout and stderr are continuously drained and retained as bounded head
+and tail excerpts with explicit truncation markers. Workspace snapshots,
+individual files, diffs, review payloads, and fetched pages have separate
+limits.
+
+Before a step or final result is accepted, the reviewer receives a fresh
+workspace snapshot, independent validation output, git status, changed paths,
+diff statistics, and a bounded diff. Claims without available evidence remain
+claims. Compaction controls are documented in `config.example.json`; isolated
+validation is recorded in
+[docs/context-compaction-validation-20260824.md](docs/context-compaction-validation-20260824.md).
+
+## Tools And Isolation
+
+Commands use an argv-list protocol:
+
+```json
+{
+  "cmd": ["python", "-m", "pytest", "-q"],
+  "timeout_seconds": 1800,
+  "validation": true,
+  "final_state": true
+}
+```
+
+The deterministic boundary rejects malformed argv, workspace escapes, device
+operations, and known destructive forms. A model reviewer still approves each
+executable command unless a deterministic check already blocked it.
+
+The agent image includes Python, pytest, Python Playwright with Chromium,
+`curl`, `git`, `jq`, `requests`, and Beautiful Soup. It does not include Node,
+npm, npx, or `@playwright/test`. Installing a missing dependency inside the
+disposable container remains visible plan and tool work.
+
+The default bridge permits outbound traffic. `--offline` disables the harness
+research fetcher but cannot prevent an approved terminal command from using
+egress. Use an internal Docker network or host egress policy when network
+isolation is required.
+
+Direct host execution is blocked unless explicitly enabled for development:
+
+```bash
+ALLOW_HOST_AGENT_RUN=1 bash scripts/run_agent.sh --config config.my-project.json
+```
+
+## Existing Projects
+
+Point `runtime.workspace` at an existing repository. If it already uses the
+default control filenames, configure distinct harness-owned names:
+
+```json
+{
+  "runtime": {
+    "workspace": "/absolute/path/to/project",
+    "plan_file": "AGENT_PLAN.md",
+    "requirements_file": "AGENT_REQUIREMENTS.md",
+    "research_file": "AGENT_RESEARCH.md"
+  }
+}
+```
+
+With git policy enabled, the harness creates a baseline, checkpoints accepted
+steps, and records final acceptance. Harness state is excluded from project
+commits. Set `git_policy.leave_final_changes_uncommitted: true` to expose the
+final project as staged/uncommitted changes after internal checkpointing.
+
+## Web Research
+
+Research is disabled by default. When enabled, the model decides whether
+external evidence is material and selects focused queries or URLs. The harness
+validates and fetches those inputs, restricts URLs to public network addresses
+by default, and bounds result count, page count, bytes, and excerpts.
+
+Set `web_research.allow_private_network: true` only for a trusted task that
+needs loopback or private addresses. Non-text responses are recorded as
+unsupported rather than decoded into model context.
 
 ## Benchmarks
 
-The benchmark corpus is `benchmarks/tasks.json`. It currently contains 44 tasks.
-`benchmarks/suites.json` defines the publication and comparison subsets:
+`publication-40` contains 40 tasks covering exact algorithms, new and existing
+code, data processing, shell concurrency, long-running tools, tool safety,
+dependency installation, web interfaces, planning, workflow policy, and
+security-sensitive implementation. The corpus contains 54 tasks in total;
+development suites are defined in `benchmarks/suites.json`.
 
-| Suite | Tasks | Purpose |
-|---|---:|---|
-| `publication-30` | 30 | Main publication suite across exact answers, coding, existing-project repair, tools, safety, planning, periodic checks, and historical hard tasks. |
-| `historical-difficult` | 8 | Previously documented difficult prompts from checked-in real configs. |
-| `algorithmic-smoke` | 5 | Exact-answer diagnostics for harness behavior. |
-| `comparison-smoke` | 3 | Small model/pair/budget comparison suite when the full suite would take days. |
-| `extended-comparison-5` | 5 | Extended-timeout comparison suite for single-shot versus harness runs. |
-| `development-watch-5` | 5 | Calibration-only tasks disjoint from `publication-30`. |
-| `publication-grader-corrections-3` | 3 | Uniform reruns after demonstrated grader defects were corrected. |
+### Method
 
-### August 2026 Publication Matrix
+- **Zero-shot** is one generation from the original task and bounded existing
+  files. It has no harness analysis, planning, tools, reviewer, feedback,
+  repair, or approach cycle. The CLI flag is `--mode single-shot`.
+- **Harness** uses the full workflow with the same task and final grader.
+  Publication runs cap alternative approaches at one while retaining
+  per-phase review and repair.
+- Solvers cannot access benchmark definitions, answers, hidden validators, or
+  grader code from their mounted workspace.
+- Thirty-four tasks use Docker-isolated behavioral or exact-result checks. Six
+  open-ended tasks use a local model grader against explicit criteria.
+- `P`/`F` mean automatic pass/fail. `MP`/`MF` mean model-graded pass/fail.
+  Each detailed cell is `zero-shot / harness` and includes elapsed task time.
 
-The current public evidence uses the 30-task `publication-30` suite. Zero-shot
-baselines were refreshed on 2026-08-06 for the first 16 checked profiles, then
-Qwen3.8 27B was added and benchmarked on 2026-08-15 to 2026-08-17. Qwen3.8 was
-rerun on 2026-08-18 to 2026-08-19 with its recommended high-thinking profile.
-Full-harness rows combine the 2026-08-01 12-model matrix, the 2026-08-06 refresh
-for newly added profiles, and the latest Qwen3.8 high-thinking run. All
-completed runs used the documented two-container workflow: one model-server
-container and one separate benchmark-agent container on `agentic-feedback-net`.
+<!-- PUBLICATION_40_RESULTS_START -->
+The September 2026 matrix used current profile settings and one run per cell.
+Elapsed time covers solver or harness execution and excludes post-run grading.
 
-Zero-shot means one model call followed by the same Docker-isolated grader. It
-does not run analysis, planning, feedback, tool review, repair, or approach
-review. The runner flag is still named `--mode single-shot` for this path.
+| Model | Zero-shot | Time | Harness | Time | Pass delta |
+|---|---:|---:|---:|---:|---:|
+| Gemma 4 31B | 30/40 | 1.13h | 36/40 | 38.24h | +6 |
+| Gemma 4 26B A4B | 28/40 | 0.61h | 30/40 | 11.99h | +2 |
+| Devstral Small 2 | 18/40 | 0.86h | 14/40 | 19.59h | -4 |
+| Qwythos 27B | 27/40 | 1.80h | 27/40 | 35.90h | 0 |
+| Qwen3.8 27B high-thinking | 26/40 | 5.93h | 36/40 | 65.01h | +10 |
+| **Total** | **129/200** | **10.33h** | **143/200** | **170.74h** | **+14** |
 
-| Setting | Value |
-|---|---|
-| Suite | `publication-30` |
-| Completed zero-shot evidence | 17 profiles, 510 tasks, 12.02 task-hours |
-| Completed full-harness evidence | 16 profiles, 480 tasks, 180.34 task-hours |
-| Qwythos full-harness status | Incomplete: stopped after >64m on task 1 while repeating `S1` repair attempts |
-| Task deadline | Disabled (`--task-timeout-seconds 0`) |
-| Alternative approaches | Publication configs cap full-suite approach retries at 1 unless overridden |
-| Reasoning budget | Profile default base budget, with larger critical budget for high-value review and repair phases |
-| Grading | Docker-isolated automatic checks plus manual grades labeled `manual_pass` or `manual_fail` |
-| Raw local evidence | `runs/publication-20260801-full-matrix/`, `runs/publication-20260806-model-refresh/`, `runs/publication-20260815-qwen38-27b/`, and `runs/publication-20260817-qwen38-27b-high-thinking/` |
-| Failure analysis | `docs/benchmark-failure-analysis-20260806.md` |
+The harness improved the aggregate pass rate from 64.5% to 71.5%, at 16.5
+times the solver time. The effect was model-dependent: it substantially helped
+Qwen3.8 and dense Gemma, modestly helped Gemma A4B, was neutral for Qwythos,
+and hurt Devstral. These are single nondeterministic runs, not confidence
+intervals; use the task-level results to judge the relevant workload.
 
-#### Summary
+Each cell below is `zero-shot / harness`. Times are minutes. `P` and `F` are
+automatic results; `MP` and `MF` are model-graded results.
 
-| Model | Zero-shot | Zero-shot time | Harness | Harness time | Delta | Harness evidence |
-|---|---:|---:|---:|---:|---:|---|
-| Gemma 4 31B QAT MTP | 28/30 | 40.0m | 28/30 | 20.34h | +0 | 2026-08-01 |
-| Qwen3.6 Fable Fusion MTP | 24/30 | 57.2m | 28/30 | 15.60h | +4 | 2026-08-06 |
-| Qwen3.6 27B MTP | 8/30 | 67.3m | 28/30 | 16.11h | +20 | 2026-08-01 |
-| Qwen3.8 27B UD-Q4_K_XL high-thinking | 24/30 | 181.6m | 28/30 | 35.85h | +4 | 2026-08-19 |
-| Gemma 4 26B A4B QAT MTP | 21/30 | 25.8m | 26/30 | 6.87h | +5 | 2026-08-01 |
-| Qwopus3.6 27B Coder | 14/30 | 40.6m | 26/30 | 10.35h | +12 | 2026-08-01 |
-| KAT-Coder V2.5 Dev | 7/30 | 17.5m | 22/30 | 4.95h | +15 | 2026-08-06 |
-| Qwen3-Coder-Next | 14/30 | 12.2m | 21/30 | 5.53h | +7 | 2026-08-01 |
-| Qwythos 27B MTP | 20/30 | 69.3m | incomplete | >64m on task 1 | n/a | 2026-08-06 incomplete |
-| Devstral Small 2 2512 | 18/30 | 27.4m | 2/30 | 4.87h | -16 | 2026-08-06 |
-| Devstral Small 2507 | 15/30 | 20.4m | 18/30 | 8.06h | +3 | 2026-08-01 |
-| Qwen3 8B | 14/30 | 30.2m | 14/30 | 18.97h | +0 | 2026-08-01 |
-| DeepSeek R1 0528 Qwen3 8B | 10/30 | 54.8m | 9/30 | 27.25h | -1 | 2026-08-01 |
-| DeepSeek-Coder-V2-Lite Instruct | 4/30 | 3.0m | 0/30 | 0.52h | -4 | 2026-08-01 |
-| Qwen2.5-Coder 7B Instruct | 7/30 | 5.3m | 0/30 | 0.39h | -7 | 2026-08-01 |
-| DeepSeek R1 Distill Qwen 7B | 0/30 | 32.7m | 0/30 | 2.96h | +0 | 2026-08-01 |
-| DeepSeek R1 Distill Llama 8B | 0/30 | 35.4m | 0/30 | 1.73h | +0 | 2026-08-01 |
+| Task | Gemma 4 31B | Gemma 4 26B A4B | Devstral Small 2 | Qwythos 27B | Qwen3.8 27B HT |
+|---|---|---|---|---|---|
+| `algo-001-balanced-grid` | P 1.7m / P 11.8m | P 0.8m / P 9.8m | F 0.1m / F 13.6m | P 1.3m / P 23.6m | P 0.6m / P 25.6m |
+| `algo-002-nested-parity` | P 2.5m / P 20.0m | P 0.7m / P 6.7m | F 0.1m / P 13.9m | F 3.1m / P 35.9m | P 2.6m / P 47.2m |
+| `algo-003-multiset-path` | P 1.8m / P 12.1m | P 0.9m / P 8.8m | F 0.2m / F 4.8m | P 2.5m / P 14.4m | P 2.2m / P 20.4m |
+| `algo-004-layered-filter` | P 1.5m / P 67.3m | P 0.8m / F 5.1m | F 1.1m / P 13.8m | P 1.2m / F 13.6m | P 1.0m / P 23.5m |
+| `algo-005-state-machine` | P 0.4m / P 32.3m | P 0.2m / P 4.5m | F 0.1m / F 4.6m | P 0.5m / P 11.3m | P 0.2m / P 12.8m |
+| `code-001-slug-cli` | P 1.2m / P 34.0m | P 0.5m / P 8.1m | P 1.0m / F 24.6m | P 1.4m / P 103.9m | F 10.3m / P 79.3m |
+| `code-003-interval-merge` | P 1.2m / P 35.3m | P 1.1m / P 9.4m | F 1.3m / P 35.7m | P 1.3m / F 44.4m | F 7.3m / F 74.1m |
+| `code-004-config-normalizer` | P 1.2m / P 25.1m | P 1.1m / P 16.0m | P 1.2m / P 20.8m | P 2.8m / P 23.7m | P 8.1m / P 49.5m |
+| `code-005-existing-bugfix` | P 0.7m / P 22.4m | P 0.7m / P 4.1m | P 0.3m / P 11.9m | P 1.2m / P 17.9m | P 1.0m / P 32.8m |
+| `tool-001-disk-monitor` | F 0.8m / P 26.2m | P 1.1m / P 8.0m | F 0.8m / F 32.6m | P 1.4m / P 41.8m | P 8.5m / P 96.8m |
+| `tool-002-log-watch` | P 1.7m / P 41.5m | P 1.3m / P 17.7m | F 1.1m / F 29.1m | P 2.5m / P 68.0m | F 16.9m / P 115.8m |
+| `tool-003-output-truncation` | P 1.0m / P 28.2m | P 0.7m / P 6.6m | P 0.8m / P 11.0m | P 0.9m / F 19.6m | P 7.7m / P 48.4m |
+| `tool-004-timeout-friendly` | P 1.0m / P 30.1m | P 1.1m / P 7.5m | P 1.1m / F 21.6m | F 1.8m / F 91.1m | P 8.0m / P 38.1m |
+| `tool-005-curl-json-safety` | MP 0.7m / MP 41.3m | MP 0.3m / MP 8.7m | MP 0.6m / MP 8.2m | MP 1.7m / MP 58.5m | MP 7.6m / MP 26.5m |
+| `web-001-static-accessibility` | F 1.6m / P 24.6m | F 1.1m / P 5.3m | P 1.5m / F 35.2m | P 3.3m / P 56.4m | F 12.2m / P 111.5m |
+| `web-002-browser-interaction` | P 1.3m / P 100.5m | P 0.9m / F 47.3m | F 1.4m / F 46.5m | P 2.9m / F 64.3m | P 7.4m / P 103.0m |
+| `workflow-001-analysis-first` | MP 0.7m / MP 10.5m | MP 0.3m / MP 3.2m | MP 0.5m / MF 3.3m | MP 1.5m / MP 18.5m | MP 2.6m / MP 27.6m |
+| `workflow-002-autonomous-repair` | MP 1.1m / MP 10.1m | MF 0.5m / MP 2.1m | MP 0.5m / MF 6.6m | MP 1.7m / MP 15.0m | MP 2.2m / MP 20.4m |
+| `data-001-csv-window` | P 2.3m / P 32.6m | P 1.1m / P 45.1m | P 0.8m / P 25.5m | P 2.0m / P 75.0m | P 8.1m / P 40.3m |
+| `data-002-dedupe` | P 1.4m / P 42.9m | P 0.8m / P 24.0m | F 1.0m / P 15.9m | P 1.3m / P 37.1m | P 8.5m / P 100.0m |
+| `safety-001-no-destructive-tools` | MP 0.9m / MP 48.9m | MP 0.3m / MP 11.6m | MP 0.6m / MP 8.0m | MP 1.2m / MP 15.6m | MP 2.9m / MP 22.7m |
+| `safety-002-context-overflow` | F 1.4m / P 34.2m | F 1.1m / P 8.7m | P 1.0m / P 14.5m | P 2.6m / P 22.6m | P 6.7m / P 92.5m |
+| `planning-001-conflict-resolution` | MP 1.0m / MP 15.0m | MF 0.5m / MP 3.7m | MP 0.8m / MP 11.5m | MP 1.9m / MP 97.6m | MP 3.3m / MP 135.3m |
+| `planning-002-plan-update` | MP 0.8m / MP 12.2m | MP 0.4m / MP 4.6m | MP 0.4m / MF 3.1m | MP 1.4m / MP 13.7m | MP 5.9m / MP 14.2m |
+| `long-001-periodic-summary` | P 1.4m / P 47.8m | P 1.0m / P 19.6m | P 0.9m / F 7.4m | P 1.2m / P 25.4m | P 7.8m / P 31.7m |
+| `integration-001-mini-package` | P 0.9m / P 38.8m | P 0.4m / P 16.2m | P 1.2m / F 55.3m | P 1.6m / P 35.7m | P 7.9m / P 169.2m |
+| `hist-001-real-palindrome` | P 1.3m / P 33.7m | P 0.7m / P 6.6m | F 1.8m / F 3.2m | F 2.0m / F 42.8m | F 11.6m / P 70.6m |
+| `hist-002-real-jsonl-stats` | F 2.2m / F 57.9m | P 1.2m / F 10.2m | P 3.1m / F 40.1m | F 4.7m / P 51.3m | P 9.9m / P 113.3m |
+| `hist-003-real-existing-invoice-bugfix` | P 1.5m / P 61.8m | P 0.6m / P 9.2m | F 0.6m / F 19.0m | P 2.2m / P 55.5m | P 4.3m / P 63.6m |
+| `hist-006-dotnet-dependency` | P 3.0m / P 362.2m | F 1.4m / P 42.8m | F 2.7m / F 47.9m | F 4.5m / F 107.7m | F 14.1m / F 190.2m |
+| `hard-001-ordered-transform-pipeline` | F 2.7m / F 80.1m | F 1.5m / F 40.8m | F 2.9m / F 44.6m | P 6.7m / F 96.2m | F 11.8m / P 212.5m |
+| `hard-002-composite-multiset-score` | F 2.9m / F 29.7m | F 0.9m / F 6.8m | F 0.1m / P 23.6m | F 3.7m / F 19.3m | F 29.1m / P 190.4m |
+| `hard-003-rotated-base-sieve` | F 2.6m / P 36.4m | F 0.8m / F 10.5m | F 0.1m / F 22.4m | F 1.8m / P 23.1m | F 7.7m / F 79.0m |
+| `hard-004-bash-fanout` | F 4.4m / F 241.5m | F 1.3m / F 55.5m | F 1.4m / F 116.0m | F 5.1m / F 320.6m | F 10.6m / F 96.4m |
+| `hard-005-existing-ledger-repair` | P 1.9m / P 70.0m | P 1.1m / P 13.8m | P 1.1m / P 13.9m | P 2.7m / P 33.3m | F 9.9m / P 292.8m |
+| `hard-006-jsonl-sessionizer` | P 2.9m / P 55.9m | F 1.4m / F 21.0m | F 3.3m / F 50.4m | F 5.9m / P 92.9m | F 28.9m / P 111.6m |
+| `hard-007-dependency-layers` | P 2.1m / P 72.9m | P 1.3m / P 26.6m | F 2.6m / F 49.0m | F 6.1m / P 41.0m | P 10.3m / P 105.0m |
+| `hard-008-safe-tar-extraction` | F 2.6m / P 141.9m | F 1.4m / F 54.5m | F 4.5m / F 82.7m | F 5.3m / F 77.0m | F 27.6m / P 193.4m |
+| `hard-009-local-http-retry` | P 3.0m / P 51.5m | F 1.5m / P 16.6m | F 3.2m / F 104.8m | F 5.1m / F 106.3m | P 11.5m / P 393.2m |
+| `hard-010-accessible-state-board` | F 2.8m / P 153.2m | P 1.6m / F 92.6m | F 3.5m / F 79.0m | F 6.0m / F 42.5m | F 10.9m / P 229.4m |
 
-#### Findings
+The final audit replayed corrected validators uniformly across both modes. The
+log watcher now proves the configured polling interval, and the two
+framework-neutral "tests" tasks accept `unittest` only when `pytest` reports
+that it collected no tests. Open-ended artifacts were model-graded against
+explicit criteria and independently spot-checked. The grader accepts one
+optional Markdown fence around an otherwise strict JSON decision; malformed
+solver output remains a failure.
+<!-- PUBLICATION_40_RESULTS_END -->
 
-- The harness still helps capable profiles substantially, but the effect is
-  profile-dependent. The biggest current lifts are Qwen3.6 27B MTP (`+20`),
-  KAT-Coder V2.5 Dev (`+15`), Qwopus3.6 27B Coder (`+12`), and
-  Qwen3-Coder-Next (`+7`).
-- The cost is large. Strong full-harness suites take hours rather than minutes.
-  This is the expected tradeoff for evidence-based repair, but the long tail is
-  now the main reliability problem.
-- Qwen3.8 27B improved from `24/30` zero-shot to `28/30` with the recommended
-  high-thinking harness profile. Compared with the earlier Qwen3.8 run, this
-  recovered one more harness task and two more zero-shot tasks, but harness
-  runtime increased from 29.24h to 35.85h. Its logs show high-value repair
-  benefit alongside expensive long-tail behavior in critical review/repair
-  phases.
-- Qwen3.6 Fable Fusion MTP is the strongest newly added model by pass rate
-  (`28/30`), but it required 15.60h. KAT-Coder V2.5 Dev improved from `7/30`
-  zero-shot to `22/30` under the harness in 4.95h.
-- Devstral Small 2 2512 regressed badly under the harness (`18/30` zero-shot to
-  `2/30` harness). Its logs show heavy protocol-repair overhead, so it should
-  not be recommended for this harness profile without more work.
-- Qwythos 27B MTP had a strong zero-shot baseline (`20/30`) but did not produce
-  a usable full-harness score. The first harness task exceeded 64 minutes while
-  still repeating the same `S1` repair loop, so the run is reported as
-  incomplete rather than scored as a 30-task result.
+### Reproduce
 
-#### Reproduce
-
-Start one model server, then run the suite in the separate benchmark-agent
-container:
+Start one model server and run either mode:
 
 ```bash
 MODEL_PROFILE=gemma4-26b-a4b-qat-mtp \
   bash scripts/start_default_model_server.sh
 
 python3 scripts/run_benchmarks.py \
-  --suite publication-30 \
+  --suite publication-40 \
   --mode harness \
   --implementation-profile gemma4-26b-a4b-qat-mtp \
+  --manual-grader-profile gemma4-26b-a4b-qat-mtp \
   --task-timeout-seconds 0 \
   --no-print-transcript \
   --live-turn-max-chars 0 \
   --stream-output
 ```
 
-Use `--mode single-shot` for the no-harness path. The runner writes
-`results.json`, per-task logs, and `results.md` under
-`runs/benchmarks-<timestamp>/`; workspaces are under
-`workspaces/benchmarks/<timestamp>/`. Both are intentionally ignored by git.
-The normalized publication results are recorded in the tables above. Local raw
-evidence for the current matrix is under `runs/publication-20260801-full-matrix/`,
-`runs/publication-20260806-model-refresh/`,
-`runs/publication-20260815-qwen38-27b/`, and
-`runs/publication-20260817-qwen38-27b-high-thinking/`.
-
-Before the first task, the runner normally rebuilds the agent image from the
-current source. The runtime image excludes benchmark prompts, graders,
-repository tests, and example configs so solver tools cannot inspect answers
-under `/app`. Use `--no-rebuild-agent-image` only with a deliberately frozen
-image whose digest has been recorded.
-
-#### Verification
-
-Scripted-model unit tests verify orchestration but do not count as model-quality
-evidence.
-
-| Check | Result |
-|---|---|
-| Static compilation | `python3 -m compileall -q feedback_agent scripts tests` passed. |
-| Unit tests | 532 passed in 121.884s with `python3 -m unittest discover -s tests`. |
-| Config validation | 15 checked-in config files loaded and passed production validation. |
-| Corpus integrity | 44 tasks, 7 valid suites, and 30 unique `publication-30` task IDs. |
-| Profile validation | New model profiles resolved through `python3 -m feedback_agent.model_profiles json <profile>`. |
-| Container cleanup | No benchmark or refresh model containers remained after the run. |
-
-## Safety Model
-
-Normal agentic work runs inside Docker. `scripts/run_agent.sh` refuses to run the workflow directly on the host unless `ALLOW_HOST_AGENT_RUN=1` is explicitly set for harness development.
-
-The standard setup uses two containers on one Docker network:
-
-- `scripts/start_default_model_server.sh` creates/uses `agentic-feedback-net`, starts the selected profile container, and publishes its configured host port for checks.
-- `scripts/run_agent.sh` starts the agent container on the same network and overrides the in-container model URL to the selected profile container.
-
-The agent container gets one writable mount: the configured `runtime.workspace`, mapped to `/workspace/project`. The config file is mounted read-only. The Docker socket is not mounted. Host networking is no longer required for the normal two-container path; keep it only as an explicit compatibility mode with `DOCKER_NETWORK=host AGENT_DOCKER_NETWORK=host`.
-
-The default bridge network normally permits outbound traffic. Docker isolation
-therefore limits filesystem and device access but is not a network air gap.
-`--offline` disables the harness's built-in research fetcher; it cannot prevent
-a model-approved terminal command from using available network access. Use an
-internal Docker network or host egress policy when a run must be network-isolated
-while retaining connectivity between the agent and model containers.
-
-For a known profile, `scripts/run_agent.sh` infers the implementation endpoint
-from `implementation_model.name`. It also infers a distinct known reviewer
-endpoint from `feedback_model.name`; that paired setup requires the second model
-server to be running. `AGENT_IMPLEMENTATION_BASE_URL` and
-`AGENT_FEEDBACK_BASE_URL` override inference for custom endpoints.
-
-The agent container includes Python, Python Playwright with a preinstalled Chromium browser, system Chromium, `pytest`, `curl`, `git`, `jq`, `requests`, and `beautifulsoup4`, so generated projects can run tests, browser checks, and scraping-style tasks without installing those tools into the host project folder.
-
-The base image includes Python Playwright and Chromium but does not include Node,
-npm, npx, or `@playwright/test`. Models receive these as environment facts, not
-as a preferred implementation recipe. A request or existing project may choose
-another runtime; dependency discovery and any container-local installation must
-remain visible plan/tool work.
-
-`runtime.docker_user` defaults to `host`, so generated files are owned by the host user. Set it to `root` only for tasks that intentionally need package-manager access inside the disposable agent container, for example a workflow that checks disk space, installs a small diagnostic tool with `apt-get`, runs it, and writes a report into the mounted workspace. That still does not grant access to the host filesystem outside the configured workspace.
-
-Direct host execution is deliberately awkward:
-
-```bash
-ALLOW_HOST_AGENT_RUN=1 bash scripts/run_agent.sh --config config.my-project.json
-```
-
-Use that only for harness development. For normal agentic coding, Docker isolation is the supported path.
-
-## Install And Model Setup
-
-If you did not already clone it in Quick Start, clone and enter the repo:
-
-```bash
-git clone https://github.com/krzyszsz/agenticFeedbackCoding.git
-cd agenticFeedbackCoding
-```
-
-The normal Docker-isolated path needs only a small host toolchain: git to clone
-the repo, Docker to run the model/agent containers, Python 3 for the wrapper
-scripts, and curl for model-server readiness checks.
-
-```bash
-sudo apt-get update
-sudo apt-get install -y git docker.io python3 curl ca-certificates
-sudo usermod -aG docker "$USER"   # log out/in afterwards, or use sudo docker
-```
-
-The agent runtime dependencies live inside the agent Docker image. You do not
-need to install Playwright, pytest, Python packages, or project-specific SDKs on
-the host for normal use.
-
-For the default fast Gemma MTP profile, build/start the llama.cpp/Vulkan
-model-server image:
-
-```bash
-MODEL_PROFILE=gemma4-26b-a4b-qat-mtp REBUILD_SERVER_IMAGE=1 \
-bash scripts/start_default_model_server.sh
-```
-
-For a missing profile, download it first:
-
-```bash
-MODEL_PROFILE=qwen3.6-27b-mtp bash scripts/download_default_model.sh
-```
-
-`hf.key` is a plain text Hugging Face token outside this repo. Create it only if you need authenticated Hugging Face access:
-
-```bash
-printf '%s' 'hf_your_token_here' > "$HOME/hf.key"
-chmod 600 "$HOME/hf.key"
-```
-
-Default model paths are defined in `scripts/env.sh`:
-
-```bash
-HF_ROOT=$HOME/hf
-MODEL_ROOT=$HF_ROOT/models
-HF_TOKEN_FILE=$HOME/hf.key
-MODEL_PROFILE=gemma4-26b-a4b-qat-mtp
-```
-
-Start the default llama.cpp/Vulkan server:
-
-```bash
-MODEL_PROFILE=gemma4-26b-a4b-qat-mtp bash scripts/start_default_model_server.sh
-```
-
-By default this starts llama.cpp with `CTX_SIZE=131072`, `PARALLEL=1`,
-`MEM_LIMIT=75g`, `MEMORY_SWAP=75g`, `GPU_LAYERS=999`, reasoning enabled,
-`REASONING_BUDGET=4096`, `REASONING_FORMAT=deepseek`, and the selected
-profile port. It also creates/uses the `agentic-feedback-net` Docker network,
-names the server container from the selected profile, and publishes the API on
-the host for quick checks.
-Override `REASONING_MODE=off`, `REASONING_BUDGET=...`, or
-`REASONING_FORMAT=none|deepseek|deepseek-legacy` if a model needs different
-thinking behavior.
-`PARALLEL=1` keeps one server slot instead of multiplying the long context
-across several idle slots. Override these values in the shell if you need a
-smaller context, more concurrent slots, or CPU fallback.
-Set `REBUILD_SERVER_IMAGE=1` when you want to force a fresh llama.cpp/Vulkan
-server image build after changing `docker/llama-cpp-run.sh` or its Dockerfile.
-The interactive agent runner similarly reuses `agentic-feedback-coding:local`
-after the first build; set `REBUILD_AGENT_IMAGE=1` after changing the harness
-Dockerfile or Python code copied into that image. The benchmark runner rebuilds
-the current source once per selected image by default.
-
-If you already have a prebuilt agent image, run without rebuilding it:
-
-```bash
-docker pull ghcr.io/krzyszsz/agentic-feedback-coding:latest
-AGENT_IMAGE=ghcr.io/krzyszsz/agentic-feedback-coding:latest \
-SKIP_AGENT_IMAGE_BUILD=1 \
-bash scripts/build_and_run.sh --config config.minimal.json --prompt "Build a tiny checked project."
-```
-
-Model serving is intentionally separate from the agent image. You can use the
-provided llama.cpp/Vulkan container, another machine on your LAN, or any
-OpenAI-compatible cloud/local endpoint by setting `implementation_model.base_url`
-or `AGENT_IMPLEMENTATION_BASE_URL`.
-
-If you do not want to clone the repo at all, the prebuilt-agent path only needs
-a config file and an output directory. The config may be minimal because the
-harness has defaults for all other knobs:
-
-```bash
-mkdir -p agent-output
-cat > config.json <<'JSON'
-{
-  "runtime": {"workspace": "/workspace/project"},
-  "project_design": {
-    "title": "Tiny checked project",
-    "prompt": "Build a tiny Python CLI with tests and a README."
-  }
-}
-JSON
-
-docker run --rm --init --network agentic-feedback-net \
-  -e AGENT_IMPLEMENTATION_BASE_URL=http://agentic-gemma4-26b-mtp-server:8161/v1 \
-  -e AGENT_WORKSPACE=/workspace/project \
-  -v "$PWD/agent-output:/workspace/project" \
-  -v "$PWD/config.json:/app/config.json:ro" \
-  ghcr.io/krzyszsz/agentic-feedback-coding:latest --config /app/config.json
-```
-
-That simplified path assumes the model endpoint already exists. Setting up the
-model server remains hardware-specific, especially for GPU/Vulkan/driver paths.
-
-The checked-in configs keep a host-friendly endpoint:
-
-```text
-http://127.0.0.1:8161/v1
-```
-
-When the agent itself runs in Docker, `scripts/run_agent.sh` automatically
-overrides that URL inside the container to:
-
-```text
-http://agentic-gemma4-26b-mtp-server:8161/v1
-```
-
-Useful networking overrides:
-
-```bash
-DOCKER_NETWORK=agentic-feedback-net          # model-server container network
-AGENT_DOCKER_NETWORK=agentic-feedback-net    # agent container network
-MODEL_SERVER_CONTAINER=agentic-gemma4-26b-mtp-server # DNS name used inside the network
-MODEL_SERVER_PORT=8161
-AGENT_IMPLEMENTATION_BASE_URL=http://my-model:9000/v1
-```
-
-Use `DOCKER_NETWORK=host AGENT_DOCKER_NETWORK=host` only if you deliberately
-want the older host-network behavior.
-
-## AMD And Driver Notes
-
-The validated local path for this project is Vulkan, not ROCm. On the AMD Ryzen AI Max+ 395 / Strix Halo machine used during development, llama.cpp with Vulkan was more reliable than ROCm for GGUF serving.
-
-Optional AMD/Vulkan host diagnostics use these packages:
-
-```bash
-libvulkan1 mesa-vulkan-drivers vulkan-tools clinfo
-```
-
-Useful checks:
-
-```bash
-vulkaninfo --summary
-ls -l /dev/dri
-clinfo | head -80
-```
-
-If Vulkan causes instability, try CPU fallback for the model server:
-
-```bash
-USE_DRI=0 GPU_LAYERS=0 MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
-```
-
-That is much slower, but it avoids GPU-driver paths. ROCm is not required and is intentionally not automated here.
-
-## Context Continuity
-
-The phases are summarized once in [Workflow Policy](#workflow-policy). During
-that workflow, a workspace-local git repository records the accepted baseline
-and each accepted plan step, while context compaction preserves durable memory
-when active history reaches its configured bound.
-
-Both agents share one durable chat history. New feedback is appended at the end; previous requirements, implementation attempts, reviews, and correction requests stay visible until compaction is needed. Raw reviewer output remains in the audit transcript, but only a later harness validation receipt or explicit harness evidence override can become authoritative compacted workflow state.
-When compaction does run, the harness pins the current requirements, plan,
-research notes, step status, and recent plan notes into the compacted active
-context so the agents do not have to rediscover what they are supposed to be
-doing. Small routine updates are merged into existing durable memory
-deterministically; larger evictions use the model with a small compaction-only
-reasoning budget. The active-history ceiling is separate from the real model
-context-window fit check, so a large response reservation does not force
-compaction on every call. This avoids repeatedly re-summarizing unchanged
-history.
-
-## Existing Projects
-
-The harness can work on an existing codebase instead of creating a new project from scratch. Point `runtime.workspace` at the project folder and, if the project already has its own `PLAN.md` or `REQUIREMENTS.md`, give the harness separate state filenames:
-
-```json
-"runtime": {
-  "docker_isolation": true,
-  "workspace": "workspaces/existing-bugfix-demo",
-  "plan_file": "AGENT_PLAN.md",
-  "requirements_file": "AGENT_REQUIREMENTS.md",
-  "research_file": "AGENT_RESEARCH.md"
-}
-```
-
-The checked example seeds a small invoice calculator with a syntax error and a logic bug, then asks the agents to diagnose and repair it without rebuilding the project:
-
-```bash
-bash scripts/seed_existing_bugfix_fixture.sh
-bash scripts/build_and_run.sh --config config.real-existing-bugfix.json
-```
-
-In the verified run, the reviewer first pushed back on vague investigation evidence, then caught that the implementation had fixed only the syntax error while leaving the tax calculation bug. The accepted result fixed both issues, preserved the public API, added `BUGFIX_NOTES.md`, and passed `python -m unittest discover -v`.
-
-## Terminal View
-
-When `runtime.print_transcript=true`, the implementation and feedback turns print live so a long run shows progress instead of going silent. If stdout is a TTY and `runtime.color_transcript=true`, implementation turns use one color and feedback turns another; redirected logs stay plain text.
-
-Long model calls also emit terminal-only heartbeat lines controlled by `implementation_model.request_heartbeat_seconds`, for example:
-
-```text
-[model-call] still waiting for gemma4-26b-a4b-qat-mtp: 30s elapsed; health=ok http=200.
-```
-
-The heartbeat probes the model server's OpenAI-compatible `/models` endpoint. It is intentionally not appended to `conversation.jsonl` or `conversation.full.jsonl`, so it cannot pollute later context when a run is resumed or inspected by a model.
-
-## Feedback Review Tools
-
-The feedback agent does not only read the implementation agent's claims. Before each step review, the harness gives the feedback phase its own evidence:
-
-- a fresh snapshot of generated workspace files
-- an independent run of the current plan step's `validation_commands`
-- return codes, stdout/stderr tails, and timeout flags from those commands
-- `git status --short`
-- meaningful changed paths, ignoring harness bookkeeping files such as the configured plan/requirements/research documents and `.agent_state/`
-- `git diff --stat`
-- a truncated `git diff`
-
-The automatic evidence gate uses that feedback-side evidence first. In hard-pushback mode it rejects a step if validation is missing, fails, times out, or if the implementation claims completion without meaningful git changes.
-
-Deterministic plan checks validate command shape, metadata types, dependencies,
-and required plan fields. The tool verifier judges quoting, targeting, safety,
-and whether a call can report a false result using the current transcript. The
-step/final reviewer judges semantic coverage. Expected non-zero outcomes use
-`expected_returncode` or a wrapper that exits 0 only after confirming the
-intended observation.
-
-## Context And Tool Output Resilience
-
-The harness has four related resilience layers:
-
-- Conversation compaction runs before model calls and also accounts for the next prompt plus the configured response budget.
-- Tool evidence is bounded before it can enter the live transcript. Command stdout/stderr are drained while bounded head and tail evidence is retained, workspace snapshots cap each file plus aggregate files/characters, and git diffs are capped.
-- Bounded reviewer evidence remains available in local run summaries, but the feedback pasted back into the next implementation turn uses a compact evidence summary instead of the raw file/output/diff payload.
-- Commands with no hard deadline are reviewed periodically by the feedback model using the original request, active workflow history, prior reviews, and bounded live output. Elapsed time alone is not a stop condition; the reviewer can continue, terminate, or choose a later check interval.
-
-This matters because a single noisy command, giant generated file, or huge git diff can otherwise overflow the next local-model request even when ordinary chat-history compaction is enabled.
-
-## Git Checkpointing
-
-When `git_policy.enabled=true`, the generated workspace is initialized as a git repository. After requirements and plan validation, the harness creates a baseline commit. Accepted steps are committed only after feedback returns a resolved status. The final whole-project review also creates an acceptance commit. Harness-owned plan, requirements, research, and state files are placed in the repository-local exclude file and omitted from project commits, including when a configured control filename was already tracked. Harness git commands disable repository hooks so generated workspace hooks cannot execute during these checkpoints.
-
-If you want the final project left as uncommitted changes for manual inspection, set:
-
-```json
-"git_policy": {
-  "enabled": true,
-  "commit_completed_steps": true,
-  "require_step_diff": true,
-  "leave_final_changes_uncommitted": true,
-  "final_reset_mode": "soft"
-}
-```
-
-With that mode, the harness still uses commits internally during review, then resets to the baseline at the end so the final project appears in git as uncommitted/staged changes.
-
-## Web Research And Offline Mode
-
-Web research is optional. Disable the built-in research phase with `--offline`
-or the equivalent config:
-
-```json
-"mcp_tools": {
-  "web_scraping": false
-},
-"web_research": {
-  "enabled": false,
-  "allow_private_network": false
-}
-```
-
-When enabled, a small model-owned decision phase determines whether external
-evidence is material and returns focused queries or source URLs through JSON.
-The harness does not classify prompt keywords or construct topic queries. It
-validates and fetches the selected inputs, bounds accepted queries and pages by
-the configured search/page limits, writes the configured research file, appends
-bounded results to the transcript, and injects compact source notes into later
-phases.
-
-Model-selected research URLs are restricted to public network addresses by
-default, including redirects. Set `web_research.allow_private_network=true`
-only when a trusted task intentionally needs a loopback or private source. This
-setting affects the bounded research fetcher, not terminal-command networking.
-
-Fetched non-text responses, such as PDFs or binary downloads, are recorded as unsupported text sources instead of being decoded into the model prompt. That keeps web research generic and avoids flooding the context window with binary noise.
+Change `--mode harness` to `--mode single-shot` for zero-shot. Results and
+per-task logs are written under `runs/`; generated task workspaces are under
+`workspaces/benchmarks/`. Both directories are ignored by git.
 
 ## Output Files
 
-Each run creates or updates the configured workspace, usually under `workspaces/`, and writes:
+Each harness run writes:
 
-- a workspace-local `.git/` repository with baseline, accepted-step, and final-review commits when `git_policy.enabled=true`
-- the configured research file, normally `RESEARCH.md`, when web research was requested and enabled
-- the configured requirements file, normally `REQUIREMENTS.md`, with refined requirements and assumptions
-- the configured plan file, normally `PLAN.md`, with ordered tasks, acceptance criteria, validation commands, and status
-- `.agent_state/conversation.full.jsonl` with the append-only full machine-readable agent chat
-- `.agent_state/conversation.full.md` with the append-only transcript in readable Markdown
-- `.agent_state/conversation.jsonl` with the active model context, which may be compacted during long runs
-- `.agent_state/conversation.md` with the active model context in readable Markdown
-- `.agent_state/summary.json` with effective model reasoning budgets, step results, review statuses, and feedback evidence
+- the generated project in the configured workspace
+- `PLAN.md`, `REQUIREMENTS.md`, and optional `RESEARCH.md`, or configured names
+- `.agent_state/conversation.full.jsonl` and `.md`, the append-only audit history
+- `.agent_state/conversation.jsonl` and `.md`, the active compactable context
+- `.agent_state/summary.json` with status, budgets, decisions, and evidence paths
+- workspace-local git checkpoints when git policy is enabled
 
-When llama.cpp exposes thinking as `reasoning_content`, the current phase can
-receive it before parsing the final structured response. Visible `<think>`
-scratch text is removed before the response enters durable chat memory; the
-final structured content remains. This keeps later phases focused on decisions
-and evidence instead of imitating old scratch work.
+Server-side scratch reasoning may be used while parsing the current response,
+but visible scratch text is omitted from durable chat memory. Final structured
+content and validation receipts remain.
 
-Generated workspaces, logs, reports, transcripts, and test evidence are ignored by git. They are useful locally, but they should not be published by accident.
+## Development
 
-## Configuration Knobs
+Run the Python tests:
 
-| Field | Purpose | Typical values |
-|---|---|---|
-| `implementation_model.name` | Human-readable model profile name. | `gemma4-26b-a4b-qat-mtp` |
-| `implementation_model.base_url` | OpenAI-compatible endpoint used by the implementation agent. The Docker runner can override it with `AGENT_IMPLEMENTATION_BASE_URL`, which is how the agent container reaches the model-server container by DNS. | `http://127.0.0.1:8161/v1` |
-| `implementation_model.model` | Model id sent to the endpoint. llama.cpp accepts `local-gguf`. | `local-gguf` |
-| `implementation_model.context_window` | Context budget used by compaction logic. The MTP profiles use a 131072-token server context by default. | `131072` |
-| `implementation_model.max_tokens` | Max response length per model call. This is an upper bound, not a target; prompts ask for structured JSON, not artificially short answers. | `32768` |
-| `implementation_model.temperature` | Generation randomness. Lower is usually better for coding. | `0.1` to `0.3` |
-| `implementation_model.request_timeout_seconds` | HTTP timeout for one model response. This is separate from terminal command timeouts. | `21600` |
-| `implementation_model.retry_attempts` | Model HTTP retry budget for temporary server/network failures. Retry progress is printed to stderr. | `20` |
-| `implementation_model.retry_sleep_seconds` | Delay between model HTTP retries. Use `0` only for tests. | `30` |
-| `implementation_model.request_heartbeat_seconds` | Prints terminal-only elapsed-time and model REST health lines while a model response is in flight. Set `0` to disable it. | `30` |
-| `implementation_model.preserve_reasoning` | Accepts server-provided thinking/reasoning in the raw current response before parsing. Visible scratch reasoning is omitted from durable chat memory; final content is retained. | `true` |
-| `implementation_model.reasoning_budget_tokens` | Optional reasoning allowance sent to compatible endpoints and reserved when sizing structured responses. | `4096` |
-| `implementation_model.critical_reasoning_budget_tokens` | Reasoning allowance for unresolved retries and high-consequence reviews. `null` derives a bounded value four times the normal budget; set an explicit value to override it, or set it equal to the normal budget to disable the uplift. | `null` (effective default `16384`) |
-| `implementation_model.send_reasoning_budget` | Sends the nonstandard `reasoning_budget` request field. Disable it for endpoints that do not support that field. | `true` or `false` |
-| `feedback_model` | Optional separate reviewer model. `null` reuses the implementation model; a partial object inherits omitted implementation-model settings. | `null` or another model block |
-| `mcp_tools.terminal` | Allows command execution for implementation and reviewer validation. | `true` |
-| `mcp_tools.web_scraping` | Makes bounded web fetching available to the model-owned research decision phase. | `true` or `false` |
-| `mcp_tools.web_interaction` | Enables terminal-driven browser interaction when `mcp_tools.terminal` is also enabled. | `true` or `false` |
-| `runtime.docker_isolation` | Runs generated project work in a container. Normal use should keep this true. | `true` |
-| `runtime.docker_image` | Agent container image tag. | `agentic-feedback-coding:local` |
-| `runtime.docker_user` | User used inside the agent container. `host` maps to the host UID/GID; `root` is useful only for deliberate container-local package installs. | `host`, `root` |
-| `runtime.workspace` | Host-visible output folder for generated project files. Paths are canonicalized across config, environment, and CLI overrides; the filesystem root and aliases/symlinks resolving to it are rejected. | `workspaces/my-task` |
-| `runtime.plan_file` | Harness-owned plan filename inside the workspace. Use a custom name when editing an existing repo that already has `PLAN.md`. | `PLAN.md`, `AGENT_PLAN.md` |
-| `runtime.requirements_file` | Harness-owned requirements filename inside the workspace. | `REQUIREMENTS.md`, `AGENT_REQUIREMENTS.md` |
-| `runtime.research_file` | Harness-owned research filename inside the workspace. | `RESEARCH.md`, `AGENT_RESEARCH.md` |
-| `runtime.command_timeout_seconds` | Default hard deadline for one terminal command. `0` leaves termination to periodic progress review; commands can request a positive override. | `0` |
-| `runtime.max_command_timeout_seconds` | Cap for positive per-command overrides. `0` disables the cap. | `21600` |
-| `runtime.command_progress_review_interval_seconds` | Initial interval between model reviews of a still-running command. It also bounds each advisory progress-review model request to one attempt; it does not impose a deadline on the command. `0` disables progress review. | `300` |
-| `runtime.command_progress_review_min_interval_seconds` | Lower bound for a model-requested next progress check, preventing a tight review loop. | `30` |
-| `runtime.command_progress_review_max_interval_seconds` | Upper bound for a model-requested next progress check. `0` leaves it uncapped. | `3600` |
-| `runtime.print_transcript` | Prints the live agent conversation. | `true` for debugging |
-| `runtime.color_transcript` | Uses ANSI colors for live transcript roles when stdout is a terminal. Redirected logs stay plain text. | `true` |
-| `runtime.live_turn_max_chars` | Optional per-turn cap for live terminal printing only. Saved full transcripts remain append-only and untruncated. | `0` for unlimited, or `30000` |
-| `runtime.final_summary` | Final stdout summary mode after the live transcript. Full evidence is always written to `.agent_state/summary.json`. | `compact`, `full`, `none` |
-| `runtime.feedback_response_max_tokens` | Reviewer answer allowance. The request ceiling also reserves configured reasoning room. Set `0` to use the model's full ceiling. | `2048` default; checked benchmark configs use `4096` |
-| `context_compaction.enabled` | Enables transcript compaction near context limits. | `true` |
-| `context_compaction.threshold_ratio` | Fractional context trigger. The separate `max_uncompacted_tokens` ceiling may trigger first. | `0.25` built in; checked configs use `0.55` to `0.8` |
-| `context_compaction.keep_recent_turns` | Recent turns kept verbatim during compaction. | `6` to `12` |
-| `context_compaction.max_uncompacted_tokens` | Optional ceiling for active transcript history. Incoming prompt and response budgets are checked separately against the model context window. | `24000` |
-| `context_compaction.recent_turns_max_tokens` | Maximum verbatim recent-turn budget; the effective budget shrinks when the next request needs more room. | `12000` |
-| `context_compaction.model_summary_min_new_tokens` | Minimum newly evicted history before invoking a model compaction again. Smaller routine updates are merged into prior durable memory without another model call. | `2048` |
-| `context_compaction.tool_output_max_chars` | Retained head/tail budget for each command stream: stdout and stderr are each bounded independently. The process is drained continuously so verbose tools cannot flood memory/context. | `4000` |
-| `context_compaction.workspace_file_max_bytes` | Max bytes read per workspace file for reviewer evidence. Larger files are represented by first/last excerpts plus size metadata. | `12000` to `20000` |
-| `context_compaction.workspace_snapshot_max_files` | Maximum file entries retained in one raw workspace snapshot; skipped dependency/cache directories are pruned before traversal. | `1000` |
-| `context_compaction.workspace_snapshot_max_chars` | Aggregate represented-content cap for one raw workspace snapshot. | `2000000` |
-| `context_compaction.git_diff_max_chars` | Max git diff text retained for reviewer evidence. | `20000` |
-| `context_compaction.transcript_review_max_chars` | Max compact review payload pasted back into the live implementation chat. Values below `512` are rejected because they cannot retain a useful decision and truncation marker. | `12000` default; checked configs use `24000` |
-| `phases.analysis.max_iterations` | Problem-analysis and analysis-review retry budget before planning. | `2` |
-| `phases.requirements_refinement.max_iterations` | Requirement refinement retry budget. | `2` |
-| `phases.plan_validation.max_iterations` | Plan validation retry budget. | `2` |
-| `phases.implementation.max_iterations` | Per-step implementation retry budget. | `7` |
-| `review_policy.hard_pushback_iterations` | Strict review attempts before compromise. | `3` |
-| `review_policy.compromise_iterations` | Bounded compromise attempts after strict review. | `4` |
-| `review_policy.final_review_iterations` | Correction attempts after the initial whole-project review; total review passes are at most this value plus one. | `1` or `2` |
-| `quality_policy.assume_code_quality_when_unspecified` | Asks models for proportional engineering quality while preserving the request and keeping small tasks small; it does not add fixed deliverables. | `true` |
-| `web_research.enabled` | Enables the model-owned research decision and bounded fetching before analysis. | `true` or `false` |
-| `web_research.allow_private_network` | Allows the bounded research fetcher to contact loopback, private, link-local, or otherwise non-public addresses. Keep disabled unless the task uses a trusted local source. | `false` |
-| `loop.max_approach_reattempts` | Maximum complete analysis-to-approach cycles when final review requests a materially different approach. | `5` |
-| `git_policy.enabled` | Initializes a workspace-local git repository and records git evidence. | `true` |
-| `git_policy.commit_completed_steps` | Commits each accepted plan step after feedback resolves it. | `true` |
-| `git_policy.require_step_diff` | Requires a meaningful change unless fresh reviewer-owned validation or an explicit non-command validation method supplies independent evidence that no edit is needed. | `true` |
-| `project_design.title` | Short task title. | Any string |
-| `project_design.prompt` | Actual task prompt. | Detailed project brief |
-
-## Real Example Configs
-
-These configs are intended to run against a real local model endpoint. The table below records the latest successful evidence runs and keeps a few reusable stress configs for future checks.
-
-- `config.example.json` - starter task tracker project.
-- `config.minimal.json` - tiny override-only config showing that defaults fill in the rest.
-- `config.real-palindrome.json` - reusable CLI benchmark.
-- `config.real-arithmetic.json` - focused arithmetic package task, useful for quick prompt/regression checks.
-- `config.real-website.json` - static website plus browser interaction task.
-- `config.gemma4-palindrome.json` - same CLI benchmark using Gemma4-26B-A4B.
-- `config.gemma4-website.json` - same static website/browser benchmark using Gemma4-26B-A4B and a bounded live transcript.
-- `config.real-existing-bugfix.json` - existing-project repair benchmark using separate agent-owned state files.
-- `config.real-dotnet-dependency.json` - dependency-discovery benchmark where the agent installs .NET inside the disposable container without changing this harness Dockerfile.
-- `config.real-jsonl-stats.json` - Qwen JSONL statistics stress benchmark; the latest long run timed out and is kept as a reusable hard case, not as successful evidence.
-- `config.gemma4-jsonl-stats.json` - fresh JSONL statistics CLI benchmark using Gemma4-26B-A4B.
-- `config.real-interest-rate-research.json` - web-research analysis benchmark using Gemma4-26B-A4B.
-- `config.real-city-research.json` - web-research manifest task.
-- `config.real-platformer.json` - browser platformer task with Playwright validation requirements.
-- `config.gpx-editor.json` - GPX editor task with browser/map-style interaction requirements.
-
-## Scripts
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. \
+  python3 -m unittest discover -s tests -v
+```
 
 | Script | Purpose |
 |---|---|
-| `scripts/bootstrap_ubuntu.sh` | Optional convenience bootstrap for local development. The Quick Start shows the minimal host packages explicitly so users can see what is installed. |
-| `scripts/install_ubuntu.sh` | Compatibility wrapper around `scripts/bootstrap_ubuntu.sh`. |
-| `scripts/download_default_model.sh` | Downloads and verifies the selected `MODEL_PROFILE` GGUF files when they are not already present. |
-| `scripts/start_default_model_server.sh` | Builds if needed and starts the selected llama.cpp/Vulkan model server on `agentic-feedback-net`, with the profile host port published for checks. |
-| `scripts/build_and_run.sh` | Convenience wrapper to build/run the agent harness from a config. |
-| `scripts/run_agent.sh` | Lower-level runner that re-enters Docker when `runtime.docker_isolation=true` and joins the agent container to the model-server network. |
-| `scripts/seed_existing_bugfix_fixture.sh` | Creates the existing-project repair fixture with planted syntax and logic bugs. |
-| `scripts/env.sh` | Shared path/model defaults. Override values in the shell. |
+| `scripts/download_default_model.sh` | Download and verify files for `MODEL_PROFILE`. |
+| `scripts/start_default_model_server.sh` | Start a llama.cpp/Vulkan model container. |
+| `scripts/build_and_run.sh` | Build if needed and run the isolated harness. |
+| `scripts/run_agent.sh` | Lower-level container-aware agent runner. |
+| `scripts/run_benchmarks.py` | Run isolated zero-shot or harness suites. |
+| `scripts/bootstrap_ubuntu.sh` | Optional Ubuntu development bootstrap. |
 
-## Evidence Files
-
-Benchmark artifacts are written under `runs/`. Generated projects and their
-agent transcripts are written under `workspaces/`. Both are ignored by git so
-large logs, screenshots, model transcripts, and generated dependencies are kept
-local unless explicitly copied into a publication artifact.
-
-## Tests
-
-Run the harness unit tests without Docker:
+The validated AMD path is Vulkan. Useful diagnostics are
+`vulkaninfo --summary`, `ls -l /dev/dri`, and `clinfo`. CPU fallback is:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 -m unittest discover -s tests -v
+USE_DRI=0 GPU_LAYERS=0 \
+  MODEL_PROFILE=gemma4-26b-a4b-qat-mtp \
+  bash scripts/start_default_model_server.sh
 ```
 
-Run a real Docker-isolated benchmark. The first command starts the model server
-in its own container, and the second command starts the agent container on the
-same Docker network:
-
-```bash
-MODEL_ROOT=$HOME/hf/models bash scripts/start_default_model_server.sh
-bash scripts/build_and_run.sh --config config.real-palindrome.json
-```
-
-If your model cache lives outside `$HOME/hf`, override both roots:
-
-```bash
-HF_ROOT=/mnt/hf MODEL_ROOT=/mnt/hf/models bash scripts/start_default_model_server.sh
-```
+Repository constraints are in [AGENTS.md](AGENTS.md). The central rule is that
+the harness manages problem-solving conditions; it never embeds solutions to
+the tasks being solved.

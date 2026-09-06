@@ -64,6 +64,7 @@ def run_bounded_process(
     byte_counts = {"stdout": 0, "stderr": 0}
     timed_out = False
     stopped_by_progress_review = False
+    satisfied_by_progress_review = False
     progress_reviews: list[dict[str, Any]] = []
     progress_review_count = 0
     started = time.monotonic()
@@ -208,7 +209,7 @@ def run_bounded_process(
         normalized = dict(decision)
         supplied_decision = normalized.get("decision")
         raw_decision = str(supplied_decision or "").strip()
-        if raw_decision not in {"continue", "terminate"}:
+        if raw_decision not in {"continue", "stop_satisfied", "terminate"}:
             raw_decision = "continue"
             protocol_error = True
         normalized["decision"] = raw_decision
@@ -223,22 +224,28 @@ def run_bounded_process(
             next_check = min(next_check, max_progress_interval)
         normalized["next_check_seconds"] = next_check
         if not normalized.get("summary"):
-            normalized["summary"] = (
-                "Progress reviewer requested termination."
-                if raw_decision == "terminate"
-                else "Progress reviewer allowed the command to continue."
-            )
+            summary_by_decision = {
+                "continue": "Progress reviewer allowed the command to continue.",
+                "stop_satisfied": "Progress reviewer found sufficient evidence and ended the command.",
+                "terminate": "Progress reviewer requested unsuccessful termination.",
+            }
+            normalized["summary"] = summary_by_decision[raw_decision]
         return normalized
 
     def apply_progress_decision(decision: dict[str, Any], now: float) -> None:
         nonlocal killed_process_group, force_close_deadline, next_progress_review
-        nonlocal progress_review_count, stopped_by_progress_review
+        nonlocal progress_review_count, stopped_by_progress_review, satisfied_by_progress_review
         progress_review_count += 1
         progress_reviews.append(decision)
         if len(progress_reviews) > MAX_RETAINED_PROGRESS_REVIEWS:
             del progress_reviews[: len(progress_reviews) - MAX_RETAINED_PROGRESS_REVIEWS]
-        if decision["decision"] == "terminate" and proc.poll() is None:
-            stopped_by_progress_review = True
+        if (
+            decision["decision"] in {"stop_satisfied", "terminate"}
+            and not timed_out
+            and proc.poll() is None
+        ):
+            stopped_by_progress_review = decision["decision"] == "terminate"
+            satisfied_by_progress_review = decision["decision"] == "stop_satisfied"
             killed_process_group = True
             force_close_deadline = now + 1.0
             kill_process_group(signal.SIGTERM)
@@ -352,9 +359,14 @@ def run_bounded_process(
     stderr = decoded_output("stderr")
     stdout_truncated = byte_counts["stdout"] > output_limit_bytes
     stderr_truncated = byte_counts["stderr"] > output_limit_bytes
-    if stopped_by_progress_review:
+    ended_by_progress_review = stopped_by_progress_review or satisfied_by_progress_review
+    if ended_by_progress_review:
         summaries = "; ".join(str(item.get("summary", "")) for item in progress_reviews[-3:] if item.get("summary"))
-        marker = "[command stopped by progress review]"
+        marker = (
+            "[command stopped after progress review found sufficient evidence]"
+            if satisfied_by_progress_review
+            else "[command stopped by progress review]"
+        )
         if summaries:
             marker += f" {summaries}"
         stderr = clamp_text(
@@ -364,7 +376,7 @@ def run_bounded_process(
         )
     return {
         "command": command,
-        "returncode": 125 if stopped_by_progress_review else 124 if timed_out else returncode,
+        "returncode": 125 if ended_by_progress_review else 124 if timed_out else returncode,
         "stdout": stdout,
         "stderr": stderr,
         "timed_out": timed_out,
@@ -375,6 +387,8 @@ def run_bounded_process(
         "stderr_truncated": stderr_truncated,
         "stdout_bytes": byte_counts["stdout"],
         "stderr_bytes": byte_counts["stderr"],
+        "ended_by_progress_review": ended_by_progress_review,
+        "satisfied_by_progress_review": satisfied_by_progress_review,
         "stopped_by_progress_review": stopped_by_progress_review,
         "progress_reviews": progress_reviews,
         "progress_review_count": progress_review_count,

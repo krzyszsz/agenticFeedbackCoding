@@ -87,7 +87,7 @@ PHASE_STATUS_VALUES: dict[str, frozenset[str]] = {
         "cannot_resolve",
     }),
     "TOOL_CALL_VERIFICATION_PHASE": frozenset({"approved", "blocked"}),
-    "TOOL_PROGRESS_REVIEW_PHASE": frozenset({"continue", "terminate"}),
+    "TOOL_PROGRESS_REVIEW_PHASE": frozenset({"continue", "stop_satisfied", "terminate"}),
 }
 
 
@@ -104,7 +104,7 @@ WORKFLOW_REVIEW_PHASES = frozenset({
 PHASE_DECISION_VALUES: dict[str, frozenset[str]] = {
     "APPROACH_REVIEW_PHASE": frozenset({"keep_result", "retry_with_new_approach", "stop_unresolved"}),
     "PLAN_VALIDATION_LIFECYCLE_PHASE": frozenset({"valid", "needs_plan_change"}),
-    "TOOL_PROGRESS_REVIEW_PHASE": frozenset({"continue", "terminate"}),
+    "TOOL_PROGRESS_REVIEW_PHASE": frozenset({"continue", "stop_satisfied", "terminate"}),
 }
 
 

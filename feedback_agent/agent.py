@@ -119,23 +119,20 @@ bounded command. Do not use `chmod` or `chown` as validation.
 
 SCOPE_BOUNDARY_GUIDANCE = """
 Scope boundary:
-The original request, supplied examples, and existing workspace define scope.
-Accepted requirements may clarify that scope but may not silently broaden or
-replace it. Preserve explicit inclusions, exclusions, and final-state
-boundaries as literal constraints, not descriptions of a primary result. A
-temporary helper may be used during execution, but remove it before acceptance
-when retaining it would violate the requested final state, and do not make a
-later validation depend on that removed helper. Keep unspecified caller-visible
-behavior as an explicit assumption, open question, or unconstrained detail
-instead of inventing an interface.
+The request, examples, and existing workspace define scope. Requirements may
+clarify but not broaden it. Preserve explicit inclusions, exclusions, and
+final-state boundaries. Remove a temporary helper only when retaining it would
+violate that final state, and never make later validation depend on a removed
+helper. Keep unspecified caller-visible behavior unconstrained or record the
+needed assumption instead of inventing an interface.
 """
 
 
 REQUIREMENTS_SCOPE_PRESERVATION_GUIDANCE = """
 Requirements scope preservation:
-Preserve explicit names, paths, data shapes, invocation forms, outputs, and
-examples. Resolve only gaps needed to proceed.
-Do not make a validation convenience part of the public interface.
+Preserve explicit names, paths, data shapes, invocations, outputs, and examples.
+Resolve only necessary gaps; do not turn validation convenience into a public
+interface.
 """
 
 
@@ -144,6 +141,9 @@ Original-request fit check:
 Re-read the original request and pre-task workspace for explicit exclusions,
 interfaces, and final-state limits that generated requirements or plans may
 have dropped. Compare those constraints with the current plan or artifacts.
+An explicitly prescribed invocation, sequence, timeout behavior, or verification
+process is a requirement, not an example. A supplemental check does not replace
+matching planned and executed evidence for that prescribed process.
 Flag only a concrete material mismatch, invented public interface, persistent
 validation byproduct, or final-state violation; do not infer an unstated limit
 or demand an inventory copy.
@@ -285,8 +285,13 @@ only part of the evidence; later review decides whether total evidence is enough
 Approval for execution and approval for later validation replay are separate.
 Set `reuse_as_validation` true only when reuse was requested and replay is
 observational, repeatable, and compatible with side effects, run counts,
-cleanup, cost, and lifecycle. A no-deadline command is acceptable when its
-purpose and progress can be reviewed.
+cleanup, cost, and lifecycle. Replay must add useful current evidence, not
+merely be safe or possible. For a no-deadline or progress-reviewed command,
+keep reuse false unless a fresh later run is necessary to judge final state;
+the retained result already proves the completed execution event. A command
+that creates, deletes, or overwrites project state may be implementation, but
+it cannot be replayed as validation. A no-deadline command is acceptable when
+its purpose and progress can be reviewed.
 """ + JSON_OUTPUT_RULES + """
 """
 
@@ -342,12 +347,13 @@ hypothetical doubt.
 
 DELIVERABLE_EVIDENCE_GUIDANCE = """
 Deliverable evidence review:
-Implementation summaries, generated tests, and requirements are claims. Inspect
-current artifacts and reviewer-owned command results, and map each requested
-material behavior and explicitly listed success or failure class to evidence.
-Command output does not prove that an artifact exists unless the command
-actually reads that artifact; compare requested final artifacts with the current
-workspace snapshot and git evidence.
+Implementation summaries, generated tests, and requirements are claims. Use only
+supplied artifact paths and command-result sources or indexes as evidence. Map
+each requested material behavior and explicitly listed success or failure class
+to that evidence; never claim a command ran or passed when no matching result is
+present. Command output proves an artifact exists only when it reads that
+artifact; compare requested final artifacts with the current workspace snapshot
+and git evidence.
 Similar cases are interchangeable only when an inspected common mechanism
 decisively covers both. A passing check proves only what it exercised; runtime
 behavior needs runtime evidence. Request the smallest decisive check for a real
@@ -466,21 +472,24 @@ def _review_payload_text(payload: dict[str, Any], final_instruction: str = "") -
 TOOL_PROGRESS_REVIEW_CONTRACT = """
 Return strict JSON only:
 {
-  "decision": "continue",
+  "decision": "<choose a permitted decision>",
   "summary": "why the running command should continue or stop",
   "evidence": ["specific current-output or context fact"],
   "risks": ["risk if continued or stopped"],
   "next_check_seconds": 300
 }
-`decision` must be exactly `continue` or `terminate`; the JSON example shows
-shape only and is not a continuation decision for the current command.
+`decision` must be exactly `continue`, `stop_satisfied`, or `terminate`; replace
+the angle-bracket placeholder with one of those values.
 Review a command that is already running. Use the chat history, current plan,
 original request, tool-call verification result, and the bounded live stdout/stderr
-snapshot. Terminate only when current evidence shows the command is unsafe,
-wrong, waiting for unavailable input, repeating a hopeless failure, or no longer
-useful. Time and quiet output alone are not failure. Heartbeats and repeated
-generic lines are observability, not progress, unless monitoring is the task.
-When uncertain, continue and choose a context-appropriate next check.
+snapshot. Use `stop_satisfied` only when the intended observation is already in
+the supplied evidence and further execution is unnecessary; this ends the
+command, not the whole task, and later review still judges the evidence. Use
+`terminate` when the command is unsafe, wrong, waiting for unavailable input, or
+repeating a hopeless failure. Time and quiet output alone are not failure.
+Heartbeats and repeated generic lines are observability, not progress, unless
+monitoring is the task. Continue only when another interval can plausibly add
+material evidence, and state that expectation in the summary.
 """ + JSON_OUTPUT_RULES + """
 """
 
@@ -506,21 +515,21 @@ Command and validation rules, in priority order:
 1. Validation is observational: test a requested property and fail on a
    plausible wrong result. Compare semantics unless the request constrains exact
    representation. A command whose successful purpose is to create or overwrite
-   the requested result is implementation, not validation. Do not use setup,
-   mutation, one-shot work, or a count-limited action as replayable validation.
+   the result is implementation, not validation. Setup, mutation, one-shot, and
+   count-limited actions are not replayable checks.
 2. Leave the final workspace in the requested state. Put temporary fixtures in
    isolated temporary storage and clean every success and failure path while
    preserving the assertion result.
 3. Commands are argv data. Use a list for an ordinary command, or an object with
-   list-valued `cmd` plus needed metadata. Put shell syntax in one `bash -lc`
-   script argument and avoid unnecessary nested quoting.
-4. Express an expected non-zero result with `expected_returncode` or a wrapper
-   that exits zero only after confirming it. Use `final_state: false` only when
-   later planned work intentionally invalidates the observation.
-5. Long-running checks should expose bounded progress. A model progress review,
-   not elapsed time alone, decides whether a no-deadline command remains useful.
-   If terminal validation is unsuitable, use a concrete non-command
-   `validation_method`.
+   list-valued `cmd` and needed metadata. Put shell syntax in one `bash -lc`
+   argument and avoid unnecessary nested quoting.
+4. Use `expected_returncode` for an expected non-zero result. Set
+   `final_state: false` when later work invalidates evidence or replay repeats
+   one-shot, costly, external, no-deadline, or progress-reviewed work without
+   needed final evidence. Retain the result.
+5. Long-running checks expose bounded progress. A model progress review, not
+   elapsed time alone, decides whether a no-deadline command remains useful. If
+   terminal validation is unsuitable, use a non-command `validation_method`.
 """
 
 
@@ -532,7 +541,7 @@ Return strict JSON only:
   "final_state": {
     "required_project_paths": ["exact relative path explicitly required in the final workspace"],
     "unrequested_new_paths_policy": "<choose allow or restrict>",
-    "path_policy_basis": "original-request or workspace fact supporting that choice",
+    "path_policy_basis": "explicit original-request or workspace fact supporting that choice",
     "other_constraints": ["explicit output, cleanup, or interface limit not represented by the path list"]
   },
   "assumptions": ["explicit assumption or gap resolution"],
@@ -552,17 +561,21 @@ Return strict JSON only:
       "depends_on": [],
       "persistent_paths": ["relative project path retained after this step"],
       "acceptance_criteria": ["verifiable criterion"],
-      "validation_method": "non-command evidence method, or empty when commands are used",
+      "validation_method": "",
       "validation_commands": [["program", "argument"]]
     }
   ]
 }
-Keep requirements specific. `required_project_paths` contains exact requested
-final paths, not helpers. Choose `allow` or `restrict` from cited request or
-workspace evidence; do not infer a path limit. Put remaining literal limits in
-`other_constraints`. Group work at dependency or review boundaries. Each step
+Keep requirements specific. `required_project_paths` lists requested final paths,
+not helpers or an exclusive inventory. Choose `restrict` only for an explicit
+request or workspace ban on other retained paths and cite it in
+`path_policy_basis`; otherwise choose `allow`. Put other literal limits in
+`other_constraints`. Use paths relative to the supplied workspace cwd. Each step
 needs one validation branch and lists every retained path in `persistent_paths`;
-exclude cleaned temporary paths.
+exclude cleaned temporary paths. Cross-check `refined_requirements`,
+`final_state`, `planning_confirmation`, and `plan`: every mandatory constraint or
+promised check must appear in the plan or remain unresolved, never deferred to
+a later phase.
 `open_questions[].resolution_strategy` must be `assume`, `defer`, or
 `cannot_resolve`; example values show shape, not preferred decisions.
 """ + SCOPE_BOUNDARY_GUIDANCE + REQUIREMENTS_SCOPE_PRESERVATION_GUIDANCE + PLAN_SCOPE_RULES + EXECUTABLE_DELIVERABLE_GUIDANCE + VALIDATION_COMMAND_RULES + JSON_OUTPUT_RULES + """
@@ -587,7 +600,7 @@ Return strict JSON only:
       "depends_on": [],
       "persistent_paths": ["relative project path retained after this step"],
       "acceptance_criteria": ["verifiable criterion"],
-      "validation_method": "non-command evidence method, or empty when commands are used",
+      "validation_method": "",
       "validation_commands": [["program", "argument"]]
     }
   ]
@@ -638,6 +651,9 @@ request; otherwise report the limitation through `resolution_request`.
 Preserve the original request and existing public interfaces. If the accepted
 plan introduced an unsupported caller-visible constraint, request a plan change
 instead of encoding it. Avoid unrelated project rewrites.
+If a necessary retained path is absent from every accepted step's
+`persistent_paths`, request `needs_plan_change` before writing it. A final-state
+policy that allows extra paths does not amend the accepted step.
 """ + SCOPE_BOUNDARY_GUIDANCE + EXECUTABLE_DELIVERABLE_GUIDANCE + """
 When terminal execution is available, request additional workspace inspection
 through `commands`; use supplied workspace snapshots as evidence without
@@ -993,11 +1009,172 @@ class FeedbackLoopAgent:
     def _workflow_memory_snapshot(self) -> str:
         """Pinned memory appended to compaction output.
 
-        This is intentionally deterministic and generic: it carries current
-        requirements, ordered plan state, recent notes, and research status
-        without embedding any benchmark-specific solution.
+        Compaction already pins the original request and latest protocol control
+        state in separate deterministic sections. This snapshot therefore uses
+        component budgets instead of clipping the full phase prompt through an
+        arbitrary middle boundary. Full notes remain in the runbook files.
         """
-        return self._prompt_excerpt(self._workflow_state_for_prompt(), 18000)
+        step_lines = [
+            f"- {step.get('id')}: {step.get('status', 'pending')} | "
+            f"{self._prompt_excerpt(str(step.get('title', '')), 240)}"
+            for step in self.plan_steps
+        ] or ["- no validated plan steps yet"]
+
+        findings = self._bounded_memory_bullets(
+            self.active_repair_findings,
+            count=5,
+            item_chars=700,
+        ) or ["- none"]
+        notes = self._bounded_memory_bullets(
+            self.plan_notes,
+            count=4,
+            item_chars=650,
+        ) or ["- none"]
+
+        requirements_status = str(self.last_requirements_review.get("status") or "not_reviewed")
+        requirements_review = self._prompt_excerpt(
+            str(self.last_requirements_review.get("summary") or "No requirements review summary."),
+            700,
+        )
+        required_changes = self._bounded_memory_bullets(
+            self.last_requirements_review.get("required_changes", []),
+            count=4,
+            item_chars=500,
+        ) or ["- none"]
+        requirements_payload = self._requirements_summary_payload(include_planning_context=False)
+        requirements_lines = [
+            "Project summary: "
+            + self._prompt_excerpt(str(requirements_payload.get("summary") or "not available"), 600),
+            "Key requirements:",
+            *(
+                self._bounded_memory_bullets(
+                    requirements_payload.get("key_requirements", []),
+                    count=6,
+                    item_chars=360,
+                )
+                or ["- none accepted yet"]
+            ),
+        ]
+        final_state = requirements_payload.get("final_state")
+        if isinstance(final_state, dict):
+            required_paths = final_state.get("required_project_paths", [])
+            if isinstance(required_paths, list):
+                requirements_lines.append(
+                    "Required final paths: "
+                    + self._prompt_excerpt(
+                        ", ".join(str(path) for path in required_paths[:12]) or "none listed",
+                        900,
+                    )
+                )
+            requirements_lines.append(
+                "Unrequested paths allowed: "
+                + str(final_state.get("allow_unrequested_new_paths", "not decided"))
+            )
+            requirements_lines.extend(
+                ["Other final-state constraints:"]
+                + (
+                    self._bounded_memory_bullets(
+                        final_state.get("other_constraints", []),
+                        count=4,
+                        item_chars=360,
+                    )
+                    or ["- none"]
+                )
+            )
+
+        recommended_path = (
+            self.problem_analysis.get("recommended_path", {})
+            if isinstance(self.problem_analysis, dict)
+            else {}
+        )
+        if not isinstance(recommended_path, dict):
+            recommended_path = {}
+        remaining_unknowns = (
+            self.problem_analysis.get("remaining_unknowns", [])
+            if isinstance(self.problem_analysis, dict)
+            else []
+        )
+        analysis_lines = [
+            "Recommended path: "
+            + self._prompt_excerpt(
+                " | ".join(
+                    part
+                    for part in (
+                        str(recommended_path.get("path_id") or ""),
+                        str(recommended_path.get("rationale") or ""),
+                    )
+                    if part
+                )
+                or "not selected",
+                900,
+            ),
+            "Fallback trigger: "
+            + self._prompt_excerpt(str(recommended_path.get("fallback_trigger") or "none recorded"), 600),
+            "Remaining unknowns:",
+            *(
+                self._bounded_memory_bullets(remaining_unknowns, count=4, item_chars=360)
+                or ["- none recorded"]
+            ),
+        ]
+        approach_tail = self.approach_history[-2:] if self.approach_history else []
+        approach_lines = [
+            "- attempt "
+            + str(item.get("approach_attempt", "?"))
+            + ": final_status="
+            + str(item.get("final_status", "unknown"))
+            + "; decision="
+            + str(
+                (item.get("approach_review") or {}).get("decision")
+                or (item.get("approach_review") or {}).get("status")
+                or "unknown"
+            )
+            + "; "
+            + self._prompt_excerpt(
+                str((item.get("approach_review") or {}).get("summary") or "no summary"),
+                600,
+            )
+            for item in approach_tail
+            if isinstance(item, dict)
+        ]
+
+        parts = [
+            "Compaction boundary: the original request and newest validated control state are pinned separately.",
+            f"Full runbook detail remains in {self.config.runtime.plan_file}, "
+            f"{self.config.runtime.requirements_file}, and {self.config.runtime.research_file}.",
+            "HIGH-PIVOTAL CURRENT STATE:",
+            "Step status:",
+            *step_lines,
+            "Unresolved repair findings:",
+            *findings,
+            f"Latest requirements review: status={requirements_status}",
+            requirements_review,
+            "Required requirements changes:",
+            *required_changes,
+            "MEDIUM-CONTRIBUTORY MEMORY:",
+            "Recent runbook outcomes:",
+            *notes,
+            "Requirements summary:",
+            *requirements_lines,
+            "Current analysis direction:",
+            *analysis_lines,
+            "Recent approach outcomes:",
+            *(approach_lines or ["- no completed approach attempts yet"]),
+            f"Web research status: {self.web_research_result.get('status', 'not_run')}",
+        ]
+        return "\n".join(parts)
+
+    def _bounded_memory_bullets(
+        self,
+        values: Any,
+        *,
+        count: int,
+        item_chars: int,
+    ) -> list[str]:
+        """Keep the newest bounded runbook items without cutting across fields."""
+        if not isinstance(values, list):
+            return []
+        selected = [str(value).strip() for value in values if str(value).strip()][-count:]
+        return [f"- {self._prompt_excerpt(value, item_chars)}" for value in selected]
 
 
     def initialize(self) -> None:
@@ -1461,29 +1638,20 @@ class FeedbackLoopAgent:
         try:
             return accept(self._extract_phase_json(raw, phase=phase))
         except Exception as exc:
-            if feedback:
-                recovery_context, omitted_unsafe_tail, omission_reason = self._json_repair_recovery_context(
-                    raw,
-                    phase=phase,
-                )
-                if not omitted_unsafe_tail:
-                    recovery_context = (
-                        "The rejected response and original review request remain in active chat history. "
-                        "Use the most recent request for this phase; this turn changes only its response format."
-                    )
-            else:
-                recovery_context, omitted_unsafe_tail, omission_reason = self._json_repair_recovery_context(
-                    raw,
-                    phase=phase,
-                )
-            if omitted_unsafe_tail:
-                self._replace_last_malformed_response_for_repair(
-                    phase,
-                    raw,
-                    exc,
-                    omission_reason=omission_reason,
-                    feedback=feedback,
-                )
+            recovery_context, omitted_unsafe_tail, omission_reason = self._json_repair_recovery_context(
+                raw,
+                phase=phase,
+            )
+            self._replace_last_malformed_response_for_repair(
+                phase,
+                raw,
+                exc,
+                omission_reason=(
+                    omission_reason
+                    or "the response was rejected by the current phase protocol"
+                ),
+                feedback=feedback,
+            )
             parse_error_text = self._json_repair_parse_error_for_prompt(
                 exc,
                 omitted_unsafe_tail=omitted_unsafe_tail,
@@ -1498,7 +1666,8 @@ class FeedbackLoopAgent:
             repair_prompt = (
                 f"{phase}_JSON_REPAIR\n"
                 f"Your preceding response to this phase was not accepted: {parse_error_text}\n"
-                "The original question, evidence, and rejected response are immediately before this turn. "
+                "The original question and evidence remain in active chat history; the rejected response remains "
+                "only in the full audit transcript and the bounded recovery note below. "
                 f"{role_reminder}Answer that same question again; correct the stated protocol defect without changing supported "
                 "content merely because its format failed. Return only one JSON object, with no label, fence, "
                 "reasoning, or narration. Schema text below shows shape, not literal values.\n"
@@ -1525,9 +1694,17 @@ class FeedbackLoopAgent:
                     critical_reasoning=False,
                     reasoning_budget_cap_tokens=PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
                 )
+            self._retire_protocol_repair_request(phase, feedback=feedback, minimal=False)
             try:
                 return accept(self._extract_phase_json(repaired, phase=phase))
             except Exception as repair_exc:
+                self._replace_last_malformed_response_for_repair(
+                    phase,
+                    repaired,
+                    repair_exc,
+                    omission_reason="the protocol-repair response was also rejected",
+                    feedback=feedback,
+                )
                 if feedback:
                     try:
                         return accept(
@@ -1563,7 +1740,18 @@ class FeedbackLoopAgent:
                     critical_reasoning=False,
                     reasoning_budget_cap_tokens=PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
                 )
-                return self._extract_phase_json(repaired_minimal, phase=phase)
+                self._retire_protocol_repair_request(phase, feedback=False, minimal=True)
+                try:
+                    return self._extract_phase_json(repaired_minimal, phase=phase)
+                except Exception as final_repair_exc:
+                    self._replace_last_malformed_response_for_repair(
+                        phase,
+                        repaired_minimal,
+                        final_repair_exc,
+                        omission_reason="the final protocol-repair response was rejected",
+                        feedback=False,
+                    )
+                    raise
 
     def _extract_phase_json(self, raw: str, *, phase: str) -> dict[str, Any]:
         payload = extract_json_object(raw)
@@ -1996,7 +2184,7 @@ class FeedbackLoopAgent:
         *,
         prompt: dict[str, Any],
     ) -> dict[str, Any]:
-        """Independently confirm that plan validation survives final replay."""
+        """Confirm prescribed process constraints and final validation lifecycle."""
         accepting = {"resolved", "skipped_with_note", "resolved_with_compromise"}
         if self._status(review) not in accepting:
             return review
@@ -2015,11 +2203,17 @@ class FeedbackLoopAgent:
         contract = json.dumps(contract_payload, ensure_ascii=False)
         raw = self._feedback_chat(
             phase
-            + "\nThe harness reruns every validation command after the last plan step unless that command object "
+            + "\nFirst compare the plan with the original request for explicitly prescribed invocations, "
+            "sequences, timeout behavior, and verification processes. A supplemental check may coexist with a "
+            "prescribed process, but it cannot replace it; require a plan change when the prescribed process is "
+            "missing or contradicted. Do not require exact mechanics that the user did not specify. Then review "
+            "validation lifecycle: the harness reruns every validation command after the last plan step unless "
+            "that command object "
             "sets `final_state` to false. Trace the supplied plan in order. Decide whether every command that will "
             "be replayed should still return its expected code after all later cleanup and state transitions. If "
             "later work intentionally invalidates an earlier observation, require `final_state: false` on that "
-            "earlier command. Do not reject the intended final state. Review only this lifecycle question. Use "
+            "earlier command. Do not reject the intended final state. Review only these process-fit and lifecycle "
+            "questions. Use "
             "`decision: \"valid\"` with an empty `required_changes` list, or `decision: \"needs_plan_change\"` "
             "with one or more concrete corrections.\n\n"
             + json.dumps(lifecycle_prompt, ensure_ascii=False)
@@ -2371,8 +2565,8 @@ class FeedbackLoopAgent:
         omission_reason: str | None = None,
         feedback: bool = False,
     ) -> None:
-        """Keep pathological rejected output out of the next active model call."""
-        reason = omission_reason or "the rejected response was unsafe recovery context"
+        """Keep rejected model output out of later semantic context."""
+        reason = omission_reason or "the response was rejected by the current phase protocol"
         note = HARNESS_RESPONSE_OMISSION_MARKER + "\n" + json.dumps(
             {
                 "phase": phase,
@@ -2398,6 +2592,28 @@ class FeedbackLoopAgent:
             content_prefix=content_prefix,
             new_content=note,
             replacement_role="user",
+        )
+
+    def _retire_protocol_repair_request(
+        self,
+        phase: str,
+        *,
+        feedback: bool,
+        minimal: bool,
+    ) -> None:
+        """Remove one-use rejected-response excerpts after the repair saw them."""
+        transport = "FEEDBACK_AGENT_REQUEST:" if feedback else "IMPLEMENTATION_AGENT_REQUEST:"
+        repair_kind = "MINIMAL_JSON_REPAIR" if minimal else "JSON_REPAIR"
+        self.conversation.replace_latest_matching_turn(
+            role="user",
+            content_prefix=f"{transport}\n{phase}_{repair_kind}",
+            replacement_role="system",
+            new_content=(
+                "HARNESS_PROTOCOL_REPAIR_CONTEXT_RETIRED:\n"
+                f"phase={phase}; repair_kind={repair_kind}. The one-use recovery prompt and any rejected "
+                "response excerpt remain only in the append-only full transcript. Use the validated repair "
+                "decision and current evidence as active state."
+            ),
         )
 
     def _feedback_minimal_json_repair(
@@ -2434,7 +2650,18 @@ class FeedbackLoopAgent:
             progress_review_timeout_seconds=progress_review_timeout_seconds,
             reasoning_budget_cap_tokens=PROTOCOL_REPAIR_REASONING_BUDGET_CAP,
         )
-        return self._extract_phase_json(repaired, phase=phase)
+        self._retire_protocol_repair_request(phase, feedback=True, minimal=True)
+        try:
+            return self._extract_phase_json(repaired, phase=phase)
+        except Exception as final_repair_error:
+            self._replace_last_malformed_response_for_repair(
+                phase,
+                repaired,
+                final_repair_error,
+                omission_reason="the final reviewer protocol-repair response was rejected",
+                feedback=True,
+            )
+            raise
 
     def _malformed_feedback_fallback(
         self,
@@ -3301,9 +3528,12 @@ class FeedbackLoopAgent:
             "REQUIREMENTS_REVIEW_PHASE\n"
             "Decide whether the requirements preserve the original request, resolve necessary gaps, and support "
             "a feasible verifiable plan. Reject concrete ambiguity, contradiction, scope expansion, or missing "
-            "verification strategy. Check separately whether explicit limits constrain artifact contents or which "
-            "new project paths may remain; cross-check the final-state path decision and its stated basis against "
-            "the original request. Detailed step boundaries "
+            "verification strategy. Cross-check refined requirements, final-state constraints, planning confirmation, "
+            "and the embedded plan; reject a mandatory constraint or promised check that the plan leaves to an "
+            "unspecified later phase. Check separately whether an explicit source constraint limits artifact contents "
+            "or retained project paths. A requested-deliverable list alone is not an exclusive path inventory; "
+            "accept a restrictive path policy only when its stated basis identifies an explicit original-request or "
+            "workspace constraint. Detailed step boundaries "
             "and semantic command adequacy belong to the separate "
             "plan-validation phase; do not reject otherwise sound requirements merely to prescribe a preferred "
             "validator. Apply the supplied environment, quality, and research context only under its stated "
@@ -3449,7 +3679,7 @@ class FeedbackLoopAgent:
             "phase": "PLAN_VALIDATION_PHASE",
             "iteration": index,
             "original_request": self._original_request_for_prompt(),
-            "requirements": self._requirements_summary_payload(),
+            "requirements": self._requirements_summary_payload(include_planning_context=True),
             "default_quality_policy": self._default_quality_policy_payload(),
             "web_research_evidence": compact_research_for_prompt(self.web_research_result),
             "execution_environment": self._execution_environment_payload(),
@@ -3506,8 +3736,10 @@ class FeedbackLoopAgent:
         """Return phase-local checks; the reviewer owns semantic judgment."""
         checks = [
             "the plan preserves requested deliverables, exclusions, interfaces, examples, behaviors, and constraints",
+            "the plan represents every mandatory constraint and verification promise in the accepted requirements rather than deferring it to an unspecified later phase",
             "steps are coherent boundaries in executable dependency order",
-            "persistent_paths declares every path retained by a step and respects the accepted final-state path policy",
+            "persistent_paths declares every path retained by a step and does not both require and forbid an acceptance artifact",
+            "relative plan and validation paths use execution_environment.workspace_cwd rather than a guessed parent directory",
             "each step has acceptance criteria and proportional evidence for its user-facing surface",
             "each explicitly listed success or failure class has direct evidence or one inspected common mechanism that covers it",
             "validation checks semantics, can fail on a plausible wrong result, and requires exact representation only when requested",
@@ -3620,6 +3852,7 @@ class FeedbackLoopAgent:
             "validation_method",
             "validation_commands",
         }
+        state_invalidating_fields = plan_fields - {"title"}
         previous_by_id = {str(step.get("id")): step for step in previous_steps if step.get("id") is not None}
         merged: list[dict[str, Any]] = []
         for refined in refined_steps:
@@ -3631,7 +3864,10 @@ class FeedbackLoopAgent:
             if refined is existing:
                 merged.append(existing)
                 continue
-            changed = any(existing.get(field) != refined.get(field) for field in plan_fields)
+            state_invalidating_change = any(
+                existing.get(field) != refined.get(field)
+                for field in state_invalidating_fields
+            )
             workflow_state = {
                 key: value
                 for key, value in existing.items()
@@ -3639,9 +3875,11 @@ class FeedbackLoopAgent:
             }
             existing.clear()
             existing.update({key: value for key, value in refined.items() if key in plan_fields})
-            if changed:
+            if state_invalidating_change:
                 existing["status"] = "pending"
             else:
+                # A title is only a display label. Rewording it while
+                # regenerating a full plan does not invalidate accepted work.
                 existing.update(workflow_state)
                 existing.setdefault("status", "pending")
             merged.append(existing)
@@ -3849,6 +4087,78 @@ class FeedbackLoopAgent:
                         f"[{step['id']}] returning to the scheduler after validated plan ordering changed."
                     )
                     return {"step_id": step["id"], "status": "rescheduled", "attempts": attempts}
+                evidence_attempt = self._latest_material_evidence_attempt(attempts[:-1])
+                if evidence_attempt is not None:
+                    evidence_attempt_number = int(evidence_attempt.get("attempt") or attempt)
+                    reassessment = self._step_review_pass(
+                        step,
+                        attempt,
+                        evidence_attempt["implementation"],
+                        review_mode,
+                        critical_reasoning=True,
+                        _evidence_reassessment={
+                            "reason": "validated workflow boundary changed",
+                            "evidence_source_attempt": evidence_attempt_number,
+                            "new_implementation_ran": False,
+                        },
+                    )
+                    attempts[-1]["control_request_review"] = attempts[-1]["review"]
+                    attempts[-1]["review"] = reassessment
+                    attempts[-1]["reviewed_evidence_attempt"] = evidence_attempt_number
+                    reassessment_status = self._status(reassessment)
+                    reassessment_summary = str(reassessment.get("summary") or "")
+                    if reassessment_status == HARNESS_PROTOCOL_ERROR_STATUS:
+                        resolution = self._protocol_error_resolution(
+                            f"step {step['id']} evidence reassessment",
+                            reassessment,
+                        )
+                        step["status"] = HARNESS_PROTOCOL_ERROR_STATUS
+                        self._append_plan_note(f"[{step['id']}] {resolution['note']}")
+                        self._write_plan_doc()
+                        return {
+                            "step_id": step["id"],
+                            "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                            "attempts": attempts,
+                            "resolution": resolution,
+                        }
+                    if reassessment_status in {"resolved", "resolved_with_compromise"}:
+                        step["status"] = "resolved"
+                        self._append_plan_note(
+                            f"[{step['id']}] resolved after validated boundary change: {reassessment_summary}"
+                        )
+                        self._write_plan_doc()
+                        attempts[-1]["git_commit"] = self._git_commit_completed_step(step)
+                        return {"step_id": step["id"], "status": "resolved", "attempts": attempts}
+                    if reassessment_status == "skipped_with_note":
+                        step["status"] = "skipped_with_note"
+                        self._append_plan_note(
+                            f"[{step['id']}] skipped after validated boundary change: {reassessment_summary}"
+                        )
+                        self._write_plan_doc()
+                        return {"step_id": step["id"], "status": "skipped_with_note", "attempts": attempts}
+                    if reassessment_status == "cannot_resolve":
+                        step["status"] = "cannot_resolve"
+                        self._append_plan_note(f"[{step['id']}] cannot resolve: {reassessment_summary}")
+                        self._write_plan_doc()
+                        return {"step_id": step["id"], "status": "cannot_resolve", "attempts": attempts}
+                    if attempt < max_attempts:
+                        self.conversation.append(
+                            "user",
+                            self._next_implementation_directive(
+                                reassessment,
+                                repeated_evidence_count=0,
+                                repeated_artifact_count=0,
+                            ),
+                        )
+                        continue
+                    resolution = self._fallback_resolution(f"step {step['id']}", reassessment)
+                    step["status"] = resolution["status"]
+                    return {
+                        "step_id": step["id"],
+                        "status": resolution["status"],
+                        "attempts": attempts,
+                        "resolution": resolution,
+                    }
             elif status == "cannot_resolve":
                 step["status"] = "cannot_resolve"
                 self._append_plan_note(f"[{step['id']}] cannot resolve: {summary}")
@@ -3942,6 +4252,29 @@ class FeedbackLoopAgent:
         step["status"] = resolution["status"]
         return {"step_id": step["id"], "status": resolution["status"], "attempts": attempts, "resolution": resolution}
 
+    @staticmethod
+    def _latest_material_evidence_attempt(attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Find prior executed or artifact evidence worth reviewing after replanning."""
+        for attempt in reversed(attempts):
+            implementation = attempt.get("implementation")
+            if not isinstance(implementation, dict):
+                continue
+            review = attempt.get("review") if isinstance(attempt.get("review"), dict) else {}
+            evidence = review.get("feedback_tool_evidence") if isinstance(review, dict) else {}
+            if not isinstance(evidence, dict):
+                evidence = {}
+            if (
+                implementation.get("written")
+                or implementation.get("commands")
+                or implementation.get("file_write_failures")
+                or implementation.get("skipped_harness_files")
+                or evidence.get("validation_results")
+                or evidence.get("accepted_validation_results")
+                or evidence.get("reviewer_validation_results")
+            ):
+                return attempt
+        return None
+
     def _repair_progress_signature(self, review: dict[str, Any]) -> str:
         """Fingerprint observable repair state without relying on model wording."""
         evidence = review.get("feedback_tool_evidence") if isinstance(review, dict) else {}
@@ -3958,6 +4291,7 @@ class FeedbackLoopAgent:
                 "returncode": result.get("returncode"),
                 "expected_returncode": result.get("expected_returncode"),
                 "timed_out": bool(result.get("timed_out")),
+                "satisfied_by_progress_review": bool(result.get("satisfied_by_progress_review")),
                 "stopped_by_progress_review": bool(result.get("stopped_by_progress_review")),
                 "blocked_by_tool_verifier": bool(result.get("blocked_by_tool_verifier")),
                 "blocked_git_mutation": bool(result.get("blocked_git_mutation")),
@@ -4239,6 +4573,146 @@ class FeedbackLoopAgent:
         normalized.setdefault("test_evidence", [])
         return normalized
 
+    @staticmethod
+    def _implementation_resolution_request(implementation: dict[str, Any]) -> str:
+        """Return a validated implementation control request, or ``none``."""
+        raw = implementation.get("raw")
+        if not isinstance(raw, dict):
+            return "none"
+        request = str(raw.get("resolution_request") or "none").strip()
+        if request in {"needs_requirements_change", "needs_plan_change", "cannot_resolve"}:
+            return request
+        return "none"
+
+    def _step_control_request_review(
+        self,
+        step: dict[str, Any],
+        attempt: int,
+        implementation: dict[str, Any],
+        review_mode: str,
+        *,
+        critical_reasoning: bool = False,
+    ) -> dict[str, Any]:
+        """Validate a model control request without replaying the disputed plan."""
+        control_request = self._implementation_resolution_request(implementation)
+        evidence = {
+            "kind": "step_control_request_review",
+            "step_id": step.get("id"),
+            "workspace_files": collect_workspace_files(
+                self.workspace,
+                self.config.context_compaction.workspace_file_max_bytes,
+                max_files=self.config.context_compaction.workspace_snapshot_max_files,
+                max_total_chars=self.config.context_compaction.workspace_snapshot_max_chars,
+            ),
+            "validation_commands": [],
+            "validation_results": [],
+            "accepted_validation_commands": [],
+            "accepted_validation_results": [],
+            "git": self._git_evidence() if self.config.git_policy.enabled else {"enabled": False},
+        }
+        prompt = {
+            "phase": "STEP_REVIEW_PHASE",
+            "review_question": "Is the implementation model's control request justified by current context and evidence?",
+            "original_request": self._original_request_for_prompt(8000),
+            "step": self._compact_step_for_review_prompt(step),
+            "attempt": attempt,
+            "review_mode": review_mode,
+            "requirements": self._requirements_summary_payload(include_planning_context=True),
+            "plan_status": [
+                {
+                    "id": item.get("id"),
+                    "title": item.get("title"),
+                    "status": item.get("status"),
+                }
+                for item in self.plan_steps
+            ],
+            "control_request": control_request,
+            "implementation": self._compact_implementation_for_prompt(implementation),
+            "current_workspace_evidence": self._compact_step_evidence_for_prompt(evidence),
+            "disputed_plan_validation_replayed": False,
+            "expected_json": {
+                "status": control_request,
+                "summary": "why the request is or is not justified",
+                "required_changes": [],
+                "verification_evidence": [],
+            },
+        }
+        instruction = (
+            "STEP_REVIEW_PHASE\n"
+            "The implementation model returned a structured control request instead of claiming completion. "
+            "Treat it as a proposal, not accepted workflow state. Decide whether current context supports changing "
+            "the plan, changing requirements, declaring the step infeasible, or returning the implementation for "
+            "rework. The current plan's validation commands were intentionally not replayed because that plan "
+            "boundary is being challenged; their absence is not failed evidence. Use status needs_plan_change, "
+            "needs_requirements_change, or cannot_resolve only when justified; otherwise use needs_rework and name "
+            "the smallest remaining implementation action. Do not use an accepting completion status and leave "
+            "validation_commands empty.\n"
+            f"{_review_prompt_guidance(ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE, evidence_challenge=False)}\n"
+            + _review_payload_text(prompt, REVIEW_PAYLOAD_DECISION_GATE)
+        )
+        raw = self._feedback_chat_with_compact_context(
+            instruction,
+            context_note=(
+                "Use active recent turns, compacted durable memory, current runbook state, and this control-request "
+                "payload. No stale plan command was run merely to decide whether that plan should change."
+            ),
+            critical_reasoning=critical_reasoning,
+        )
+        review = self._normalize_review(self._extract_json_or_retry(
+            raw,
+            phase="STEP_REVIEW_PHASE",
+            contract=json.dumps(prompt["expected_json"], ensure_ascii=False),
+            feedback=True,
+            record_feedback_decision=False,
+            critical_reasoning=critical_reasoning,
+        ))
+        permitted = {"needs_rework", "needs_plan_change", "needs_requirements_change", "cannot_resolve"}
+        if self._status(review) not in permitted:
+            repair_raw = self._feedback_chat_with_compact_context(
+                "STEP_REVIEW_PHASE\n"
+                "STEP_CONTROL_REQUEST_REVIEW_STATUS_REPAIR\n"
+                f"Your response used status {self._status(review)!r}, which does not answer the pending control "
+                "request. Answer the same contextual question again. Use exactly one of needs_rework, "
+                "needs_plan_change, needs_requirements_change, or cannot_resolve; do not claim step completion "
+                "before its disputed boundary is settled.\n"
+                + _review_payload_text(prompt, REVIEW_PAYLOAD_DECISION_GATE),
+                context_note="The original request, current runbook, control request, and current evidence remain authoritative.",
+                critical_reasoning=critical_reasoning,
+            )
+            review = self._normalize_review(self._extract_json_or_retry(
+                repair_raw,
+                phase="STEP_REVIEW_PHASE",
+                contract=json.dumps(prompt["expected_json"], ensure_ascii=False),
+                feedback=True,
+                record_feedback_decision=False,
+                critical_reasoning=critical_reasoning,
+            ))
+        if self._status(review) not in permitted:
+            review = {
+                "status": HARNESS_PROTOCOL_ERROR_STATUS,
+                "needs_rework": False,
+                "summary": "The reviewer did not return a usable decision for the pending control request.",
+                "required_changes": [
+                    "No workflow boundary change was accepted because the reviewer twice used a completion status."
+                ],
+                "verification_evidence": [],
+                "review_protocol_error": True,
+                "status_provenance": "harness_protocol_validation",
+            }
+            self._record_effective_review_if_needed(
+                "STEP_REVIEW_PHASE",
+                review,
+                reason="control_request_review_protocol_failure",
+            )
+        else:
+            self._record_validated_feedback_decision("STEP_REVIEW_PHASE", review)
+        review["control_request"] = control_request
+        review["feedback_tool_evidence"] = evidence
+        self._append_plan_note(
+            f"[{step['id']} attempt {attempt}] control request review: {review.get('summary', 'no summary')}"
+        )
+        return review
+
     def _run_reviewer_validation_round(
         self,
         review: dict[str, Any],
@@ -4298,8 +4772,17 @@ class FeedbackLoopAgent:
         _feedback_tool_evidence: dict[str, Any] | None = None,
         _reviewer_validation_round_used: bool = False,
         _prior_review: dict[str, Any] | None = None,
+        _evidence_reassessment: dict[str, Any] | None = None,
     ) -> dict:
         """Critique one step using reviewer-owned file and command evidence."""
+        if self._implementation_resolution_request(implementation) != "none":
+            return self._step_control_request_review(
+                step,
+                attempt,
+                implementation,
+                review_mode,
+                critical_reasoning=critical_reasoning,
+            )
         feedback_tool_evidence = (
             _feedback_tool_evidence
             if _feedback_tool_evidence is not None
@@ -4363,11 +4846,21 @@ class FeedbackLoopAgent:
                 "validation_commands": [],
             },
         }
+        if _evidence_reassessment is not None:
+            prompt["evidence_reassessment"] = _evidence_reassessment
         validation_round_instruction = (
             "A reviewer-requested validation round has already been used. Decide from the supplied results; "
             "leave validation_commands empty and name any remaining implementation, plan, requirements, or "
             "environment gap directly.\n"
             if _reviewer_validation_round_used
+            else ""
+        )
+        reassessment_instruction = (
+            "A validated plan or requirements change altered this step after evidence was collected. No new "
+            "implementation ran. Reassess the supplied prior implementation and reviewer-owned evidence against "
+            "the current step. Do not repeat work merely because evidence predates the boundary change; accept it "
+            "only when it still proves the current criteria.\n"
+            if _evidence_reassessment is not None
             else ""
         )
         raw = self._feedback_chat_with_compact_context(
@@ -4379,6 +4872,7 @@ class FeedbackLoopAgent:
                 "cannot_resolve, needs_requirements_change, needs_plan_change, skipped_with_note, or "
                 "resolved_with_compromise. Use resolved only when evidence is sufficient.\n"
                 f"{validation_round_instruction}"
+                f"{reassessment_instruction}"
                 f"{REPAIR_REVIEW_CAUSAL_RECHECK_GUIDANCE if attempt > 1 else ''}\n"
                 f"{_review_prompt_guidance(ORIGINAL_REQUEST_FIT_CHECK_GUIDANCE, REVIEWER_VALIDATION_REQUEST_GUIDANCE, deliverable_evidence=True, completion_countercheck=True)}\n"
                 + _review_payload_text(prompt, EVIDENCE_REVIEW_PAYLOAD_DECISION_GATE),
@@ -4427,6 +4921,7 @@ class FeedbackLoopAgent:
                     "required_changes": review.get("required_changes", []),
                     "validation_commands": requested_validation,
                 },
+                _evidence_reassessment=_evidence_reassessment,
             )
             final_review["reviewer_validation_request"] = {
                 "review": {
@@ -5156,6 +5651,10 @@ class FeedbackLoopAgent:
                 "acceptance_criteria_total": len(step.get("acceptance_criteria", []) or []),
                 "acceptance_criteria_omitted_count": omitted_count,
                 "validation_method": self._prompt_excerpt(str(step.get("validation_method") or ""), 1000),
+                "validation_commands": self._compact_commands_for_prompt(
+                    step.get("validation_commands", []),
+                    max_total_chars=1400,
+                ),
                 "validation_command_count": len(step.get("validation_commands") or []),
             })
         return compact
@@ -5216,11 +5715,34 @@ class FeedbackLoopAgent:
             attempts = result.get("attempts", [])
             last_attempt = attempts[-1] if attempts else {}
             review = last_attempt.get("review", {})
-            implementation = last_attempt.get("implementation", {})
+            implementation_attempt = last_attempt
+            reviewed_evidence_attempt = last_attempt.get("reviewed_evidence_attempt")
+            if isinstance(reviewed_evidence_attempt, int):
+                implementation_attempt = next(
+                    (
+                        item
+                        for item in reversed(attempts)
+                        if item.get("attempt") == reviewed_evidence_attempt
+                    ),
+                    last_attempt,
+                )
+            implementation = implementation_attempt.get("implementation", {})
             raw = implementation.get("raw") or {}
             implementation_command_summary = self._command_result_counts(
                 implementation.get("commands", [])
             )
+            implementation_commands = [
+                command
+                for command in implementation.get("commands", []) or []
+                if isinstance(command, dict)
+            ]
+            if len(implementation_commands) > 6:
+                selected_implementation_commands = [
+                    *implementation_commands[:3],
+                    *implementation_commands[-3:],
+                ]
+            else:
+                selected_implementation_commands = implementation_commands
             reviewer_evidence = (review.get("feedback_tool_evidence") or {})
             reviewer_validation_summary = self._command_result_counts(
                 reviewer_evidence.get("validation_results", [])
@@ -5230,6 +5752,7 @@ class FeedbackLoopAgent:
                 "step_id": result.get("step_id"),
                 "status": result.get("status"),
                 "attempt_count": len(attempts),
+                "implementation_evidence_attempt": implementation_attempt.get("attempt"),
                 "written_paths": self._clip_nested_for_transcript(
                     implementation.get("written", []),
                     string_limit=500,
@@ -5238,6 +5761,15 @@ class FeedbackLoopAgent:
                 "last_review_status": review.get("status"),
                 "last_review_summary": self._prompt_excerpt(str(review.get("summary") or ""), 1200),
                 "implementation_command_summary": implementation_command_summary,
+                "implementation_command_results": self._compact_command_results_for_prompt(
+                    selected_implementation_commands,
+                    max_total_output_chars=2400,
+                ),
+                "implementation_command_result_count": len(implementation_commands),
+                "implementation_command_results_omitted_count": max(
+                    0,
+                    len(implementation_commands) - len(selected_implementation_commands),
+                ),
                 "reviewer_validation_summary": reviewer_validation_summary,
                 "reviewer_requested_validation_summary": self._command_result_counts(
                     reviewer_requested_results
@@ -5311,6 +5843,7 @@ class FeedbackLoopAgent:
             "failed": 0,
             "blocked": 0,
             "timed_out": 0,
+            "satisfied_by_progress_review": 0,
             "stopped_by_progress_review": 0,
             "not_run_or_unknown": 0,
             "problem_examples": [],
@@ -5328,6 +5861,9 @@ class FeedbackLoopAgent:
             elif result.get("timed_out"):
                 summary["timed_out"] += 1
                 status = "timed_out"
+            elif result.get("satisfied_by_progress_review"):
+                summary["satisfied_by_progress_review"] += 1
+                summary["passed"] += 1
             elif result.get("stopped_by_progress_review"):
                 summary["stopped_by_progress_review"] += 1
                 status = "stopped_by_progress_review"
@@ -5377,6 +5913,8 @@ class FeedbackLoopAgent:
                 "expected_returncode": result.get("expected_returncode"),
                 "returncode_matches_expected": result.get("returncode_matches_expected"),
                 "timed_out": result.get("timed_out"),
+                "ended_by_progress_review": result.get("ended_by_progress_review"),
+                "satisfied_by_progress_review": result.get("satisfied_by_progress_review"),
                 "stopped_by_progress_review": result.get("stopped_by_progress_review"),
                 "declared_validation": result.get("declared_validation"),
                 "progress_review_count": result.get("progress_review_count", len(result.get("progress_reviews", []))),
@@ -5566,8 +6104,14 @@ class FeedbackLoopAgent:
             accepted_commands = validation.get("accepted_validation_commands_run", [])
             validation_results = validation.get("validation_results", [])
             accepted_results = validation.get("accepted_validation_results", [])
+            declared_commands = validation.get("validation_commands", [])
             validations.append({
                 "step_id": validation.get("step_id"),
+                "declared_validation_commands": self._compact_commands_for_prompt(
+                    declared_commands,
+                    max_total_chars=payload_budget,
+                ),
+                "declared_validation_command_count": len(declared_commands),
                 "validation_commands": self._compact_commands_for_prompt(
                     planned_commands,
                     max_total_chars=payload_budget,
@@ -6432,6 +6976,8 @@ class FeedbackLoopAgent:
         web_interaction = self.config.mcp_tools.terminal and self.config.mcp_tools.web_interaction
         payload = {
             "agent_runs_in_docker": self.config.runtime.docker_isolation,
+            "workspace_cwd": str(self.workspace),
+            "project_paths_are_relative_to_workspace_cwd": True,
             "terminal_tools": self.config.mcp_tools.terminal,
             "web_research": self.config.mcp_tools.web_scraping and self.config.web_research.enabled,
             "web_interaction": web_interaction,
@@ -6463,7 +7009,9 @@ class FeedbackLoopAgent:
         )
         return (
             "EXECUTION_ENVIRONMENT:\n"
-            f"Work runs in {location}. Use only tools evidenced by the workspace or these configured capabilities. "
+            f"Work runs in {location}. The command cwd and base for relative project paths is {self.workspace}. "
+            "Use relative paths for project files, persistent_paths, and ordinary validation commands; do not guess "
+            "a container parent directory. Use only tools evidenced by the workspace or these configured capabilities. "
             "Discover missing dependencies explicitly and keep setup separate from validation. "
             f"{terminal_fact} {research_fact} {browser_fact}"
         )
@@ -6611,7 +7159,8 @@ class FeedbackLoopAgent:
         """Return a callback that lets the feedback model review a live command.
 
         The process runner owns draining and bounding stdout/stderr. This
-        callback owns the model decision: continue or terminate based on the
+        callback owns the model decision: continue, stop with sufficient
+        evidence, or terminate unsuccessfully based on the
         active request, plan state, previous repair history, and a compact live
         output snapshot. It deliberately does not encode task-specific answers.
         """
@@ -6644,8 +7193,8 @@ class FeedbackLoopAgent:
                     "tool_output_max_chars": self.config.context_compaction.tool_output_max_chars,
                 },
                 "expected_json": {
-                    "decision": "continue",
-                    "summary": "why continue or terminate",
+                    "decision": "<choose a permitted decision>",
+                    "summary": "why continue, stop satisfied, or terminate",
                     "evidence": ["specific observed fact"],
                     "risks": ["risk"],
                     "next_check_seconds": self.config.runtime.command_progress_review_interval_seconds,
@@ -6657,10 +7206,17 @@ class FeedbackLoopAgent:
                     "A terminal command is still running. Decide whether it remains useful for the current task. "
                     "Use the transcript, workflow state, and bounded live output snapshot. Do not stop it just "
                     "because it has been running for a while, and do not continue it just because an earlier model "
-                    "asked for it. Stop only when the current evidence shows the command is wrong, unsafe, stuck in "
-                    "a hopeless loop, waiting for unavailable input, or no longer useful. Otherwise continue and set "
-                    "a sensible next_check_seconds. Heartbeats, health checks, elapsed time, and repeated generic "
-                    "log lines are observability, not task progress unless the user requested monitoring.\n"
+                    "asked for it. First classify the observed state using the original request and current step. "
+                    "Choose stop_satisfied only when that state is explicitly a successful intended observation and "
+                    "further execution is unnecessary; later step review still decides whether the evidence completes "
+                    "the work. Mere evidence that a command is blocked is not success. Choose terminate when the "
+                    "command is wrong, unsafe, waiting for unavailable input, in a hopeless loop, or when the original "
+                    "request defines the observed state as unsuccessful. If stop_satisfied and terminate both appear "
+                    "plausible, preserve the original request's explicit success or failure meaning. Otherwise "
+                    "continue only when another interval can plausibly add material "
+                    "evidence, state what that evidence would be, and set a sensible next_check_seconds. Heartbeats, "
+                    "health checks, elapsed time, and repeated generic log lines are observability, not task progress "
+                    "unless the user requested monitoring.\n"
                     f"{JSON_OUTPUT_RULES}\n"
                     + _review_payload_text(prompt),
                     progress_review_timeout_seconds=(
@@ -6723,17 +7279,18 @@ class FeedbackLoopAgent:
         review = dict(review)
         supplied_decision = review.get("decision")
         decision = str(supplied_decision or "").strip()
-        if decision not in {"continue", "terminate"}:
+        if decision not in {"continue", "stop_satisfied", "terminate"}:
             decision = "continue"
             review["protocol_error"] = True
         review["decision"] = decision
         review["status"] = decision
         if not review.get("summary"):
-            review["summary"] = (
-                "Progress review terminated the running command."
-                if decision == "terminate"
-                else "Progress review allowed the running command to continue."
-            )
+            summary_by_decision = {
+                "continue": "Progress review allowed the running command to continue.",
+                "stop_satisfied": "Progress review found sufficient evidence and ended the running command.",
+                "terminate": "Progress review terminated the running command without satisfying it.",
+            }
+            review["summary"] = summary_by_decision[decision]
         try:
             next_check = int(review.get("next_check_seconds", self.config.runtime.command_progress_review_interval_seconds))
         except (TypeError, ValueError):
@@ -6891,8 +7448,12 @@ class FeedbackLoopAgent:
             + review_instruction
             + "Use current workflow context and return one decision for each supplied index. Block concrete safety, "
             "targeting, quoting, control-flow, false-result, or progress-review defects. Deterministic blockers are "
-            "authoritative observations; advisories require judgment. Decide execution separately from replay, and "
-            "approve replay only for an observational repeatable check. A missing hard deadline alone is not a "
+            "authoritative observations; advisories require judgment. Decide execution separately from replay. "
+            "Replay must add useful current evidence, not merely be safe or possible. For a no-deadline or "
+            "progress-reviewed command, keep reuse false unless a fresh later run is necessary to judge final "
+            "state; the retained result already proves the execution event. A command that creates, deletes, or "
+            "overwrites project state may be approved as implementation, but never for validation replay. "
+            "A missing hard deadline alone is not a "
             "defect. Do not reuse decisions from older turns.\n"
             f"{JSON_OUTPUT_RULES}\n"
             + _review_payload_text(prompt, TOOL_REVIEW_PAYLOAD_DECISION_GATE),
@@ -8041,22 +8602,27 @@ class FeedbackLoopAgent:
 
 
     def _command_returncode_matches_expected(self, result: dict[str, Any]) -> bool:
-        """Return True when a command produced the intended exit status.
+        """Return True when a command produced its accepted outcome.
 
         Negative-path validation is legitimate. For example, argparse should
         exit with code 2 when a required CLI argument is missing. The command
         schema therefore supports expected_returncode so the reviewer can check
         error messages without the deterministic gate treating the test itself
-        as failed.
+        as failed. A progress reviewer may also end an open-ended observation
+        after its intended evidence is present; that outcome is recorded
+        separately from the synthetic process return code.
         """
         if any(result.get(key) for key in (
             "timed_out",
-            "stopped_by_progress_review",
             "blocked_by_tool_verifier",
             "blocked_git_mutation",
             "invalid_command",
             "spawn_error",
         )):
+            return False
+        if result.get("satisfied_by_progress_review") is True:
+            return True
+        if result.get("stopped_by_progress_review"):
             return False
         expected = int(result.get("expected_returncode", 0))
         return int(result.get("returncode", 0)) == expected

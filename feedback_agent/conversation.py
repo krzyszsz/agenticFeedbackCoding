@@ -188,6 +188,21 @@ class Conversation:
         if self.echo:
             self._print_turn(turn)
 
+    def append_full_audit(self, content: str) -> None:
+        """Append harness-owned evidence without exposing it to active model context.
+
+        Compaction receipts belong in the append-only transcript because they
+        are needed to replay later compactions. They must not become another
+        active-context turn, where verbose audit metadata would consume the
+        space compaction just recovered.
+        """
+        if not self.full_path or self.full_path == self.path:
+            return
+        self._append_turn_to_path(
+            self.full_path,
+            Turn(role="system", content=content),
+        )
+
     def replace_last_turn(
         self,
         *,
@@ -225,6 +240,44 @@ class Conversation:
         if self.echo:
             self._print_turn(self.turns[-1])
         return True
+
+    def replace_latest_matching_turn(
+        self,
+        *,
+        role: str,
+        content_prefix: str,
+        new_content: str,
+        replacement_role: str | None = None,
+    ) -> bool:
+        """Replace the newest matching active turn while preserving full audit.
+
+        Protocol-repair requests are followed by the repair response, so they
+        are no longer the literal last turn when their one-use recovery excerpt
+        should be retired from durable context.
+        """
+        for index in range(len(self.turns) - 1, -1, -1):
+            turn = self.turns[index]
+            if turn.role != role or not turn.content.startswith(content_prefix):
+                continue
+            self.turns[index] = Turn(
+                role=replacement_role or role,
+                content=new_content,
+            )
+            self._write_turns(self.path, self.turns)
+            if self.full_path and self.full_path != self.path:
+                self._append_turn_to_path(
+                    self.full_path,
+                    Turn(
+                        role="system",
+                        content=(
+                            "ACTIVE_CONTEXT_EARLIER_TURN_REPLACED: a one-use recovery turn was "
+                            "retired from active context. Its original text remains earlier in this "
+                            "append-only full transcript."
+                        ),
+                    ),
+                )
+            return True
+        return False
 
     def messages(
         self,
@@ -318,8 +371,9 @@ class Conversation:
         memory_turn = Turn(
             role="system",
             content=(
-                "Compacted durable memory from earlier turns. Preserve these decisions, "
-                "constraints, and unresolved risks:\n\n" + memory
+                "Compacted context from earlier turns follows. Honor authoritative user and control sections; "
+                "treat summarized discoveries according to their stated provenance and validation state:\n\n"
+                + memory
             ),
         )
         self.turns = [turn for turn in (base_system, memory_turn) if turn is not None] + recent

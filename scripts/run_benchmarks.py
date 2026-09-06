@@ -422,6 +422,34 @@ def _normalize_manual_grade(value: Any) -> str | None:
     return grade if grade in {"manual_pass", "manual_fail"} else None
 
 
+def _extract_manual_grade_payload(raw: str) -> dict[str, Any]:
+    """Accept a JSON object with an optional single Markdown code fence."""
+    cleaned = raw.strip()
+    lines = cleaned.splitlines()
+    if len(lines) >= 3 and lines[-1].strip() == "```":
+        opening = lines[0].strip().lower()
+        if opening in {"```", "```json"}:
+            cleaned = "\n".join(lines[1:-1]).strip()
+    return extract_json_object(cleaned)
+
+
+def _manual_grader_reasoning_budget(
+    profile_name: str,
+    configured_budget_tokens: int | None,
+    max_tokens: int,
+) -> int | None:
+    """Keep a profile-default grader budget below its response ceiling."""
+    if configured_budget_tokens is not None:
+        return configured_budget_tokens
+    profile = resolve_profile(profile_name)
+    budget = profile.reasoning_budget_tokens
+    effective_max_tokens = profile_safe_max_tokens(profile, max_tokens)
+    if budget is None or budget < effective_max_tokens:
+        return budget
+    answer_reserve = min(2048, max(1, effective_max_tokens // 4))
+    return max(0, effective_max_tokens - answer_reserve)
+
+
 def manual_grade_task(
     workspace: Path,
     task: dict[str, Any],
@@ -464,10 +492,15 @@ def manual_grade_task(
         "Workspace files:\n"
         f"{json.dumps(workspace_files, indent=2)}"
     )
+    effective_reasoning_budget_tokens = _manual_grader_reasoning_budget(
+        grader_profile,
+        reasoning_budget_tokens,
+        max_tokens,
+    )
     client = OpenAICompatClient(
         direct_model_config(
             grader_profile,
-            reasoning_budget_tokens=reasoning_budget_tokens,
+            reasoning_budget_tokens=effective_reasoning_budget_tokens,
             max_tokens=max_tokens,
         )
     )
@@ -483,7 +516,7 @@ def manual_grade_task(
     for attempt in range(2):
         try:
             raw = client.chat(messages, max_tokens=max_tokens, temperature=0.0)
-            payload = extract_json_object(raw)
+            payload = _extract_manual_grade_payload(raw)
             grade = _normalize_manual_grade(payload.get("grade"))
             if grade is not None:
                 return {

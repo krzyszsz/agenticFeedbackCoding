@@ -69,15 +69,22 @@ class CompactionConfig:
     threshold_ratio: float
     keep_recent_turns: int
     summary_max_tokens: int
+    reasoning_budget_tokens: int = 1024
+    critical_reasoning_budget_tokens: int = 4096
+    model_repair_attempts: int = 1
+    initial_request_max_tokens: int = 0
+    initial_request_reference_max_tokens: int = 8192
+    source_max_tokens: int = 65536
+    recompaction_headroom_tokens: int = 8192
     tool_output_max_chars: int = 4000
     workspace_file_max_bytes: int = 20000
     workspace_snapshot_max_files: int = 1000
     workspace_snapshot_max_chars: int = 2_000_000
     git_diff_max_chars: int = 20000
     transcript_review_max_chars: int = 24000
-    max_uncompacted_tokens: int = 24000
-    recent_turns_max_tokens: int = 12000
-    model_summary_min_new_tokens: int = 2048
+    max_uncompacted_tokens: int = 48000
+    recent_turns_max_tokens: int = 24000
+    model_summary_min_new_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -216,18 +223,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "context_compaction": {
         "enabled": True,
-        "threshold_ratio": 0.25,
+        "threshold_ratio": 0.8,
         "keep_recent_turns": 8,
-        "summary_max_tokens": 1024,
+        "summary_max_tokens": 2048,
+        "reasoning_budget_tokens": 1024,
+        "critical_reasoning_budget_tokens": 4096,
+        "model_repair_attempts": 1,
+        "initial_request_max_tokens": 0,
+        "initial_request_reference_max_tokens": 8192,
+        "source_max_tokens": 65536,
+        "recompaction_headroom_tokens": 8192,
         "tool_output_max_chars": 4000,
         "workspace_file_max_bytes": 12000,
         "workspace_snapshot_max_files": 1000,
         "workspace_snapshot_max_chars": 2_000_000,
         "git_diff_max_chars": 12000,
         "transcript_review_max_chars": 12000,
-        "max_uncompacted_tokens": 24000,
-        "recent_turns_max_tokens": 12000,
-        "model_summary_min_new_tokens": 2048,
+        "max_uncompacted_tokens": 48000,
+        "recent_turns_max_tokens": 24000,
+        "model_summary_min_new_tokens": 0,
     },
     "loop": {
         "max_approach_reattempts": 5,
@@ -609,6 +623,11 @@ def validate_config(config: AgentConfig) -> None:
         errors.append("context_compaction.keep_recent_turns must be zero or greater")
     for field in (
         "summary_max_tokens",
+        "reasoning_budget_tokens",
+        "critical_reasoning_budget_tokens",
+        "initial_request_reference_max_tokens",
+        "source_max_tokens",
+        "recompaction_headroom_tokens",
         "tool_output_max_chars",
         "workspace_file_max_bytes",
         "workspace_snapshot_max_files",
@@ -619,10 +638,18 @@ def validate_config(config: AgentConfig) -> None:
     ):
         if int(getattr(compaction, field)) <= 0:
             errors.append(f"context_compaction.{field} must be greater than zero")
+    if compaction.model_repair_attempts < 0:
+        errors.append("context_compaction.model_repair_attempts must be zero or greater")
+    if compaction.critical_reasoning_budget_tokens < compaction.reasoning_budget_tokens:
+        errors.append(
+            "context_compaction.critical_reasoning_budget_tokens must be at least reasoning_budget_tokens"
+        )
     if compaction.transcript_review_max_chars < 512:
         errors.append("context_compaction.transcript_review_max_chars must be at least 512")
     if compaction.max_uncompacted_tokens < 0:
         errors.append("context_compaction.max_uncompacted_tokens must be zero or greater")
+    if compaction.initial_request_max_tokens < 0:
+        errors.append("context_compaction.initial_request_max_tokens must be zero or greater")
     if compaction.model_summary_min_new_tokens < 0:
         errors.append("context_compaction.model_summary_min_new_tokens must be zero or greater")
     if compaction.workspace_snapshot_max_chars < compaction.workspace_file_max_bytes:

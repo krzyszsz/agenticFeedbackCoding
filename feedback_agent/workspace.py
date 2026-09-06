@@ -362,7 +362,13 @@ def run_commands(
             progress_max_interval_seconds=progress_max_interval_seconds,
         )
         result["expected_returncode"] = expected_returncode
-        result["returncode_matches_expected"] = result["returncode"] == expected_returncode
+        result["returncode_matches_expected"] = (
+            (
+                result.get("satisfied_by_progress_review") is True
+                and not result.get("timed_out")
+            )
+            or result["returncode"] == expected_returncode
+        )
         result["declared_validation"] = declared_validation
         result["final_state"] = final_state
         result["command_metadata"] = command_metadata
