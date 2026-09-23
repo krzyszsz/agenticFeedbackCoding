@@ -490,6 +490,98 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         presence_penalty=0.0,
         repeat_penalty=1.0,
     ),
+    "huihui-qwen3.8-27b-abliterated": ModelProfile(
+        name="huihui-qwen3.8-27b-abliterated",
+        role="strong_dense",
+        repo_id="huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF",
+        local_dir="/mnt/hf/models/huihui-qwen3.8-27b-abliterated-gguf",
+        model_file="Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf",
+        draft_file=None,
+        mmproj_file=None,
+        container_name="agentic-huihui-qwen38-27b-server",
+        port=8178,
+        context_window=262144,
+        memory_limit="75g",
+        memory_reservation="67g",
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        reasoning_mode="on",
+        reasoning_format="deepseek",
+        reasoning_budget_tokens=8192,
+        spec_type="draft-mtp",
+        spec_draft_n_max=2,
+        notes=(
+            "Huihui Qwen3.8 27B abliterated UD-Q4_K_XL using the base "
+            "Qwen3.8 high-thinking generation profile."
+        ),
+        server_extra_args="--reasoning-preserve",
+        min_p=0.0,
+        presence_penalty=0.0,
+        repeat_penalty=1.0,
+    ),
+    "muse-glimmer-30b": ModelProfile(
+        name="muse-glimmer-30b",
+        role="strong_agentic_dense",
+        repo_id="bartowski/Muse-Glimmer-30B-GGUF",
+        local_dir="/mnt/hf/models/muse-glimmer-30b-gguf",
+        model_file="Muse-Glimmer-30B-Q4_K_M.gguf",
+        draft_file=None,
+        mmproj_file=None,
+        container_name="agentic-muse-glimmer-30b-server",
+        port=8179,
+        context_window=131072,
+        memory_limit="75g",
+        memory_reservation="67g",
+        temperature=1.0,
+        top_p=0.95,
+        top_k=64,
+        reasoning_mode="on",
+        reasoning_format="auto",
+        reasoning_budget_tokens=8192,
+        spec_type="",
+        spec_draft_n_max=0,
+        notes=(
+            "Muse Glimmer 30B Q4_K_M with Meta's recommended sampling and high "
+            "reasoning strength for agentic coding."
+        ),
+        server_extra_args=(
+            '--reasoning-preserve --chat-template-kwargs {"reasoning_strength":"high"}'
+        ),
+        min_p=0.0,
+        presence_penalty=0.0,
+        repeat_penalty=1.0,
+    ),
+    "qwen3.8-27b-q8": ModelProfile(
+        name="qwen3.8-27b-q8",
+        role="strong_dense",
+        repo_id="ggml-org/Qwen3.8-27B-GGUF",
+        local_dir="/mnt/hf/models/qwen3.8-27b-q8-gguf",
+        model_file="Qwen3.8-27B-Q8_0.gguf",
+        draft_file="mtp-Qwen3.8-27B-Q8_0.gguf",
+        mmproj_file=None,
+        container_name="agentic-qwen38-27b-q8-server",
+        port=8180,
+        context_window=262144,
+        memory_limit="75g",
+        memory_reservation="67g",
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        reasoning_mode="on",
+        reasoning_format="deepseek",
+        reasoning_budget_tokens=8192,
+        spec_type="draft-mtp",
+        spec_draft_n_max=2,
+        notes=(
+            "Official Qwen3.8 27B Q8_0 target with its matching Q8 MTP draft "
+            "and the established high-thinking generation profile."
+        ),
+        server_extra_args="--reasoning-preserve",
+        min_p=0.0,
+        presence_penalty=0.0,
+        repeat_penalty=1.0,
+    ),
 }
 
 ALIASES = {
@@ -529,6 +621,12 @@ ALIASES = {
     "qwen38": "qwen3.8-27b",
     "qwen3.8": "qwen3.8-27b",
     "qwen38-27b": "qwen3.8-27b",
+    "huihui-qwen38": "huihui-qwen3.8-27b-abliterated",
+    "qwen3.8-abliterated": "huihui-qwen3.8-27b-abliterated",
+    "muse-glimmer": "muse-glimmer-30b",
+    "glimmer-30b": "muse-glimmer-30b",
+    "qwen38-q8": "qwen3.8-27b-q8",
+    "qwen3.8-q8": "qwen3.8-27b-q8",
 }
 
 

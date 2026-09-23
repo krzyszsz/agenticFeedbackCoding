@@ -5279,6 +5279,21 @@ class FeedbackLoopAgentTests(unittest.TestCase):
                 "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
                 "off",
             ),
+            "huihui-qwen38": (
+                "huihui-qwen3.8-27b-abliterated",
+                "Huihui-Qwen3.8-27B-abliterated-UD-Q4_K_XL.gguf",
+                "on",
+            ),
+            "muse-glimmer": (
+                "muse-glimmer-30b",
+                "Muse-Glimmer-30B-Q4_K_M.gguf",
+                "on",
+            ),
+            "qwen38-q8": (
+                "qwen3.8-27b-q8",
+                "Qwen3.8-27B-Q8_0.gguf",
+                "on",
+            ),
         }
 
         for alias, (name, model_file, reasoning_mode) in expected.items():
@@ -5299,6 +5314,11 @@ class FeedbackLoopAgentTests(unittest.TestCase):
         self.assertEqual(qwen3.server_extra_args, "")
         self.assertEqual(qwen3.min_p, 0.0)
         self.assertEqual(qwen3.presence_penalty, 0.0)
+        muse = resolve_profile("muse-glimmer")
+        self.assertEqual((muse.temperature, muse.top_p, muse.top_k), (1.0, 0.95, 64))
+        self.assertIn('"reasoning_strength":"high"', muse.server_extra_args)
+        qwen_q8 = resolve_profile("qwen38-q8")
+        self.assertEqual(qwen_q8.draft_file, "mtp-Qwen3.8-27B-Q8_0.gguf")
 
     def test_model_launcher_preserves_profile_without_projector(self) -> None:
         launcher = (Path(__file__).resolve().parents[1] / "scripts" / "start_default_model_server.sh").read_text(

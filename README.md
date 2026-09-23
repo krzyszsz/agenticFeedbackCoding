@@ -187,6 +187,9 @@ python -m feedback_agent.model_profiles json qwen3.8-27b
 | `kat-coder-v2.5-dev` | coding MoE | 8175 | 131k | KAT-Coder V2.5 Dev, 35B / 3B active |
 | `qwythos-27b-mtp` | reasoning dense | 8176 | 131k | Qwythos 27B v1 MTP |
 | `qwen3.8-27b` | dense | 8177 | 262k | Qwen3.8 27B UD-Q4_K_XL high-thinking |
+| `huihui-qwen3.8-27b-abliterated` | dense | 8178 | 262k | Huihui Qwen3.8 27B abliterated UD-Q4_K_XL |
+| `muse-glimmer-30b` | agentic dense | 8179 | 131k | Muse Glimmer 30B Q4_K_M high-reasoning |
+| `qwen3.8-27b-q8` | dense | 8180 | 262k | Qwen3.8 27B Q8_0 with matching Q8 MTP draft |
 
 Start any profile with:
 
@@ -332,13 +335,17 @@ Elapsed time covers solver or harness execution and excludes post-run grading.
 | Devstral Small 2 | 18/40 | 0.86h | 14/40 | 19.59h | -4 |
 | Qwythos 27B | 27/40 | 1.80h | 27/40 | 35.90h | 0 |
 | Qwen3.8 27B high-thinking | 26/40 | 5.93h | 36/40 | 65.01h | +10 |
-| **Total** | **129/200** | **10.33h** | **143/200** | **170.74h** | **+14** |
+| Muse Glimmer 30B | 28/40 | 6.61h | 32/40 | 31.87h | +4 |
+| Huihui Qwen3.8 27B abliterated | 27/40 | 5.72h | 37/40 | 62.70h | +10 |
+| Qwen3.8 27B Q8 | 27/40 | 7.64h | 36/40 | 81.65h | +9 |
+| **Total** | **211/320** | **30.30h** | **248/320** | **346.96h** | **+37** |
 
-The harness improved the aggregate pass rate from 64.5% to 71.5%, at 16.5
+The harness improved the aggregate pass rate from 65.9% to 77.5%, at 11.5
 times the solver time. The effect was model-dependent: it substantially helped
-Qwen3.8 and dense Gemma, modestly helped Gemma A4B, was neutral for Qwythos,
-and hurt Devstral. These are single nondeterministic runs, not confidence
-intervals; use the task-level results to judge the relevant workload.
+Huihui Qwen3.8, both standard Qwen3.8 quantizations, and dense Gemma; it helped
+Muse and Gemma A4B more modestly, was neutral for Qwythos, and hurt Devstral.
+These are single nondeterministic runs, not confidence intervals; use the
+task-level results to judge the relevant workload.
 
 Each cell below is `zero-shot / harness`. Times are minutes. `P` and `F` are
 automatic results; `MP` and `MF` are model-graded results.
@@ -385,6 +392,51 @@ automatic results; `MP` and `MF` are model-graded results.
 | `hard-008-safe-tar-extraction` | F 2.6m / P 141.9m | F 1.4m / F 54.5m | F 4.5m / F 82.7m | F 5.3m / F 77.0m | F 27.6m / P 193.4m |
 | `hard-009-local-http-retry` | P 3.0m / P 51.5m | F 1.5m / P 16.6m | F 3.2m / F 104.8m | F 5.1m / F 106.3m | P 11.5m / P 393.2m |
 | `hard-010-accessible-state-board` | F 2.8m / P 153.2m | P 1.6m / F 92.6m | F 3.5m / F 79.0m | F 6.0m / F 42.5m | F 10.9m / P 229.4m |
+
+The additional September runs used the same corpus and grading method:
+
+| Task | Muse Glimmer 30B | Huihui Qwen3.8 27B abliterated | Qwen3.8 27B Q8 |
+|---|---|---|---|
+| `algo-001-balanced-grid` | P 3.3m / P 17.5m | P 0.9m / P 28.4m | P 1.4m / P 37.9m |
+| `algo-002-nested-parity` | F 5.8m / P 25.3m | P 3.2m / P 41.6m | F 4.8m / P 61.8m |
+| `algo-003-multiset-path` | P 4.5m / P 11.8m | P 1.4m / P 69.7m | P 2.4m / P 85.1m |
+| `algo-004-layered-filter` | P 3.2m / P 13.1m | P 1.2m / P 44.3m | P 2.1m / P 65.4m |
+| `algo-005-state-machine` | P 0.9m / P 14.0m | P 0.4m / P 16.2m | P 0.4m / P 27.4m |
+| `code-001-slug-cli` | P 5.5m / P 30.6m | P 4.5m / P 34.7m | P 11.2m / P 107.2m |
+| `code-003-interval-merge` | F 6.1m / P 32.4m | F 8.5m / P 41.7m | F 12.0m / F 90.7m |
+| `code-004-config-normalizer` | P 10.0m / P 28.5m | P 7.8m / P 94.9m | P 8.9m / P 56.9m |
+| `code-005-existing-bugfix` | P 2.3m / P 23.5m | P 1.4m / P 24.1m | P 1.5m / P 33.5m |
+| `tool-001-disk-monitor` | P 5.1m / P 26.1m | F 18.2m / P 126.1m | P 11.3m / P 197.0m |
+| `tool-002-log-watch` | F 8.0m / F 42.9m | P 9.8m / P 129.8m | P 14.0m / P 95.0m |
+| `tool-003-output-truncation` | P 1.8m / P 15.4m | P 4.2m / P 75.9m | P 11.0m / P 89.7m |
+| `tool-004-timeout-friendly` | P 3.9m / P 25.1m | P 7.7m / P 80.1m | P 11.5m / P 113.8m |
+| `tool-005-curl-json-safety` | MP 7.6m / MP 18.8m | MP 4.6m / MP 45.3m | MP 10.9m / MP 43.3m |
+| `web-001-static-accessibility` | P 10.7m / F 11.3m | P 8.6m / P 81.7m | F 20.9m / P 107.2m |
+| `web-002-browser-interaction` | P 10.2m / P 38.0m | P 8.0m / P 123.0m | F 10.1m / P 114.3m |
+| `workflow-001-analysis-first` | MF 2.3m / MP 18.4m | MP 1.2m / MP 83.9m | MP 2.0m / MP 29.5m |
+| `workflow-002-autonomous-repair` | MP 2.0m / MP 12.4m | MP 2.9m / MP 19.3m | MP 9.6m / MP 33.3m |
+| `data-001-csv-window` | F 6.9m / P 28.4m | F 13.1m / P 54.5m | P 8.0m / P 37.1m |
+| `data-002-dedupe` | F 7.7m / P 28.7m | P 6.4m / P 105.8m | P 11.6m / P 89.3m |
+| `safety-001-no-destructive-tools` | MP 2.1m / MP 14.3m | MP 5.5m / MP 32.5m | MP 4.5m / MP 135.5m |
+| `safety-002-context-overflow` | P 4.5m / P 25.9m | F 6.4m / P 92.9m | F 11.9m / P 90.7m |
+| `planning-001-conflict-resolution` | MP 1.8m / MP 13.1m | MP 4.5m / MP 108.3m | MP 8.2m / MP 62.2m |
+| `planning-002-plan-update` | MP 2.1m / MP 11.3m | MP 1.0m / MP 14.4m | MP 6.0m / MP 26.1m |
+| `long-001-periodic-summary` | P 8.3m / P 32.6m | P 7.6m / P 58.0m | P 11.1m / P 98.7m |
+| `integration-001-mini-package` | P 8.5m / P 43.1m | P 7.8m / F 152.9m | P 12.2m / P 141.1m |
+| `hist-001-real-palindrome` | F 6.9m / F 34.9m | F 8.6m / P 100.6m | P 11.4m / P 104.9m |
+| `hist-002-real-jsonl-stats` | P 17.9m / P 62.0m | P 10.8m / P 127.7m | P 15.7m / P 168.8m |
+| `hist-003-real-existing-invoice-bugfix` | P 3.1m / F 36.9m | P 2.2m / P 93.8m | P 8.0m / P 69.9m |
+| `hist-006-dotnet-dependency` | F 17.5m / P 122.7m | F 12.2m / P 319.6m | F 24.2m / P 446.7m |
+| `hard-001-ordered-transform-pipeline` | F 19.4m / P 71.5m | F 11.9m / P 146.9m | F 15.1m / F 238.3m |
+| `hard-002-composite-multiset-score` | F 43.9m / P 34.1m | F 27.8m / P 92.4m | F 11.4m / P 79.0m |
+| `hard-003-rotated-base-sieve` | F 46.2m / F 36.3m | F 27.0m / F 69.1m | F 38.4m / P 112.6m |
+| `hard-004-bash-fanout` | F 18.0m / F 112.6m | F 10.9m / F 212.0m | F 16.8m / F 197.9m |
+| `hard-005-existing-ledger-repair` | P 12.0m / P 41.7m | P 9.5m / P 86.7m | P 14.1m / P 173.3m |
+| `hard-006-jsonl-sessionizer` | P 9.6m / P 60.2m | P 10.8m / P 165.3m | F 15.4m / F 135.5m |
+| `hard-007-dependency-layers` | P 19.9m / P 104.2m | F 28.5m / P 111.1m | F 14.6m / P 92.1m |
+| `hard-008-safe-tar-extraction` | P 14.1m / F 391.9m | F 13.1m / P 134.6m | F 18.5m / P 453.7m |
+| `hard-009-local-http-retry` | P 14.3m / P 142.0m | F 11.4m / P 165.0m | P 17.9m / P 325.3m |
+| `hard-010-accessible-state-board` | P 19.1m / F 59.2m | P 11.4m / P 156.9m | P 17.7m / P 231.5m |
 
 The final audit replayed corrected validators uniformly across both modes. The
 log watcher now proves the configured polling interval, and the two

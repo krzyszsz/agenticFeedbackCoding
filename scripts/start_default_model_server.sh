@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LLAMA_CPP_PIN="876a4321163249c43ca4e986818fab5ab081f282"
+LLAMA_CPP_PIN="dd1ea524333b1e697489067d7a4c39c60d32beee"
 source "$REPO_ROOT/scripts/env.sh"
 
 if [ -n "${MODEL_PROFILE:-}" ]; then

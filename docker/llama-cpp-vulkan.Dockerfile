@@ -1,7 +1,7 @@
 FROM ubuntu:24.04 AS build
 
 # Pin the server runtime so published benchmark runs remain reproducible.
-ARG LLAMA_CPP_REF=876a4321163249c43ca4e986818fab5ab081f282
+ARG LLAMA_CPP_REF=dd1ea524333b1e697489067d7a4c39c60d32beee
 ARG LLAMA_CPP_CACHEBUST=0
 ENV DEBIAN_FRONTEND=noninteractive
 
